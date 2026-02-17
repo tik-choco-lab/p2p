@@ -1,0 +1,288 @@
+mod proxy;
+mod rtc;
+mod signal;
+mod stdio;
+mod tcp;
+mod udp;
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tokio::io::AsyncBufReadExt;
+use tracing::error;
+use tracing_subscriber::EnvFilter;
+
+use rtc::RTCManager;
+use signal::SignalClient;
+
+const DEFAULT_SIGNALING_URL: &str = "wss://rtc.tik-choco.com/signaling";
+
+#[derive(Parser)]
+#[command(name = "p2p", about = "WebRTC P2P Tunnel CLI")]
+#[command(
+    long_about = "A P2P tunnel application using WebRTC.\nSupports TCP/UDP forwarding and standard I/O bridging.\n\nIf no command is specified, p2p starts in Chat Mode."
+)]
+struct Cli {
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    room_id: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Connect {
+        room_id: String,
+
+        forward: Option<String>,
+
+        #[arg(long, default_value = DEFAULT_SIGNALING_URL)]
+        url: String,
+    },
+
+    Serve {
+        args: Vec<String>,
+
+        #[arg(last = true)]
+        command: Vec<String>,
+
+        #[arg(long, default_value = DEFAULT_SIGNALING_URL)]
+        url: String,
+    },
+}
+
+fn generate_room_id() -> String {
+    let mut buf = [0u8; 4];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
+    hex::encode(buf)
+}
+
+fn parse_forward(f: &str) -> (&str, &str, i32) {
+    let (proto, addr) = if let Some(rest) = f.strip_prefix("tcp://") {
+        ("tcp", rest)
+    } else if let Some(rest) = f.strip_prefix("udp://") {
+        ("udp", rest)
+    } else {
+        ("tcp", f)
+    };
+
+    let port = if let Ok(p) = addr.parse::<i32>() {
+        p
+    } else if let Some(port_str) = addr.rsplit(':').next() {
+        port_str.parse::<i32>().unwrap_or(-1)
+    } else {
+        -1
+    };
+
+    (proto, addr, port)
+}
+
+fn init_tracing(verbose: u8) {
+    let filter = match verbose {
+        0 => "error",
+        1 => "info",
+        _ => "debug",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(filter))
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
+
+    match cli.command {
+        Some(Commands::Connect {
+            room_id,
+            forward,
+            url,
+        }) => run_connect(&url, &room_id, forward.as_deref()).await,
+        Some(Commands::Serve { args, command, url }) => run_serve(&url, &args, &command).await,
+        None => run_chat(DEFAULT_SIGNALING_URL, cli.room_id.as_deref()).await,
+    }
+}
+
+async fn run_chat(url: &str, room_id: Option<&str>) -> Result<()> {
+    let room = match room_id {
+        Some(r) => r.to_string(),
+        None => {
+            let id = generate_room_id();
+            eprintln!("Room ID: {}", id);
+            id
+        }
+    };
+
+    let self_id = uuid::Uuid::new_v4().to_string();
+    let sig = SignalClient::new(url, &self_id, &room).await?;
+    let manager = RTCManager::new(sig, self_id.clone(), room, false).await;
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let mgr = manager.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        mgr.close().await;
+        let _ = shutdown_tx.send(()).await;
+    });
+
+    println!("=== Chat Mode ===");
+    println!("Type a message and press Enter to send.");
+
+    manager
+        .on_chat_message(|peer_id, msg| {
+            let short_id = &peer_id[..peer_id.len().min(8)];
+            println!("[{}] {}", short_id, msg);
+        })
+        .await;
+
+    let mgr = manager.clone();
+    tokio::spawn(async move {
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let msg = line.trim_end();
+                    if !msg.is_empty() {
+                        mgr.send_chat_to_all(msg).await;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    shutdown_rx.recv().await;
+    Ok(())
+}
+
+async fn run_connect(url: &str, room_id: &str, forward: Option<&str>) -> Result<()> {
+    let self_id = uuid::Uuid::new_v4().to_string();
+    let sig = SignalClient::new(url, &self_id, room_id).await?;
+    let manager = RTCManager::new(sig, self_id, room_id.to_string(), false).await;
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let bridge = Arc::new(stdio::Bridge::new(manager.clone()));
+
+    let br = bridge.clone();
+    let mgr = manager.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        br.close();
+        mgr.close().await;
+        let _ = shutdown_tx.send(()).await;
+    });
+
+    if let Some(f) = forward {
+        let (proto, _, port) = parse_forward(f);
+        let mgr = manager.clone();
+        if proto == "tcp" {
+            tokio::spawn(async move {
+                if let Err(e) = tcp::TcpManager::listen_and_serve(mgr, port, String::new()).await {
+                    error!("TCP error: {}", e);
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = udp::UdpManager::listen_and_serve(mgr, port, String::new()).await {
+                    error!("UDP error: {}", e);
+                }
+            });
+        }
+    }
+
+    let br = bridge.clone();
+    tokio::spawn(async move {
+        br.run().await;
+    });
+
+    shutdown_rx.recv().await;
+    manager.close().await;
+    Ok(())
+}
+
+async fn run_serve(url: &str, args: &[String], command: &[String]) -> Result<()> {
+    let mut room_id = String::new();
+    let mut forwards: Vec<String> = Vec::new();
+
+    if !args.is_empty() {
+        let arg = &args[0];
+        let is_forward =
+            arg.contains(':') || arg.starts_with("tcp://") || arg.starts_with("udp://");
+        if is_forward && args.len() == 1 {
+            forwards.push(arg.clone());
+        } else {
+            room_id = arg.clone();
+            if args.len() > 1 {
+                forwards.push(args[1].clone());
+            }
+        }
+    }
+
+    if room_id.is_empty() {
+        room_id = generate_room_id();
+        eprintln!("Room ID: {}", room_id);
+    }
+
+    let self_id = uuid::Uuid::new_v4().to_string();
+    let sig = SignalClient::new(url, &self_id, &room_id).await?;
+    let manager = RTCManager::new(sig, self_id, room_id, true).await;
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let mgr = manager.clone();
+    let stx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        mgr.close().await;
+        let _ = stx.send(()).await;
+    });
+
+    for f in &forwards {
+        let (proto, addr, _) = parse_forward(f);
+        let mgr = manager.clone();
+        let addr = addr.to_string();
+        if proto == "tcp" {
+            tokio::spawn(async move {
+                if let Err(e) = tcp::TcpManager::listen_and_serve(mgr, -1, addr).await {
+                    error!("TCP error: {}", e);
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = udp::UdpManager::listen_and_serve(mgr, -1, addr).await {
+                    error!("UDP error: {}", e);
+                }
+            });
+        }
+    }
+
+    if !command.is_empty() {
+        let executor = proxy::Executor::new(manager.clone(), command.to_vec());
+        let stx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = executor.run().await {
+                error!("proxy executor error: {}", e);
+            }
+            let _ = stx.send(()).await;
+        });
+    } else if forwards.is_empty() {
+        error!("No command or forwards specified. Usage: p2p serve [room-id] [forward-target] ...");
+        return Ok(());
+    }
+
+    shutdown_rx.recv().await;
+    manager.close().await;
+    Ok(())
+}
