@@ -1,6 +1,5 @@
 mod proxy;
 mod rtc;
-mod signal;
 mod stdio;
 mod tcp;
 mod udp;
@@ -14,7 +13,6 @@ use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use rtc::RTCManager;
-use signal::SignalClient;
 
 const DEFAULT_SIGNALING_URL: &str = "wss://rtc.tik-choco.com/signaling";
 
@@ -120,8 +118,7 @@ async fn run_chat(url: &str, room_id: Option<&str>) -> Result<()> {
     };
 
     let self_id = uuid::Uuid::new_v4().to_string();
-    let sig = SignalClient::new(url, &self_id, &room).await?;
-    let manager = RTCManager::new(sig, self_id.clone(), room, false).await;
+    let manager = RTCManager::new(url, self_id.clone(), room, false).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -168,8 +165,7 @@ async fn run_chat(url: &str, room_id: Option<&str>) -> Result<()> {
 
 async fn run_connect(url: &str, room_id: &str, forward: Option<&str>) -> Result<()> {
     let self_id = uuid::Uuid::new_v4().to_string();
-    let sig = SignalClient::new(url, &self_id, room_id).await?;
-    let manager = RTCManager::new(sig, self_id, room_id.to_string(), false).await;
+    let manager = RTCManager::new(url, self_id, room_id.to_string(), false).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -236,8 +232,7 @@ async fn run_serve(url: &str, args: &[String], command: &[String]) -> Result<()>
     }
 
     let self_id = uuid::Uuid::new_v4().to_string();
-    let sig = SignalClient::new(url, &self_id, &room_id).await?;
-    let manager = RTCManager::new(sig, self_id, room_id, true).await;
+    let manager = RTCManager::new(url, self_id, room_id, true).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 

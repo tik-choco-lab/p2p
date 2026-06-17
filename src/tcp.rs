@@ -119,18 +119,12 @@ impl TcpManager {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let peers = self.rtc_manager.get_server_peers().await;
-            for peer in &peers {
-                if let Some(dc) = peer.dc_tunnel().await {
-                    if dc.ready_state()
-                        == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-                    {
-                        debug!("Selected server peer: {}", peer.peer_id());
-                        return Ok(peer.peer_id().to_string());
-                    }
-                }
+            if let Some(peer_id) = peers.first() {
+                debug!("Selected server peer: {}", peer_id);
+                return Ok(peer_id.clone());
             }
             if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("tunnel data channel not open");
+                anyhow::bail!("server peer not connected");
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
@@ -266,16 +260,7 @@ impl TcpManager {
 
     async fn send_to(&self, peer_id: &str, msg: &TunnelMessage) -> Result<()> {
         let data = serde_json::to_vec(msg)?;
-        let peer = self
-            .rtc_manager
-            .get_peer(peer_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("peer not found: {}", peer_id))?;
-        let dc = peer
-            .dc_tunnel()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("tunnel dc not ready"))?;
-        dc.send(&bytes::Bytes::from(data)).await?;
+        self.rtc_manager.send_tunnel_to(peer_id, data).await?;
         Ok(())
     }
 
