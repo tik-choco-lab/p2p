@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use super::event::{handle_leave, handle_payload};
 use super::payload::P2pPayload;
 use super::state::{PeerRole, RTCManagerInner};
-use super::RTCManagerHandle;
+use super::{mistlib_config, RTCManagerHandle};
 
 fn test_manager(self_id: &str, self_role: PeerRole) -> RTCManagerHandle {
     RTCManagerHandle {
@@ -13,6 +13,24 @@ fn test_manager(self_id: &str, self_role: PeerRole) -> RTCManagerHandle {
 
 fn encode(payload: P2pPayload) -> Vec<u8> {
     serde_json::to_vec(&payload).unwrap()
+}
+
+#[test]
+fn mistlib_config_is_unset_by_default() {
+    temp_env::with_var("P2P_MISTLIB_CONFIG_JSON", None::<&str>, || {
+        assert!(mistlib_config().is_none());
+    });
+}
+
+#[test]
+fn mistlib_config_uses_explicit_env_only() {
+    temp_env::with_var(
+        "P2P_MISTLIB_CONFIG_JSON",
+        Some("{\"signaling\":{}}"),
+        || {
+            assert_eq!(mistlib_config(), Some(br#"{"signaling":{}}"#.to_vec()));
+        },
+    );
 }
 
 #[tokio::test]

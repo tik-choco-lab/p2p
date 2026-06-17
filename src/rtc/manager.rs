@@ -14,7 +14,6 @@ use state::{PeerRole, RTCManagerInner};
 mod tests;
 
 const MISTLIB_CONFIG_ENV: &str = "P2P_MISTLIB_CONFIG_JSON";
-const MISTLIB_DEFAULT_CONFIG: &[u8] = b"{}";
 
 #[derive(Clone)]
 pub struct RTCManagerHandle {
@@ -40,13 +39,17 @@ impl RTCManagerHandle {
             dispatch_event(&runtime, &weak, message_type, from, data);
         });
         let config = mistlib_config();
-        let initialized = tokio::task::spawn_blocking(move || {
-            mistlib::init_with_config(self_id, config.as_slice())
+        let initialized = tokio::task::spawn_blocking(move || match config {
+            Some(config) => mistlib::init_with_config(self_id, config.as_slice()),
+            None => {
+                mistlib::init(self_id, String::new());
+                true
+            }
         })
         .await
         .unwrap_or(false);
         if !initialized {
-            tracing::warn!("mistlib default config was rejected");
+            tracing::warn!("mistlib config was rejected");
         }
         mistlib::join_room(room_id);
         handle.send_role_to_all().await;
@@ -173,8 +176,8 @@ impl RTCManagerHandle {
 
 pub type RTCManager = RTCManagerHandle;
 
-fn mistlib_config() -> Vec<u8> {
+fn mistlib_config() -> Option<Vec<u8>> {
     std::env::var(MISTLIB_CONFIG_ENV)
+        .ok()
         .map(|config| config.into_bytes())
-        .unwrap_or_else(|_| MISTLIB_DEFAULT_CONFIG.to_vec())
 }
