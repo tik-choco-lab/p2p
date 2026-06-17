@@ -1,3 +1,5 @@
 /target
+.just-go/
+.just-go-cache/
 webrtc-p2p-tunnel/
 strip_comments.py

@@ -14,8 +14,6 @@ use tracing_subscriber::EnvFilter;
 
 use rtc::RTCManager;
 
-const DEFAULT_SIGNALING_URL: &str = "wss://rtc.tik-choco.com/signaling";
-
 #[derive(Parser)]
 #[command(name = "p2p", about = "WebRTC P2P Tunnel CLI")]
 #[command(
@@ -37,9 +35,6 @@ enum Commands {
         room_id: String,
 
         forward: Option<String>,
-
-        #[arg(long, default_value = DEFAULT_SIGNALING_URL)]
-        url: String,
     },
 
     Serve {
@@ -47,9 +42,6 @@ enum Commands {
 
         #[arg(last = true)]
         command: Vec<String>,
-
-        #[arg(long, default_value = DEFAULT_SIGNALING_URL)]
-        url: String,
     },
 }
 
@@ -97,17 +89,15 @@ async fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     match cli.command {
-        Some(Commands::Connect {
-            room_id,
-            forward,
-            url,
-        }) => run_connect(&url, &room_id, forward.as_deref()).await,
-        Some(Commands::Serve { args, command, url }) => run_serve(&url, &args, &command).await,
-        None => run_chat(DEFAULT_SIGNALING_URL, cli.room_id.as_deref()).await,
+        Some(Commands::Connect { room_id, forward }) => {
+            run_connect(&room_id, forward.as_deref()).await
+        }
+        Some(Commands::Serve { args, command }) => run_serve(&args, &command).await,
+        None => run_chat(cli.room_id.as_deref()).await,
     }
 }
 
-async fn run_chat(url: &str, room_id: Option<&str>) -> Result<()> {
+async fn run_chat(room_id: Option<&str>) -> Result<()> {
     let room = match room_id {
         Some(r) => r.to_string(),
         None => {
@@ -118,7 +108,7 @@ async fn run_chat(url: &str, room_id: Option<&str>) -> Result<()> {
     };
 
     let self_id = uuid::Uuid::new_v4().to_string();
-    let manager = RTCManager::new(url, self_id.clone(), room, false).await;
+    let manager = RTCManager::new(self_id.clone(), room, false).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -163,9 +153,9 @@ async fn run_chat(url: &str, room_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn run_connect(url: &str, room_id: &str, forward: Option<&str>) -> Result<()> {
+async fn run_connect(room_id: &str, forward: Option<&str>) -> Result<()> {
     let self_id = uuid::Uuid::new_v4().to_string();
-    let manager = RTCManager::new(url, self_id, room_id.to_string(), false).await;
+    let manager = RTCManager::new(self_id, room_id.to_string(), false).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -208,7 +198,7 @@ async fn run_connect(url: &str, room_id: &str, forward: Option<&str>) -> Result<
     Ok(())
 }
 
-async fn run_serve(url: &str, args: &[String], command: &[String]) -> Result<()> {
+async fn run_serve(args: &[String], command: &[String]) -> Result<()> {
     let mut room_id = String::new();
     let mut forwards: Vec<String> = Vec::new();
 
@@ -232,7 +222,7 @@ async fn run_serve(url: &str, args: &[String], command: &[String]) -> Result<()>
     }
 
     let self_id = uuid::Uuid::new_v4().to_string();
-    let manager = RTCManager::new(url, self_id, room_id, true).await;
+    let manager = RTCManager::new(self_id, room_id, true).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
