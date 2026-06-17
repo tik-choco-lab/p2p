@@ -7,13 +7,13 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error};
 
-use crate::rtc::{RTCManager, RemotePeer};
+use crate::rtc::RTCManager;
 use crate::stdio::packet::{unwrap_packet, wrap_packet, StreamType};
 
 pub struct Executor {
     manager: RTCManager,
     command: Vec<String>,
-    active_peer: Arc<Mutex<Option<Arc<RemotePeer>>>>,
+    active_peer: Arc<Mutex<Option<String>>>,
     stdin_tx: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
     done: Arc<Notify>,
 }
@@ -32,23 +32,12 @@ impl Executor {
     pub async fn run(&self) -> Result<()> {
         let active_peer = self.active_peer.clone();
         let stdin_tx = self.stdin_tx.clone();
-        let mgr = self.manager.clone();
         self.manager
             .on_stdio_message(move |peer_id, data| {
                 let active_peer = active_peer.clone();
                 let stdin_tx = stdin_tx.clone();
-                let mgr = mgr.clone();
                 tokio::spawn(async move {
-                    {
-                        let mut ap = active_peer.lock().await;
-                        let needs = match &*ap {
-                            Some(p) => p.peer_id() != peer_id,
-                            None => true,
-                        };
-                        if needs {
-                            *ap = mgr.get_peer(&peer_id).await;
-                        }
-                    }
+                    *active_peer.lock().await = Some(peer_id);
                     let (stream_type, payload) = unwrap_packet(&data);
                     if stream_type == StreamType::Stdin {
                         let mut tx = stdin_tx.lock().await;
@@ -77,11 +66,11 @@ impl Executor {
                             return;
                         }
                     }
-                    *active_peer.lock().await = mgr.get_peer(&peer_id).await;
+                    *active_peer.lock().await = Some(peer_id.clone());
                     debug!("Starting proxy command for peer: {}", peer_id);
 
                     if let Err(e) =
-                        Self::start_command(&cmd, active_peer.clone(), stdin_tx.clone()).await
+                        Self::start_command(&cmd, mgr, active_peer.clone(), stdin_tx.clone()).await
                     {
                         error!("Failed to start proxy command: {}", e);
                     }
@@ -97,11 +86,9 @@ impl Executor {
                 let stdin_tx = stdin_tx.clone();
                 tokio::spawn(async move {
                     let ap = active_peer.lock().await;
-                    if let Some(ref p) = *ap {
-                        if p.peer_id() == peer_id {
-                            debug!("Stdio closed, stopping proxy command");
-                            *stdin_tx.lock().await = None;
-                        }
+                    if ap.as_deref() == Some(peer_id.as_str()) {
+                        debug!("Stdio closed, stopping proxy command");
+                        *stdin_tx.lock().await = None;
                     }
                 });
             })
@@ -113,7 +100,8 @@ impl Executor {
 
     async fn start_command(
         cmd: &[String],
-        active_peer: Arc<Mutex<Option<Arc<RemotePeer>>>>,
+        manager: RTCManager,
+        active_peer: Arc<Mutex<Option<String>>>,
         stdin_holder: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
     ) -> Result<()> {
         if cmd.is_empty() {
@@ -136,13 +124,14 @@ impl Executor {
         debug!("Proxy command started");
 
         let ap = active_peer.clone();
+        let mgr = manager.clone();
         tokio::spawn(async move {
-            Self::forward_stream(stdout, StreamType::Stdout, ap).await;
+            Self::forward_stream(stdout, StreamType::Stdout, mgr, ap).await;
         });
 
         let ap = active_peer.clone();
         tokio::spawn(async move {
-            Self::forward_stream(stderr, StreamType::Stderr, ap).await;
+            Self::forward_stream(stderr, StreamType::Stderr, manager, ap).await;
         });
 
         let stdin_holder2 = stdin_holder.clone();
@@ -161,7 +150,8 @@ impl Executor {
     async fn forward_stream<R: tokio::io::AsyncRead + Unpin>(
         mut reader: R,
         stream_type: StreamType,
-        active_peer: Arc<Mutex<Option<Arc<RemotePeer>>>>,
+        manager: RTCManager,
+        active_peer: Arc<Mutex<Option<String>>>,
     ) {
         let mut buf = vec![0u8; 32 * 1024];
         loop {
@@ -170,10 +160,8 @@ impl Executor {
                 Ok(n) => {
                     let data = wrap_packet(stream_type, &buf[..n]);
                     let ap = active_peer.lock().await;
-                    if let Some(ref peer) = *ap {
-                        if let Some(dc) = peer.dc_stdio().await {
-                            let _ = dc.send(&bytes::Bytes::from(data)).await;
-                        }
+                    if let Some(ref peer_id) = *ap {
+                        let _ = manager.send_stdio_to(peer_id, data).await;
                     }
                 }
                 Err(e) => {

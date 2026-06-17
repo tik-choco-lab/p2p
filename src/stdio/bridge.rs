@@ -4,11 +4,11 @@ use tokio::sync::{Mutex, Notify};
 use tracing::debug;
 
 use super::packet::{unwrap_packet, wrap_packet, StreamType};
-use crate::rtc::{RTCManager, RemotePeer};
+use crate::rtc::RTCManager;
 
 pub struct Bridge {
     manager: RTCManager,
-    active_peer: Arc<Mutex<Option<Arc<RemotePeer>>>>,
+    active_peer: Arc<Mutex<Option<String>>>,
     connected: Arc<Mutex<bool>>,
     buffer: Arc<Mutex<Vec<Vec<u8>>>>,
     done: Arc<Notify>,
@@ -27,22 +27,11 @@ impl Bridge {
 
     pub async fn run(&self) {
         let active_peer = self.active_peer.clone();
-        let mgr = self.manager.clone();
         self.manager
             .on_stdio_message(move |peer_id, data| {
                 let active_peer = active_peer.clone();
-                let mgr = mgr.clone();
                 tokio::spawn(async move {
-                    {
-                        let mut ap = active_peer.lock().await;
-                        let needs_update = match &*ap {
-                            Some(p) => p.peer_id() != peer_id,
-                            None => true,
-                        };
-                        if needs_update {
-                            *ap = mgr.get_peer(&peer_id).await;
-                        }
-                    }
+                    *active_peer.lock().await = Some(peer_id);
                     let (stream_type, payload) = unwrap_packet(&data);
                     match stream_type {
                         StreamType::Stdout => {
@@ -75,19 +64,14 @@ impl Bridge {
                     let mut conn = connected.lock().await;
                     if !*conn {
                         *conn = true;
-                        *active_peer.lock().await = mgr.get_peer(&peer_id).await;
+                        *active_peer.lock().await = Some(peer_id.clone());
                         debug!("stdio bridge connected to peer: {}", peer_id);
 
                         let mut buf = buffer.lock().await;
                         if !buf.is_empty() {
                             debug!("Flushing buffered stdin data...");
-                            let ap = active_peer.lock().await;
-                            if let Some(ref peer) = *ap {
-                                if let Some(dc) = peer.dc_stdio().await {
-                                    for data in buf.drain(..) {
-                                        let _ = dc.send(&bytes::Bytes::from(data)).await;
-                                    }
-                                }
+                            for data in buf.drain(..) {
+                                let _ = mgr.send_stdio_to(&peer_id, data).await;
                             }
                         }
                     }
@@ -103,12 +87,10 @@ impl Bridge {
                 let connected = connected.clone();
                 tokio::spawn(async move {
                     let mut ap = active_peer.lock().await;
-                    if let Some(ref p) = *ap {
-                        if p.peer_id() == peer_id {
-                            *connected.lock().await = false;
-                            *ap = None;
-                            debug!("stdio bridge disconnected from peer: {}", peer_id);
-                        }
+                    if ap.as_deref() == Some(peer_id.as_str()) {
+                        *connected.lock().await = false;
+                        *ap = None;
+                        debug!("stdio bridge disconnected from peer: {}", peer_id);
                     }
                 });
             })
@@ -118,17 +100,19 @@ impl Bridge {
         let connected = self.connected.clone();
         let buffer = self.buffer.clone();
         let done = self.done.clone();
+        let manager = self.manager.clone();
         tokio::spawn(async move {
-            Self::read_stdin(active_peer, connected, buffer, done).await;
+            Self::read_stdin(active_peer, connected, buffer, manager, done).await;
         });
 
         self.done.notified().await;
     }
 
     async fn read_stdin(
-        active_peer: Arc<Mutex<Option<Arc<RemotePeer>>>>,
+        active_peer: Arc<Mutex<Option<String>>>,
         connected: Arc<Mutex<bool>>,
         buffer: Arc<Mutex<Vec<Vec<u8>>>>,
+        manager: RTCManager,
         done: Arc<Notify>,
     ) {
         let mut stdin = io::stdin();
@@ -142,10 +126,8 @@ impl Bridge {
                     let conn = *connected.lock().await;
                     if conn {
                         let ap = active_peer.lock().await;
-                        if let Some(ref peer) = *ap {
-                            if let Some(dc) = peer.dc_stdio().await {
-                                let _ = dc.send(&bytes::Bytes::from(data)).await;
-                            }
+                        if let Some(ref peer_id) = *ap {
+                            let _ = manager.send_stdio_to(peer_id, data).await;
                         }
                     } else {
                         buffer.lock().await.push(data);

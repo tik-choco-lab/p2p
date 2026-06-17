@@ -216,11 +216,7 @@ impl UdpManager {
                         Ok(d) => d,
                         Err(_) => continue,
                     };
-                    if let Some(peer) = rtc_manager.get_peer(&peer_id).await {
-                        if let Some(dc) = peer.dc_tunnel().await {
-                            let _ = dc.send(&bytes::Bytes::from(data)).await;
-                        }
-                    }
+                    let _ = rtc_manager.send_tunnel_to(&peer_id, data).await;
                 }
                 Err(e) => {
                     error!("UDP target read error: {}", e);
@@ -232,16 +228,7 @@ impl UdpManager {
 
     async fn send_to(&self, peer_id: &str, msg: &TunnelMessage) -> Result<()> {
         let data = serde_json::to_vec(msg)?;
-        let peer = self
-            .rtc_manager
-            .get_peer(peer_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("peer not found"))?;
-        let dc = peer
-            .dc_tunnel()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("dc not ready"))?;
-        dc.send(&bytes::Bytes::from(data)).await?;
+        self.rtc_manager.send_tunnel_to(peer_id, data).await?;
         Ok(())
     }
 
@@ -249,14 +236,8 @@ impl UdpManager {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let peers = self.rtc_manager.get_server_peers().await;
-            for peer in &peers {
-                if let Some(dc) = peer.dc_tunnel().await {
-                    if dc.ready_state()
-                        == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-                    {
-                        return Ok(peer.peer_id().to_string());
-                    }
-                }
+            if let Some(peer_id) = peers.first() {
+                return Ok(peer_id.clone());
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!("timeout");
