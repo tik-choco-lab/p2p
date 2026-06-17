@@ -36,7 +36,10 @@ async fn role_payload_tracks_server_peers() {
     )
     .await;
 
-    assert_eq!(manager.get_server_peers().await, vec!["server-1".to_string()]);
+    assert_eq!(
+        manager.get_server_peers().await,
+        vec!["server-1".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -130,7 +133,12 @@ async fn invalid_and_self_payloads_are_ignored() {
         }),
     )
     .await;
-    handle_payload(manager.inner.clone(), "peer-1".to_string(), b"not json".to_vec()).await;
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        b"not json".to_vec(),
+    )
+    .await;
 
     assert!(chats.lock().unwrap().is_empty());
 }
@@ -174,7 +182,13 @@ async fn leave_removes_peer_state_and_notifies_close_handlers() {
     handle_leave(manager.inner.clone(), "peer-1".to_string()).await;
 
     assert!(!manager.inner.peers.read().await.contains("peer-1"));
-    assert!(manager.inner.peer_roles.read().await.get("peer-1").is_none());
+    assert!(manager
+        .inner
+        .peer_roles
+        .read()
+        .await
+        .get("peer-1")
+        .is_none());
     assert_eq!(*tunnel_closed.lock().unwrap(), vec!["peer-1".to_string()]);
     assert_eq!(*stdio_closed.lock().unwrap(), vec!["peer-1".to_string()]);
 }

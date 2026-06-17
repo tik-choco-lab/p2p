@@ -31,16 +31,34 @@ mod tests {
 
     #[test]
     fn wraps_stream_type_and_payload() {
-        assert_eq!(wrap_packet(StreamType::Stdin, b"abc"), vec![0x00, b'a', b'b', b'c']);
-        assert_eq!(wrap_packet(StreamType::Stdout, b"abc"), vec![0x01, b'a', b'b', b'c']);
-        assert_eq!(wrap_packet(StreamType::Stderr, b"abc"), vec![0x02, b'a', b'b', b'c']);
+        assert_eq!(
+            wrap_packet(StreamType::Stdin, b"abc"),
+            vec![0x00, b'a', b'b', b'c']
+        );
+        assert_eq!(
+            wrap_packet(StreamType::Stdout, b"abc"),
+            vec![0x01, b'a', b'b', b'c']
+        );
+        assert_eq!(
+            wrap_packet(StreamType::Stderr, b"abc"),
+            vec![0x02, b'a', b'b', b'c']
+        );
     }
 
     #[test]
     fn unwraps_stream_type_and_payload() {
-        assert_eq!(unwrap_packet(&[0x00, 1, 2]), (StreamType::Stdin, &[1, 2][..]));
-        assert_eq!(unwrap_packet(&[0x01, 1, 2]), (StreamType::Stdout, &[1, 2][..]));
-        assert_eq!(unwrap_packet(&[0x02, 1, 2]), (StreamType::Stderr, &[1, 2][..]));
+        assert_eq!(
+            unwrap_packet(&[0x00, 1, 2]),
+            (StreamType::Stdin, &[1, 2][..])
+        );
+        assert_eq!(
+            unwrap_packet(&[0x01, 1, 2]),
+            (StreamType::Stdout, &[1, 2][..])
+        );
+        assert_eq!(
+            unwrap_packet(&[0x02, 1, 2]),
+            (StreamType::Stderr, &[1, 2][..])
+        );
     }
 
     #[test]

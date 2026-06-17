@@ -1,17 +1,17 @@
 # p2p (webrtc-p2p-tunnel-rs)
 
-A high-performance P2P tunnel application written in Rust, utilizing WebRTC for secure, NAT-traversing connectivity.
+A high-performance P2P tunnel application written in Rust, utilizing mistlib for secure, NAT-traversing connectivity.
 
-This project is a functional port of the original Go implementation [webrtc-p2p-tunnel](https://github.com/tik-choco-lab/webrtc-p2p-tunnel), rewritten in Rust using the `tokio` runtime and `webrtc-rs` for improved safety and concurrency.
+This project is a functional port of the original Go implementation [webrtc-p2p-tunnel](https://github.com/tik-choco-lab/webrtc-p2p-tunnel), rewritten in Rust using the `tokio` runtime.
 
 ## Features
 
-- **P2P Connectivity**: Establishes direct peer-to-peer connections using WebRTC (ICE, STUN), allowing connectivity even behind restrictive NATs.
+- **P2P Connectivity**: Establishes direct peer-to-peer connections through mistlib, allowing connectivity even behind restrictive NATs.
 - **TCP/UDP Forwarding**: Tunnel any TCP or UDP traffic through the P2P connection.
 - **Stdio Bridging**: Bridge remote standard input/output to your local terminal, similar to SSH execution.
-- **Multi-Channel Architecture**: Uses dedicated WebRTC DataChannels for different traffic types (Tunnel, Chat, Signal relay, Stdio).
+- **Multi-Channel Architecture**: Routes tunnel, chat, and stdio payloads over mistlib messages.
 - **Embedded Chat**: Simple built-in P2P chat mode for coordination.
-- **Signaling**: Flexible signaling via WebSocket with automatic reconnection and exponential backoff.
+- **Signaling**: Uses mistlib's default Nostr signaling configuration.
 
 ## Installation
 
@@ -65,13 +65,34 @@ p2p connect my-room :8080
 
 - `-v`: Enable Info level logging.
 - `-vv`: Enable Debug level logging.
-- `--url`: Specify a custom WebRTC signaling server URL.
+
+## Live Tests
+
+Nostr signaling requires relay access, so the E2E test is ignored by default.
+
+```bash
+P2P_NOSTR_E2E=1 cargo test --test nostr_signaling -- --ignored --nocapture
+```
+
+```powershell
+$env:P2P_NOSTR_E2E = "1"
+cargo test --test nostr_signaling -- --ignored --nocapture
+```
+
+With `just`:
+
+```powershell
+# terminal 1
+just nostr-relay
+
+# terminal 2
+just test-nostr
+```
 
 ## Architecture
 
 This Rust implementation follows the same internal logic as the Go version:
-- **Signal**: WebSocket client for SDP/ICE exchange.
-- **RTC Manager**: Manages multiple `RemotePeer` instances and their `RTCPeerConnection`s.
-- **Router**: Handles signaling message routing and deduplication.
-- **Bridges**: Dedicated logic for mapping TCP, UDP, and Stdio to WebRTC DataChannels.
+- **mistlib**: Provides the P2P transport, room membership, and Nostr signaling.
+- **RTC Manager**: Adapts mistlib events and raw payloads to the tunnel, chat, and stdio handlers.
+- **Bridges**: Dedicated logic for mapping TCP, UDP, and stdio to mistlib messages.
 

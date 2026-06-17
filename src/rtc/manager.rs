@@ -13,6 +13,9 @@ use state::{PeerRole, RTCManagerInner};
 #[cfg(test)]
 mod tests;
 
+const MISTLIB_CONFIG_ENV: &str = "P2P_MISTLIB_CONFIG_JSON";
+const MISTLIB_DEFAULT_CONFIG: &[u8] = b"{}";
+
 #[derive(Clone)]
 pub struct RTCManagerHandle {
     inner: Arc<RTCManagerInner>,
@@ -20,7 +23,7 @@ pub struct RTCManagerHandle {
 
 #[allow(dead_code)]
 impl RTCManagerHandle {
-    pub async fn new(url: &str, self_id: String, room_id: String, is_server: bool) -> Self {
+    pub async fn new(self_id: String, room_id: String, is_server: bool) -> Self {
         let role = if is_server {
             PeerRole::Server
         } else {
@@ -36,7 +39,16 @@ impl RTCManagerHandle {
         mistlib::register_raw_handler(move |message_type, from, data| {
             dispatch_event(&runtime, &weak, message_type, from, data);
         });
-        mistlib::init_and_join(self_id, url.to_string(), room_id);
+        let config = mistlib_config();
+        let initialized = tokio::task::spawn_blocking(move || {
+            mistlib::init_with_config(self_id, config.as_slice())
+        })
+        .await
+        .unwrap_or(false);
+        if !initialized {
+            tracing::warn!("mistlib default config was rejected");
+        }
+        mistlib::join_room(room_id);
         handle.send_role_to_all().await;
 
         handle
@@ -127,7 +139,8 @@ impl RTCManagerHandle {
     }
 
     pub async fn send_tunnel_to(&self, peer_id: &str, data: Vec<u8>) -> Result<()> {
-        self.send_payload(peer_id, P2pPayload::Tunnel { data }).await
+        self.send_payload(peer_id, P2pPayload::Tunnel { data })
+            .await
     }
 
     pub async fn send_stdio_to(&self, peer_id: &str, data: Vec<u8>) -> Result<()> {
@@ -159,3 +172,9 @@ impl RTCManagerHandle {
 }
 
 pub type RTCManager = RTCManagerHandle;
+
+fn mistlib_config() -> Vec<u8> {
+    std::env::var(MISTLIB_CONFIG_ENV)
+        .map(|config| config.into_bytes())
+        .unwrap_or_else(|_| MISTLIB_DEFAULT_CONFIG.to_vec())
+}
