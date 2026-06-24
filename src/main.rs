@@ -1,3 +1,5 @@
+mod controller;
+mod forward_args;
 mod proxy;
 mod rtc;
 mod stdio;
@@ -12,6 +14,8 @@ use tokio::io::AsyncBufReadExt;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
+use controller::{Direction, ForwardController, ForwardSpec, Proto};
+use forward_args::{forward_key, parse_connect_forward, parse_forward, split_serve_args};
 use rtc::RTCManager;
 
 #[derive(Parser)]
@@ -53,59 +57,6 @@ fn generate_room_id() -> String {
     let mut buf = [0u8; 4];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
     hex::encode(buf)
-}
-
-fn parse_forward(f: &str) -> (&str, &str, i32) {
-    let (proto, addr) = if let Some(rest) = f.strip_prefix("tcp://") {
-        ("tcp", rest)
-    } else if let Some(rest) = f.strip_prefix("udp://") {
-        ("udp", rest)
-    } else {
-        ("tcp", f)
-    };
-
-    let port = if let Ok(p) = addr.parse::<i32>() {
-        p
-    } else if let Some(port_str) = addr.rsplit(':').next() {
-        port_str.parse::<i32>().unwrap_or(-1)
-    } else {
-        -1
-    };
-
-    (proto, addr, port)
-}
-
-fn parse_connect_forward(f: &str) -> (&str, i32, String) {
-    let (proto, addr, fallback_port) = parse_forward(f);
-    let addr = addr.trim_start_matches(':');
-
-    let (listen_port, remote_port) =
-        if let Some((listen, remote)) = addr.split_once(':') {
-            let listen_port = listen.parse::<i32>().unwrap_or(fallback_port);
-            let remote_port = remote.parse::<i32>().unwrap_or(listen_port);
-            (listen_port, remote_port)
-        } else {
-            (fallback_port, fallback_port)
-        };
-
-    (proto, listen_port, format!("{}:{}", proto, remote_port))
-}
-
-fn split_serve_args(args: &[String]) -> (Option<String>, Vec<String>) {
-    let Some(first) = args.first() else {
-        return (None, Vec::new());
-    };
-
-    let is_forward =
-        first.contains(':') || first.starts_with("tcp://") || first.starts_with("udp://");
-    if is_forward {
-        (None, args.to_vec())
-    } else {
-        (
-            Some(first.clone()),
-            args.iter().skip(1).cloned().collect::<Vec<_>>(),
-        )
-    }
 }
 
 fn init_tracing(verbose: u8) {
@@ -206,38 +157,18 @@ async fn run_connect(room_id: &str, forwards: &[String]) -> Result<()> {
         let _ = shutdown_tx.send(()).await;
     });
 
+    let controller = ForwardController::new(manager.clone());
     for f in forwards {
         let (proto, listen_port, target) = parse_connect_forward(f);
-        let mgr = manager.clone();
-        if proto == "tcp" {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    tcp::TcpManager::listen_and_serve_with_target(
-                        mgr,
-                        listen_port,
-                        String::new(),
-                        target,
-                    )
-                    .await
-                {
-                    error!("TCP error: {}", e);
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    udp::UdpManager::listen_and_serve_with_target(
-                        mgr,
-                        listen_port,
-                        String::new(),
-                        target,
-                    )
-                    .await
-                {
-                    error!("UDP error: {}", e);
-                }
-            });
-        }
+        controller
+            .add_forward(ForwardSpec {
+                direction: Direction::Connect,
+                proto: Proto::from_name(proto)?,
+                addr: String::new(),
+                listen_port,
+                target,
+            })
+            .await?;
     }
 
     let br = bridge.clone();
@@ -272,28 +203,19 @@ async fn run_serve(args: &[String], command: &[String]) -> Result<()> {
         let _ = stx.send(()).await;
     });
 
+    let controller = ForwardController::new(manager.clone());
     for f in &forwards {
         let (proto, addr, _) = parse_forward(f);
         let target = forward_key(proto, addr);
-        let mgr = manager.clone();
-        let addr = addr.to_string();
-        if proto == "tcp" {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    tcp::TcpManager::listen_and_serve_with_target(mgr, -1, addr, target).await
-                {
-                    error!("TCP error: {}", e);
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(e) =
-                    udp::UdpManager::listen_and_serve_with_target(mgr, -1, addr, target).await
-                {
-                    error!("UDP error: {}", e);
-                }
-            });
-        }
+        controller
+            .add_forward(ForwardSpec {
+                direction: Direction::Serve,
+                proto: Proto::from_name(proto)?,
+                addr: addr.to_string(),
+                listen_port: -1,
+                target,
+            })
+            .await?;
     }
 
     if !command.is_empty() {
@@ -313,69 +235,4 @@ async fn run_serve(args: &[String], command: &[String]) -> Result<()> {
     shutdown_rx.recv().await;
     manager.close().await;
     Ok(())
-}
-
-fn forward_key(proto: &str, addr: &str) -> String {
-    let port = addr
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<i32>().ok())
-        .unwrap_or(-1);
-    format!("{}:{}", proto, port)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn strings(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn connect_forward_defaults_remote_port_to_listen_port() {
-        assert_eq!(
-            parse_connect_forward(":8080"),
-            ("tcp", 8080, "tcp:8080".to_string())
-        );
-        assert_eq!(
-            parse_connect_forward("udp://9000"),
-            ("udp", 9000, "udp:9000".to_string())
-        );
-    }
-
-    #[test]
-    fn connect_forward_maps_listen_port_to_remote_target() {
-        assert_eq!(
-            parse_connect_forward("15432:5432"),
-            ("tcp", 15432, "tcp:5432".to_string())
-        );
-        assert_eq!(
-            parse_connect_forward("udp://19000:9000"),
-            ("udp", 19000, "udp:9000".to_string())
-        );
-    }
-
-    #[test]
-    fn serve_args_keep_all_forwards_when_room_is_present() {
-        let (room, forwards) =
-            split_serve_args(&strings(&["my-room", ":80", "tcp://127.0.0.1:5432"]));
-
-        assert_eq!(room, Some("my-room".to_string()));
-        assert_eq!(forwards, strings(&[":80", "tcp://127.0.0.1:5432"]));
-    }
-
-    #[test]
-    fn serve_args_treat_leading_forward_as_generated_room_mode() {
-        let (room, forwards) = split_serve_args(&strings(&[":80", "udp://127.0.0.1:9000"]));
-
-        assert_eq!(room, None);
-        assert_eq!(forwards, strings(&[":80", "udp://127.0.0.1:9000"]));
-    }
-
-    #[test]
-    fn forward_key_uses_protocol_and_port() {
-        assert_eq!(forward_key("tcp", "127.0.0.1:80"), "tcp:80");
-        assert_eq!(forward_key("udp", ":9000"), "udp:9000");
-    }
 }
