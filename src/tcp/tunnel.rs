@@ -87,7 +87,8 @@ impl TcpManager {
                 drop(conns);
                 self.close_conn(&tm.conn_id, true).await;
             } else {
-                self.runtime.record_bytes_out(payload.len());
+                self.runtime
+                    .record_bytes_out_for(&tc.peer_id, payload.len());
             }
         }
     }

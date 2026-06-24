@@ -45,6 +45,9 @@ pub(super) struct RTCManagerInner {
     pub(super) peer_forward_keys: RwLock<HashMap<String, HashSet<String>>>,
     pub(super) self_forward_keys: RwLock<HashSet<String>>,
     pub(super) default_tunnel_target: RwLock<Option<String>>,
+    /// Round-robin cursor per target key, used to load-balance connect-side
+    /// peer selection across all peers advertising the same forward key.
+    pub(super) peer_rr_cursor: RwLock<HashMap<String, usize>>,
     pub(super) next_tunnel_handler_id: AtomicU64,
 
     pub(super) chat_handlers: RwLock<Vec<ChatHandler>>,
@@ -67,6 +70,7 @@ impl RTCManagerInner {
             peer_forward_keys: RwLock::new(HashMap::new()),
             self_forward_keys: RwLock::new(HashSet::new()),
             default_tunnel_target: RwLock::new(None),
+            peer_rr_cursor: RwLock::new(HashMap::new()),
             next_tunnel_handler_id: AtomicU64::new(1),
             chat_handlers: RwLock::new(Vec::new()),
             tunnel_msg_handlers: RwLock::new(Vec::new()),

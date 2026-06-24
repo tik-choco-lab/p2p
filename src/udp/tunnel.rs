@@ -22,12 +22,14 @@ impl UdpManager {
         if let Some(uc) = conns.get(&tm.conn_id) {
             if let Some(ref target) = uc.target_conn {
                 if target.send(&payload).await.is_ok() {
-                    self.runtime.record_bytes_out(payload.len());
+                    self.runtime
+                        .record_bytes_out_for(&uc.peer_id, payload.len());
                 }
             } else if let Some(ref addr) = uc.client_addr {
                 if let Some(ref sock) = *self.local_socket.read().await {
                     if sock.send_to(&payload, addr).await.is_ok() {
-                        self.runtime.record_bytes_out(payload.len());
+                        self.runtime
+                            .record_bytes_out_for(&uc.peer_id, payload.len());
                     }
                 }
             }
@@ -52,7 +54,7 @@ impl UdpManager {
                     }
                     let sock = Arc::new(sock);
                     if sock.send(&payload).await.is_ok() {
-                        self.runtime.record_bytes_out(payload.len());
+                        self.runtime.record_bytes_out_for(peer_id, payload.len());
                     }
 
                     let mut conns = self.conns.write().await;
@@ -66,7 +68,7 @@ impl UdpManager {
                         },
                     );
                     if old.is_none() {
-                        self.runtime.record_conn_open();
+                        self.runtime.record_conn_open_for(peer_id);
                     }
 
                     let mgr_conns = self.conns.clone();
@@ -87,7 +89,7 @@ impl UdpManager {
         } else if let Some(ref sock) = *self.local_socket.read().await {
             if let Ok(addr) = tm.conn_id.parse::<std::net::SocketAddr>() {
                 if sock.send_to(&payload, &addr).await.is_ok() {
-                    self.runtime.record_bytes_out(payload.len());
+                    self.runtime.record_bytes_out_for(peer_id, payload.len());
                 }
             }
         }
@@ -136,7 +138,7 @@ impl UdpManager {
                                 Err(_) => continue,
                             };
                             if rtc_manager.send_tunnel_to(&peer_id, data).await.is_ok() {
-                                runtime.record_bytes_in(n);
+                                runtime.record_bytes_in_for(&peer_id, n);
                             }
                         }
                         Err(e) => {

@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tracing::error;
 
 use crate::auth::{allow_all, SharedAuthorizer};
-use crate::forward_runtime::ForwardRuntime;
+use crate::forward_runtime::{ForwardRuntime, PeerMetrics};
 use crate::rtc::RTCManager;
 use crate::{tcp, udp};
 
@@ -67,6 +67,7 @@ pub struct ForwardStatus {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub state: ForwardState,
+    pub peers: Vec<PeerMetrics>,
 }
 
 #[allow(dead_code)]
@@ -169,6 +170,7 @@ impl ForwardController {
                     bytes_in: metrics.bytes_in,
                     bytes_out: metrics.bytes_out,
                     state: handle.state.clone(),
+                    peers: handle.runtime.peer_metrics(),
                 }
             })
             .collect::<Vec<_>>();

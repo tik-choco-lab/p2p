@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "p2p", about = "WebRTC P2P Tunnel CLI")]
 #[command(
-    long_about = "A P2P tunnel application using WebRTC.\nSupports TCP/UDP forwarding and standard I/O bridging.\n\nIf no command is specified, p2p starts in Chat Mode."
+    long_about = "A P2P tunnel application using WebRTC.\nSupports TCP/UDP forwarding and standard I/O bridging.\n\nIf no command is specified, p2p starts the interactive TUI."
 )]
 struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]

@@ -2,7 +2,8 @@ use std::io;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{sleep, timeout, Duration};
 
@@ -108,7 +109,7 @@ async fn chat_message_crosses_mistlib_nostr_signaling() -> io::Result<()> {
         return Ok(());
     }
 
-    let (mut alice, mut alice_stdout) = spawn_p2p(&[])?;
+    let (mut alice, mut alice_stdout) = spawn_p2p(&["chat"])?;
     let mut alice_stderr =
         BufReader::new(
             alice.child.stderr.take().ok_or_else(|| {
@@ -117,7 +118,7 @@ async fn chat_message_crosses_mistlib_nostr_signaling() -> io::Result<()> {
         );
     let room_id = read_room_id(&mut alice_stderr).await?;
 
-    let (mut bob, mut bob_stdout) = spawn_p2p(&[&room_id])?;
+    let (mut bob, mut bob_stdout) = spawn_p2p(&["chat", &room_id])?;
     let message = unique_id("nostr-e2e-message");
 
     let mut alice_stdin = alice
@@ -155,4 +156,108 @@ async fn chat_message_crosses_mistlib_nostr_signaling() -> io::Result<()> {
     // Keep alice_stdout alive until after process cleanup so stdout is drained by the OS pipe owner.
     let _ = &mut alice_stdout;
     Ok(())
+}
+
+/// Spawns a TCP echo server on an ephemeral local port and returns its port.
+async fn spawn_echo_server() -> io::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// Finds a currently-free local TCP port by binding to port 0 and releasing it.
+async fn free_port() -> io::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+#[tokio::test]
+#[ignore = "requires working mistlib default Nostr relay access"]
+async fn tcp_forward_crosses_mistlib_nostr_signaling() -> io::Result<()> {
+    if std::env::var("P2P_NOSTR_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set P2P_NOSTR_E2E=1 to run the live Nostr signaling test");
+        return Ok(());
+    }
+
+    // Origin echo server published by the serve side.
+    let remote_port = spawn_echo_server().await?;
+    // Local listen port opened by the connect side.
+    let listen_port = free_port().await?;
+
+    // serve: publish tcp:<remote_port>, auto-accept inbound connections.
+    let (mut server, mut server_stdout) = spawn_p2p(&[
+        "serve",
+        "--auto-accept",
+        &format!("tcp://127.0.0.1:{remote_port}"),
+    ])?;
+    let mut server_stderr =
+        BufReader::new(
+            server.child.stderr.take().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "stderr pipe was not created")
+            })?,
+        );
+    let room_id = read_room_id(&mut server_stderr).await?;
+
+    // connect: map local listen_port -> remote tcp:<remote_port>.
+    let (mut client, mut client_stdout) =
+        spawn_p2p(&["connect", &room_id, &format!("{listen_port}:{remote_port}")])?;
+
+    let message = unique_id("tcp-e2e");
+    let probe = async {
+        loop {
+            // Retry until the connect side is listening and the tunnel is ready.
+            let Ok(mut stream) = TcpStream::connect(("127.0.0.1", listen_port)).await else {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            };
+            if stream.write_all(message.as_bytes()).await.is_err() {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            let mut buf = vec![0u8; message.len()];
+            match stream.read_exact(&mut buf).await {
+                Ok(_) if buf == message.as_bytes() => return Ok::<_, io::Error>(()),
+                _ => {
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            }
+        }
+    };
+
+    let result = timeout(E2E_TIMEOUT, probe).await;
+
+    server.kill().await;
+    client.kill().await;
+    let _ = &mut server_stdout;
+    let _ = &mut client_stdout;
+
+    result.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for echoed bytes through tcp forward",
+        )
+    })?
 }

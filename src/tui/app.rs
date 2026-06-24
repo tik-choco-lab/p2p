@@ -28,6 +28,7 @@ pub(super) struct App {
     pub(super) trust: Vec<TrustEntry>,
     pub(super) forwards_sel: usize,
     pub(super) pending_sel: usize,
+    pub(super) expanded: bool,
     pub(super) message: Option<String>,
     pub(super) should_quit: bool,
 }
@@ -44,6 +45,7 @@ impl App {
             trust: Vec::new(),
             forwards_sel: 0,
             pending_sel: 0,
+            expanded: false,
             message: None,
             should_quit: false,
         }
@@ -86,6 +88,9 @@ impl App {
             }
             KeyCode::Char('a') => self.popup = Popup::Add(String::new()),
             KeyCode::Char('t') => self.popup = Popup::Trust(0),
+            KeyCode::Enter | KeyCode::Char(' ') if self.focus == Focus::Forwards => {
+                self.expanded = !self.expanded;
+            }
             KeyCode::Char('r') => {}
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
