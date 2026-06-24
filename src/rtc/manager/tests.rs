@@ -131,6 +131,50 @@ async fn message_payloads_are_dispatched_to_registered_handlers() {
     );
 }
 
+#[test]
+fn byte_payloads_are_encoded_as_hex_strings() {
+    let encoded_tunnel = encode(P2pPayload::Tunnel {
+        data: vec![1, 2, 3, 255],
+    });
+    let encoded_stdio = encode(P2pPayload::Stdio { data: vec![4, 5] });
+
+    assert_eq!(
+        String::from_utf8(encoded_tunnel).unwrap(),
+        r#"{"kind":"tunnel","data":"010203ff"}"#
+    );
+    assert_eq!(
+        String::from_utf8(encoded_stdio).unwrap(),
+        r#"{"kind":"stdio","data":"0405"}"#
+    );
+}
+
+#[tokio::test]
+async fn legacy_byte_array_payloads_are_still_accepted() {
+    let manager = test_manager("self", PeerRole::Client);
+    let tunnels = Arc::new(Mutex::new(Vec::new()));
+
+    {
+        let tunnels = tunnels.clone();
+        manager
+            .on_tunnel_message(move |peer, data| {
+                tunnels.lock().unwrap().push((peer, data));
+            })
+            .await;
+    }
+
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        br#"{"kind":"tunnel","data":[1,2,3]}"#.to_vec(),
+    )
+    .await;
+
+    assert_eq!(
+        *tunnels.lock().unwrap(),
+        vec![("peer-1".to_string(), vec![1, 2, 3])]
+    );
+}
+
 #[tokio::test]
 async fn invalid_and_self_payloads_are_ignored() {
     let manager = test_manager("self", PeerRole::Client);

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,28 +15,44 @@ use super::{UdpConn, UdpManager, MAX_UDP_SIZE};
 impl UdpManager {
     pub(super) async fn handle_data(&self, peer_id: &str, tm: &TunnelMessage) {
         let payload = match &tm.payload {
-            Some(p) if !p.is_empty() => p.clone(),
+            Some(p) if !p.is_empty() => p,
             _ => return,
         };
 
-        let conns = self.conns.read().await;
-        if let Some(uc) = conns.get(&tm.conn_id) {
-            if let Some(ref target) = uc.target_conn {
-                if target.send(&payload).await.is_ok() {
-                    self.runtime
-                        .record_bytes_out_for(&uc.peer_id, payload.len());
+        enum SendTarget {
+            Connected(Arc<UdpSocket>, String),
+            Local(Arc<UdpSocket>, SocketAddr, String),
+        }
+
+        let existing = {
+            let conns = self.conns.read().await;
+            if let Some(uc) = conns.get(&tm.conn_id) {
+                if let Some(target) = &uc.target_conn {
+                    Some(SendTarget::Connected(target.clone(), uc.peer_id.clone()))
+                } else if let Some(addr) = uc.client_addr {
+                    let sock = self.local_socket.read().await.clone();
+                    sock.map(|sock| SendTarget::Local(sock, addr, uc.peer_id.clone()))
+                } else {
+                    None
                 }
-            } else if let Some(ref addr) = uc.client_addr {
-                if let Some(ref sock) = *self.local_socket.read().await {
-                    if sock.send_to(&payload, addr).await.is_ok() {
-                        self.runtime
-                            .record_bytes_out_for(&uc.peer_id, payload.len());
-                    }
-                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(target) = existing {
+            let sent = match &target {
+                SendTarget::Connected(sock, _) => sock.send(payload).await.is_ok(),
+                SendTarget::Local(sock, addr, _) => sock.send_to(payload, addr).await.is_ok(),
+            };
+            if sent {
+                let peer_id = match target {
+                    SendTarget::Connected(_, peer_id) | SendTarget::Local(_, _, peer_id) => peer_id,
+                };
+                self.runtime.record_bytes_out_for(&peer_id, payload.len());
             }
             return;
         }
-        drop(conns);
 
         if !self.remote_addr.is_empty() {
             if !self.authorize_remote_session(peer_id).await {
@@ -53,7 +70,7 @@ impl UdpManager {
                         return;
                     }
                     let sock = Arc::new(sock);
-                    if sock.send(&payload).await.is_ok() {
+                    if sock.send(payload).await.is_ok() {
                         self.runtime.record_bytes_out_for(peer_id, payload.len());
                     }
 
@@ -88,7 +105,7 @@ impl UdpManager {
             }
         } else if let Some(ref sock) = *self.local_socket.read().await {
             if let Ok(addr) = tm.conn_id.parse::<std::net::SocketAddr>() {
-                if sock.send_to(&payload, &addr).await.is_ok() {
+                if sock.send_to(payload, &addr).await.is_ok() {
                     self.runtime.record_bytes_out_for(peer_id, payload.len());
                 }
             }
