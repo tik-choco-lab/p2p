@@ -2,6 +2,8 @@ use super::*;
 
 use std::path::PathBuf;
 
+mod pending;
+
 fn request(peer_id: &str, forward_key: &str) -> AuthRequest {
     AuthRequest {
         peer_id: peer_id.to_string(),

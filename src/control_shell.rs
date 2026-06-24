@@ -1,22 +1,15 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::{AuthAuditLog, TrustStore};
-use crate::controller::{Direction, ForwardController, ForwardSpec, ForwardState, Proto};
-use crate::forward_args::{forward_key, parse_connect_forward, parse_forward};
+use crate::auth::{AuthAuditLog, PendingAuthorizations, TrustStore};
+use crate::controller::{Direction, ForwardController, ForwardSpec, ForwardState};
 
+mod commands;
 mod events;
+mod pending;
 mod trust;
 
-enum ShellCommand {
-    Add(ForwardSpec),
-    Remove(String),
-    List,
-    Events,
-    Trust(trust::Command),
-    Help,
-    Quit,
-}
+use commands::{parse_command, ShellCommand};
 
 #[derive(Debug)]
 pub(crate) struct ShellOutcome {
@@ -28,6 +21,7 @@ pub(crate) async fn run<R, W>(
     controller: ForwardController,
     trust_store: TrustStore,
     audit_log: AuthAuditLog,
+    pending_auth: PendingAuthorizations,
     mut reader: R,
     mut writer: W,
 ) -> Result<()>
@@ -46,9 +40,14 @@ where
             break;
         }
 
-        let outcome =
-            execute_line_with_context(&controller, Some(&trust_store), Some(&audit_log), &line)
-                .await?;
+        let outcome = execute_line_with_context(
+            &controller,
+            Some(&trust_store),
+            Some(&audit_log),
+            Some(&pending_auth),
+            &line,
+        )
+        .await?;
         if !outcome.output.is_empty() {
             writer.write_all(outcome.output.as_bytes()).await?;
         }
@@ -76,13 +75,14 @@ pub(crate) async fn execute_line_with_trust(
     trust_store: Option<&TrustStore>,
     line: &str,
 ) -> Result<ShellOutcome> {
-    execute_line_with_context(controller, trust_store, None, line).await
+    execute_line_with_context(controller, trust_store, None, None, line).await
 }
 
 pub(crate) async fn execute_line_with_context(
     controller: &ForwardController,
     trust_store: Option<&TrustStore>,
     audit_log: Option<&AuthAuditLog>,
+    pending_auth: Option<&PendingAuthorizations>,
     line: &str,
 ) -> Result<ShellOutcome> {
     let Some(command) = parse_command(line)? else {
@@ -115,6 +115,14 @@ pub(crate) async fn execute_line_with_context(
             output: events::format(audit_log).await?,
             should_quit: false,
         }),
+        ShellCommand::Pending => Ok(ShellOutcome {
+            output: pending::format(pending_auth).await?,
+            should_quit: false,
+        }),
+        ShellCommand::ResolvePending(command) => Ok(ShellOutcome {
+            output: pending::resolve(pending_auth, command).await?,
+            should_quit: false,
+        }),
         ShellCommand::Trust(command) => Ok(ShellOutcome {
             output: trust::execute(trust_store, command).await?,
             should_quit: false,
@@ -127,50 +135,6 @@ pub(crate) async fn execute_line_with_context(
             output: "bye\n".to_string(),
             should_quit: true,
         }),
-    }
-}
-
-fn parse_command(line: &str) -> Result<Option<ShellCommand>> {
-    let parts = line.split_whitespace().collect::<Vec<_>>();
-    let Some(command) = parts.first().copied() else {
-        return Ok(None);
-    };
-
-    match command {
-        "add" if parts.len() == 3 => parse_add(parts[1], parts[2]).map(Some),
-        "remove" | "rm" if parts.len() == 2 => Ok(Some(ShellCommand::Remove(parts[1].into()))),
-        "list" | "ls" if parts.len() == 1 => Ok(Some(ShellCommand::List)),
-        "events" | "ev" if parts.len() == 1 => Ok(Some(ShellCommand::Events)),
-        "trust" | "t" => trust::parse(&parts).map(ShellCommand::Trust).map(Some),
-        "help" | "h" if parts.len() == 1 => Ok(Some(ShellCommand::Help)),
-        "quit" | "q" | "exit" if parts.len() == 1 => Ok(Some(ShellCommand::Quit)),
-        _ => Err(anyhow!("unknown command; type `help` for usage")),
-    }
-}
-
-fn parse_add(direction: &str, forward: &str) -> Result<ShellCommand> {
-    match direction {
-        "serve" => {
-            let (proto, addr, _) = parse_forward(forward);
-            Ok(ShellCommand::Add(ForwardSpec {
-                direction: Direction::Serve,
-                proto: Proto::from_name(proto)?,
-                addr: addr.to_string(),
-                listen_port: -1,
-                target: forward_key(proto, addr),
-            }))
-        }
-        "connect" => {
-            let (proto, listen_port, target) = parse_connect_forward(forward);
-            Ok(ShellCommand::Add(ForwardSpec {
-                direction: Direction::Connect,
-                proto: Proto::from_name(proto)?,
-                addr: String::new(),
-                listen_port,
-                target,
-            }))
-        }
-        _ => Err(anyhow!("direction must be `serve` or `connect`")),
     }
 }
 
@@ -226,6 +190,9 @@ fn help_text() -> String {
         "  remove <target>",
         "  list",
         "  events",
+        "  pending",
+        "  approve <pending-id> [always]",
+        "  deny <pending-id> [always]",
         "  trust list",
         "  trust allow <peer-id> <target>",
         "  trust deny <peer-id> <target>",

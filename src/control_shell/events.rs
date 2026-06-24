@@ -41,5 +41,6 @@ fn event_source_name(source: AuthEventSource) -> &'static str {
     match source {
         AuthEventSource::Policy => "policy",
         AuthEventSource::TrustStore => "trust",
+        AuthEventSource::Pending => "pending",
     }
 }
