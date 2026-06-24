@@ -254,3 +254,21 @@ impl TcpManager {
         }
     }
 }
+
+fn is_expected_tcp_close(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn log_tcp_io_error(context: &str, e: &std::io::Error) {
+    if is_expected_tcp_close(e) {
+        debug!("{}: {}", context, e);
+    } else {
+        tracing::error!("{}: {}", context, e);
+    }
+}

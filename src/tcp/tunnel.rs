@@ -7,7 +7,7 @@ use tracing::{debug, error};
 use crate::auth::AuthRequest;
 use crate::rtc::TunnelMessage;
 
-use super::TcpManager;
+use super::{log_tcp_io_error, TcpManager};
 
 impl TcpManager {
     pub(super) async fn on_tunnel_message(&self, peer_id: &str, data: &[u8]) {
@@ -91,7 +91,7 @@ impl TcpManager {
 
         let mut writer = writer.lock().await;
         if let Err(e) = writer.write_all(payload).await {
-            error!("failed to write to tcp: {}", e);
+            log_tcp_io_error("failed to write to tcp", &e);
             drop(writer);
             self.close_conn(&tm.conn_id, true).await;
         } else {
