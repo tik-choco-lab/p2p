@@ -3,8 +3,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+pub use audit::{AuthAuditLog, AuthEvent, AuthEventSource};
 pub use trust::{default_trust_store_path, TrustDecision, TrustEntry, TrustKey, TrustStore};
 
+mod audit;
 mod trust;
 
 pub type AuthFuture<'a> = Pin<Box<dyn Future<Output = AuthDecision> + Send + 'a>>;
@@ -80,15 +82,36 @@ impl AuthPolicy {
 pub struct PolicyAuthorizer {
     policy: AuthPolicy,
     store: TrustStore,
+    audit_log: Option<AuthAuditLog>,
 }
 
 impl PolicyAuthorizer {
     pub fn new(policy: AuthPolicy, store: TrustStore) -> Self {
-        Self { policy, store }
+        Self {
+            policy,
+            store,
+            audit_log: None,
+        }
     }
 
     pub fn shared(policy: AuthPolicy, store: TrustStore) -> SharedAuthorizer {
         Arc::new(Self::new(policy, store))
+    }
+
+    pub fn with_audit_log(policy: AuthPolicy, store: TrustStore, audit_log: AuthAuditLog) -> Self {
+        Self {
+            policy,
+            store,
+            audit_log: Some(audit_log),
+        }
+    }
+
+    pub fn shared_with_audit_log(
+        policy: AuthPolicy,
+        store: TrustStore,
+        audit_log: AuthAuditLog,
+    ) -> SharedAuthorizer {
+        Arc::new(Self::with_audit_log(policy, store, audit_log))
     }
 
     async fn decide(&self, req: &AuthRequest) -> AuthDecision {
@@ -97,10 +120,13 @@ impl PolicyAuthorizer {
             forward_key: req.forward_key.clone(),
         };
         if let Some(decision) = self.store.get(&key).await {
-            return match decision {
+            let auth_decision = match decision {
                 TrustDecision::Allow => AuthDecision::Allow,
                 TrustDecision::Deny => AuthDecision::Deny,
             };
+            self.record(req, auth_decision, AuthEventSource::TrustStore)
+                .await;
+            return auth_decision;
         }
 
         let decision = match &self.policy {
@@ -111,7 +137,14 @@ impl PolicyAuthorizer {
         if let Some(trust) = decision.trust_decision() {
             let _ = self.store.remember(key, trust).await;
         }
+        self.record(req, decision, AuthEventSource::Policy).await;
         decision
+    }
+
+    async fn record(&self, req: &AuthRequest, decision: AuthDecision, source: AuthEventSource) {
+        if let Some(log) = &self.audit_log {
+            log.record(req, decision, source).await;
+        }
     }
 }
 

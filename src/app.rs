@@ -5,7 +5,8 @@ use tokio::io::AsyncBufReadExt;
 use tracing::error;
 
 use crate::auth::{
-    default_trust_store_path, AuthPolicy, PolicyAuthorizer, SharedAuthorizer, TrustStore,
+    default_trust_store_path, AuthAuditLog, AuthPolicy, PolicyAuthorizer, SharedAuthorizer,
+    TrustStore,
 };
 use crate::controller::{Direction, ForwardController, ForwardSpec, Proto};
 use crate::forward_args::{forward_key, parse_connect_forward, parse_forward, split_serve_args};
@@ -30,13 +31,21 @@ pub(crate) async fn run_control_shell(room_id: Option<&str>) -> Result<()> {
 
     let self_id = uuid::Uuid::new_v4().to_string();
     let manager = RTCManager::new(self_id, room, false).await;
-    let controller = ForwardController::new(manager.clone());
     let trust_store = TrustStore::load(default_trust_store_path()).await?;
+    let audit_log = AuthAuditLog::default();
+    let controller = ForwardController::with_authorizer(
+        manager.clone(),
+        PolicyAuthorizer::shared_with_audit_log(
+            AuthPolicy::DenyUnknown,
+            trust_store.clone(),
+            audit_log.clone(),
+        ),
+    );
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
     tokio::select! {
-        result = control_shell::run(controller, trust_store, stdin, stdout) => {
+        result = control_shell::run(controller, trust_store, audit_log, stdin, stdout) => {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {}

@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::auth::{TrustDecision, TrustKey, TrustStore};
+use crate::auth::{
+    AuthAuditLog, AuthDecision, AuthEventSource, AuthRequest, TrustDecision, TrustKey, TrustStore,
+};
 
 fn temp_store_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -129,6 +131,42 @@ async fn trust_commands_require_store() {
     let err = execute_line(&controller, "trust list").await.unwrap_err();
 
     assert!(err.to_string().contains("trust commands are unavailable"));
+}
+
+#[tokio::test]
+async fn events_render_auth_audit_log() {
+    let controller = ForwardController::new_inert();
+    let audit_log = AuthAuditLog::default();
+    audit_log
+        .record(
+            &AuthRequest {
+                peer_id: "peer-a".to_string(),
+                forward_key: "tcp:80".to_string(),
+                target_addr: "127.0.0.1:80".to_string(),
+                proto: "tcp".to_string(),
+            },
+            AuthDecision::Allow,
+            AuthEventSource::Policy,
+        )
+        .await;
+
+    let outcome = execute_line_with_context(&controller, None, Some(&audit_log), "events")
+        .await
+        .unwrap();
+
+    assert!(outcome.output.contains("seq decision source peer target"));
+    assert!(outcome
+        .output
+        .contains("1 allow policy peer-a tcp:80 tcp 127.0.0.1:80"));
+}
+
+#[tokio::test]
+async fn events_require_audit_log() {
+    let controller = ForwardController::new_inert();
+
+    let err = execute_line(&controller, "events").await.unwrap_err();
+
+    assert!(err.to_string().contains("events are unavailable"));
 }
 
 #[tokio::test]

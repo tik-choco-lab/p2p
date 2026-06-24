@@ -155,3 +155,76 @@ async fn trust_store_takes_precedence_over_policy() {
     assert_eq!(decision, AuthDecision::Deny);
     let _ = tokio::fs::remove_file(path).await;
 }
+
+#[tokio::test]
+async fn policy_authorizer_records_policy_decision_events() {
+    let store = TrustStore::load(temp_store_path("audit-policy"))
+        .await
+        .unwrap();
+    let audit_log = AuthAuditLog::default();
+    let authorizer =
+        PolicyAuthorizer::with_audit_log(AuthPolicy::DenyUnknown, store, audit_log.clone());
+
+    let decision = authorizer.authorize(&request("peer-a", "tcp:80")).await;
+    let events = audit_log.list().await;
+
+    assert_eq!(decision, AuthDecision::Deny);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].peer_id, "peer-a");
+    assert_eq!(events[0].forward_key, "tcp:80");
+    assert_eq!(events[0].decision, AuthDecision::Deny);
+    assert_eq!(events[0].source, AuthEventSource::Policy);
+}
+
+#[tokio::test]
+async fn policy_authorizer_records_trust_store_decision_events() {
+    let path = temp_store_path("audit-trust");
+    let store = TrustStore::load(&path).await.unwrap();
+    store
+        .remember(
+            TrustKey {
+                peer_id: "peer-a".to_string(),
+                forward_key: "tcp:80".to_string(),
+            },
+            TrustDecision::Allow,
+        )
+        .await
+        .unwrap();
+    let audit_log = AuthAuditLog::default();
+    let authorizer =
+        PolicyAuthorizer::with_audit_log(AuthPolicy::DenyUnknown, store, audit_log.clone());
+
+    let decision = authorizer.authorize(&request("peer-a", "tcp:80")).await;
+    let events = audit_log.list().await;
+
+    assert_eq!(decision, AuthDecision::Allow);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].decision, AuthDecision::Allow);
+    assert_eq!(events[0].source, AuthEventSource::TrustStore);
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn audit_log_retains_only_capacity() {
+    let audit_log = AuthAuditLog::with_capacity(1);
+
+    audit_log
+        .record(
+            &request("peer-a", "tcp:80"),
+            AuthDecision::Allow,
+            AuthEventSource::Policy,
+        )
+        .await;
+    audit_log
+        .record(
+            &request("peer-b", "udp:53"),
+            AuthDecision::Deny,
+            AuthEventSource::Policy,
+        )
+        .await;
+
+    let events = audit_log.list().await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].peer_id, "peer-b");
+    assert_eq!(events[0].sequence, 2);
+}
