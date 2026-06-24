@@ -4,8 +4,9 @@ use std::time::Instant;
 
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{debug, error};
 
+use crate::auth::AuthRequest;
 use crate::rtc::{RTCManager, TunnelMessage};
 
 use super::{UdpConn, UdpManager, MAX_UDP_SIZE};
@@ -35,6 +36,14 @@ impl UdpManager {
         drop(conns);
 
         if !self.remote_addr.is_empty() {
+            if !self.authorize_remote_session(peer_id).await {
+                debug!(
+                    "denied udp tunnel session from {} to {}",
+                    peer_id, self.target
+                );
+                return;
+            }
+
             match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(sock) => {
                     if let Err(e) = sock.connect(&self.remote_addr).await {
@@ -82,6 +91,16 @@ impl UdpManager {
                 }
             }
         }
+    }
+
+    async fn authorize_remote_session(&self, peer_id: &str) -> bool {
+        let req = AuthRequest {
+            peer_id: peer_id.to_string(),
+            forward_key: self.target.clone(),
+            target_addr: self.remote_addr.clone(),
+            proto: "udp".to_string(),
+        };
+        self.authorizer.authorize(&req).await.is_allowed()
     }
 
     async fn forward_target_to_tunnel(

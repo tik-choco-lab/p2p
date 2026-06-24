@@ -6,11 +6,15 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::debug;
 
+use crate::auth::{allow_all, SharedAuthorizer};
 use crate::forward_runtime::ForwardRuntime;
 use crate::rtc::{RTCManager, TunnelMessage};
 
+mod lifecycle;
 mod local;
 mod tunnel;
+
+use lifecycle::{forward_key, spawn_handler_cleanup};
 
 const TCP_BUFFER_SIZE: usize = 4096;
 const TUNNEL_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -28,6 +32,7 @@ pub struct TcpManager {
     remote_addr: String,
     target: String,
     runtime: ForwardRuntime,
+    authorizer: SharedAuthorizer,
 }
 
 impl TcpManager {
@@ -59,6 +64,25 @@ impl TcpManager {
         target: String,
         runtime: ForwardRuntime,
     ) -> Result<()> {
+        Self::listen_and_serve_with_target_and_auth(
+            rtc_manager,
+            listen_port,
+            remote_addr,
+            target,
+            runtime,
+            allow_all(),
+        )
+        .await
+    }
+
+    pub async fn listen_and_serve_with_target_and_auth(
+        rtc_manager: RTCManager,
+        listen_port: i32,
+        remote_addr: String,
+        target: String,
+        runtime: ForwardRuntime,
+        authorizer: SharedAuthorizer,
+    ) -> Result<()> {
         let resolved = if !remote_addr.is_empty() {
             if remote_addr.contains(':') {
                 remote_addr.clone()
@@ -75,6 +99,7 @@ impl TcpManager {
             remote_addr: resolved,
             target: target.clone(),
             runtime,
+            authorizer,
         });
 
         let mgr_msg = mgr.clone();
@@ -209,31 +234,7 @@ impl TcpManager {
             remote_addr: self.remote_addr.clone(),
             target: self.target.clone(),
             runtime: self.runtime.clone(),
+            authorizer: self.authorizer.clone(),
         }
     }
-}
-
-#[allow(dead_code)]
-fn forward_key(proto: &str, addr: &str) -> String {
-    let port = addr
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<i32>().ok())
-        .unwrap_or(-1);
-    format!("{}:{}", proto, port)
-}
-
-fn spawn_handler_cleanup(rtc_manager: RTCManager, runtime: ForwardRuntime, handler_id: u64) {
-    tokio::spawn(async move {
-        let mut shutdown = runtime.subscribe();
-        loop {
-            if *shutdown.borrow() {
-                break;
-            }
-            if shutdown.changed().await.is_err() {
-                break;
-            }
-        }
-        rtc_manager.remove_tunnel_message_handler(handler_id).await;
-    });
 }
