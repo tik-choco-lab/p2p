@@ -1,5 +1,7 @@
 use super::*;
 
+use std::path::PathBuf;
+
 fn request(peer_id: &str, forward_key: &str) -> AuthRequest {
     AuthRequest {
         peer_id: peer_id.to_string(),
@@ -75,6 +77,60 @@ async fn trust_store_persists_remembered_decisions() {
         .await;
 
     assert_eq!(decision, Some(TrustDecision::Allow));
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn trust_store_lists_entries_in_stable_order() {
+    let path = temp_store_path("list");
+    let store = TrustStore::load(&path).await.unwrap();
+    store
+        .remember(
+            TrustKey {
+                peer_id: "peer-b".to_string(),
+                forward_key: "udp:53".to_string(),
+            },
+            TrustDecision::Deny,
+        )
+        .await
+        .unwrap();
+    store
+        .remember(
+            TrustKey {
+                peer_id: "peer-a".to_string(),
+                forward_key: "tcp:80".to_string(),
+            },
+            TrustDecision::Allow,
+        )
+        .await
+        .unwrap();
+
+    let entries = store.list().await;
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].key.peer_id, "peer-a");
+    assert_eq!(entries[1].key.peer_id, "peer-b");
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn trust_store_removes_entry() {
+    let path = temp_store_path("remove");
+    let key = TrustKey {
+        peer_id: "peer-a".to_string(),
+        forward_key: "tcp:80".to_string(),
+    };
+    let store = TrustStore::load(&path).await.unwrap();
+    store
+        .remember(key.clone(), TrustDecision::Allow)
+        .await
+        .unwrap();
+
+    assert!(store.remove(&key).await.unwrap());
+    assert_eq!(store.get(&key).await, None);
+
+    let loaded = TrustStore::load(&path).await.unwrap();
+    assert_eq!(loaded.get(&key).await, None);
     let _ = tokio::fs::remove_file(path).await;
 }
 
