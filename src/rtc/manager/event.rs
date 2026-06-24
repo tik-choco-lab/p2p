@@ -110,6 +110,38 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
                 h(peer_id.clone(), data.clone());
             }
         }
+        P2pPayload::ForwardRequest {
+            req_id,
+            proto,
+            remote_addr,
+            target,
+        } => {
+            let ev = super::ForwardRequestEvent {
+                req_id,
+                proto,
+                remote_addr,
+                target,
+            };
+            let handlers = inner.forward_request_handlers.read().await;
+            for h in handlers.iter() {
+                h(peer_id.clone(), ev.clone());
+            }
+        }
+        P2pPayload::ForwardResponse {
+            req_id,
+            target,
+            accepted,
+        } => {
+            let ev = super::ForwardResponseEvent {
+                req_id,
+                target,
+                accepted,
+            };
+            let handlers = inner.forward_response_handlers.read().await;
+            for h in handlers.iter() {
+                h(peer_id.clone(), ev.clone());
+            }
+        }
     }
 }
 

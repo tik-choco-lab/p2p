@@ -16,6 +16,24 @@ mod tests;
 
 const MISTLIB_CONFIG_ENV: &str = "P2P_MISTLIB_CONFIG_JSON";
 
+/// A peer's proposal to establish a forward: the peer wants to reach
+/// `remote_addr` on this node, multiplexed under `target`.
+#[derive(Debug, Clone)]
+pub struct ForwardRequestEvent {
+    pub req_id: String,
+    pub proto: String,
+    pub remote_addr: String,
+    pub target: String,
+}
+
+/// A peer's answer to a previously sent [`ForwardRequestEvent`].
+#[derive(Debug, Clone)]
+pub struct ForwardResponseEvent {
+    pub req_id: String,
+    pub target: String,
+    pub accepted: bool,
+}
+
 #[derive(Clone)]
 pub struct RTCManagerHandle {
     inner: Arc<RTCManagerInner>,
@@ -114,6 +132,48 @@ impl RTCManagerHandle {
         let idx = *cursor % peers.len();
         *cursor = cursor.wrapping_add(1);
         Some(peers[idx].clone())
+    }
+
+    pub async fn connected_peers(&self) -> Vec<String> {
+        let mut peers = self
+            .inner
+            .peers
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        peers.sort();
+        peers
+    }
+
+    pub async fn send_forward_request(&self, peer_id: &str, ev: ForwardRequestEvent) -> Result<()> {
+        self.send_payload(
+            peer_id,
+            P2pPayload::ForwardRequest {
+                req_id: ev.req_id,
+                proto: ev.proto,
+                remote_addr: ev.remote_addr,
+                target: ev.target,
+            },
+        )
+        .await
+    }
+
+    pub async fn send_forward_response(
+        &self,
+        peer_id: &str,
+        ev: ForwardResponseEvent,
+    ) -> Result<()> {
+        self.send_payload(
+            peer_id,
+            P2pPayload::ForwardResponse {
+                req_id: ev.req_id,
+                target: ev.target,
+                accepted: ev.accepted,
+            },
+        )
+        .await
     }
 
     pub async fn publish_tunnel_target(&self, target: &str) {
