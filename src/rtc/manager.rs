@@ -6,10 +6,10 @@ mod event;
 mod payload;
 mod state;
 
+use crate::rtc::TunnelMessage;
 use event::dispatch_event;
 use payload::P2pPayload;
 use state::{PeerRole, RTCManagerInner};
-use crate::rtc::TunnelMessage;
 
 #[cfg(test)]
 mod tests;

@@ -30,8 +30,7 @@ fn connect_forward_maps_listen_port_to_remote_target() {
 
 #[test]
 fn serve_args_keep_all_forwards_when_room_is_present() {
-    let (room, forwards) =
-        split_serve_args(&strings(&["my-room", ":80", "tcp://127.0.0.1:5432"]));
+    let (room, forwards) = split_serve_args(&strings(&["my-room", ":80", "tcp://127.0.0.1:5432"]));
 
     assert_eq!(room, Some("my-room".to_string()));
     assert_eq!(forwards, strings(&[":80", "tcp://127.0.0.1:5432"]));

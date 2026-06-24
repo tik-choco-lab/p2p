@@ -34,6 +34,25 @@ async fn add_forward_registers_status() {
 }
 
 #[tokio::test]
+async fn list_forwards_reflects_runtime_metrics() {
+    let controller = ForwardController::new_inert();
+    controller.add_forward(serve_spec("tcp:80")).await.unwrap();
+
+    {
+        let forwards = controller.forwards.read().await;
+        let runtime = &forwards.get("tcp:80").unwrap().runtime;
+        runtime.record_conn_open();
+        runtime.record_bytes_in(128);
+        runtime.record_bytes_out(64);
+    }
+
+    let status = controller.list_forwards().await.into_iter().next().unwrap();
+    assert_eq!(status.active_conns, 1);
+    assert_eq!(status.bytes_in, 128);
+    assert_eq!(status.bytes_out, 64);
+}
+
+#[tokio::test]
 async fn add_forward_rejects_duplicate_key() {
     let controller = ForwardController::new_inert();
 
@@ -70,7 +89,10 @@ async fn remove_forward_rejects_unknown_key() {
 async fn list_forwards_is_sorted_by_key() {
     let controller = ForwardController::new_inert();
 
-    controller.add_forward(serve_spec("udp:9000")).await.unwrap();
+    controller
+        .add_forward(serve_spec("udp:9000"))
+        .await
+        .unwrap();
     controller.add_forward(serve_spec("tcp:80")).await.unwrap();
 
     let keys = controller

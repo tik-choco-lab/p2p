@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::error;
 
+use crate::forward_runtime::ForwardRuntime;
 use crate::rtc::RTCManager;
 use crate::{tcp, udp};
 
@@ -70,9 +71,7 @@ pub struct ForwardStatus {
 #[allow(dead_code)]
 struct ForwardHandle {
     spec: ForwardSpec,
-    active_conns: usize,
-    bytes_in: u64,
-    bytes_out: u64,
+    runtime: ForwardRuntime,
     state: ForwardState,
     task: Option<JoinHandle<()>>,
 }
@@ -109,20 +108,19 @@ impl ForwardController {
         if forwards.contains_key(&key) {
             return Err(anyhow!("forward already exists: {}", key));
         }
+        let runtime = ForwardRuntime::new();
         forwards.insert(
             key.clone(),
             ForwardHandle {
                 spec: spec.clone(),
-                active_conns: 0,
-                bytes_in: 0,
-                bytes_out: 0,
+                runtime: runtime.clone(),
                 state: ForwardState::Listening,
                 task: None,
             },
         );
         drop(forwards);
 
-        let task = self.spawn_forward(spec, key.clone()).await;
+        let task = self.spawn_forward(spec, key.clone(), runtime).await;
         if let Some(task) = task {
             if let Some(handle) = self.forwards.write().await.get_mut(&key) {
                 handle.task = Some(task);
@@ -137,6 +135,7 @@ impl ForwardController {
             return Err(anyhow!("forward not found: {}", key));
         };
 
+        handle.runtime.cancel();
         if let Some(task) = handle.task {
             task.abort();
         }
@@ -153,20 +152,28 @@ impl ForwardController {
         let forwards = self.forwards.read().await;
         let mut statuses = forwards
             .iter()
-            .map(|(key, handle)| ForwardStatus {
-                key: key.clone(),
-                spec: handle.spec.clone(),
-                active_conns: handle.active_conns,
-                bytes_in: handle.bytes_in,
-                bytes_out: handle.bytes_out,
-                state: handle.state.clone(),
+            .map(|(key, handle)| {
+                let metrics = handle.runtime.metrics();
+                ForwardStatus {
+                    key: key.clone(),
+                    spec: handle.spec.clone(),
+                    active_conns: metrics.active_conns,
+                    bytes_in: metrics.bytes_in,
+                    bytes_out: metrics.bytes_out,
+                    state: handle.state.clone(),
+                }
             })
             .collect::<Vec<_>>();
         statuses.sort_by(|a, b| a.key.cmp(&b.key));
         statuses
     }
 
-    async fn spawn_forward(&self, spec: ForwardSpec, key: String) -> Option<JoinHandle<()>> {
+    async fn spawn_forward(
+        &self,
+        spec: ForwardSpec,
+        key: String,
+        runtime: ForwardRuntime,
+    ) -> Option<JoinHandle<()>> {
         let manager = self.rtc_manager.clone()?;
         let state = self.forwards.clone();
 
@@ -178,6 +185,7 @@ impl ForwardController {
                         spec.listen_port,
                         spec.addr.clone(),
                         spec.target.clone(),
+                        runtime,
                     )
                     .await
                 }
@@ -187,6 +195,7 @@ impl ForwardController {
                         spec.listen_port,
                         spec.addr.clone(),
                         spec.target.clone(),
+                        runtime,
                     )
                     .await
                 }

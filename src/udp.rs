@@ -7,6 +7,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tracing::{debug, error};
 
+use crate::forward_runtime::ForwardRuntime;
 use crate::rtc::{RTCManager, TunnelMessage};
 
 mod tunnel;
@@ -30,6 +31,7 @@ pub struct UdpManager {
     remote_addr: String,
     local_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     target: String,
+    runtime: ForwardRuntime,
 }
 
 impl UdpManager {
@@ -44,7 +46,14 @@ impl UdpManager {
         } else {
             forward_key("udp", &remote_addr)
         };
-        Self::listen_and_serve_with_target(rtc_manager, listen_port, remote_addr, target).await
+        Self::listen_and_serve_with_target(
+            rtc_manager,
+            listen_port,
+            remote_addr,
+            target,
+            ForwardRuntime::new(),
+        )
+        .await
     }
 
     pub async fn listen_and_serve_with_target(
@@ -52,6 +61,7 @@ impl UdpManager {
         listen_port: i32,
         remote_addr: String,
         target: String,
+        runtime: ForwardRuntime,
     ) -> Result<()> {
         let mgr = Arc::new(Self {
             rtc_manager: rtc_manager.clone(),
@@ -59,6 +69,7 @@ impl UdpManager {
             remote_addr,
             local_socket: Arc::new(RwLock::new(None)),
             target: target.clone(),
+            runtime,
         });
 
         let mgr_msg = mgr.clone();
@@ -91,58 +102,79 @@ impl UdpManager {
 
     async fn read_local_packets(self: Arc<Self>, socket: Arc<UdpSocket>) {
         let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let mut shutdown = self.runtime.subscribe();
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((n, addr)) => {
-                    let conn_id = addr.to_string();
-                    let peer_id = {
-                        let conns = self.conns.read().await;
-                        conns.get(&conn_id).map(|c| c.peer_id.clone())
-                    };
-
-                    let peer_id = match peer_id {
-                        Some(id) => id,
-                        None => match self.wait_for_tunnel_ready(TUNNEL_READY_TIMEOUT).await {
-                            Ok(id) => {
-                                let mut conns = self.conns.write().await;
-                                conns.entry(conn_id.clone()).or_insert(UdpConn {
-                                    target_conn: None,
-                                    last_seen: Instant::now(),
-                                    peer_id: id.clone(),
-                                    client_addr: Some(addr),
-                                });
-                                id
-                            }
-                            Err(e) => {
-                                error!("Tunnel not ready for UDP: {}", e);
-                                continue;
-                            }
-                        },
-                    };
-
-                    {
-                        let mut conns = self.conns.write().await;
-                        if let Some(uc) = conns.get_mut(&conn_id) {
-                            uc.last_seen = Instant::now();
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((n, addr)) => {
+                            self.handle_local_packet(&buf[..n], addr).await;
+                        }
+                        Err(e) => {
+                            error!("UDP read error: {}", e);
+                            return;
                         }
                     }
-
-                    let payload = buf[..n].to_vec();
-                    let msg = TunnelMessage {
-                        msg_type: "data".into(),
-                        conn_id,
-                        target: self.target.clone(),
-                        payload: Some(payload),
-                    };
-                    if let Err(e) = self.send_to(&peer_id, &msg).await {
-                        error!("Failed to send UDP data: {}", e);
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
                     }
                 }
+            }
+        }
+    }
+
+    async fn handle_local_packet(&self, payload: &[u8], addr: std::net::SocketAddr) {
+        let conn_id = addr.to_string();
+        let peer_id = {
+            let conns = self.conns.read().await;
+            conns.get(&conn_id).map(|c| c.peer_id.clone())
+        };
+
+        let peer_id = match peer_id {
+            Some(id) => id,
+            None => match self.wait_for_tunnel_ready(TUNNEL_READY_TIMEOUT).await {
+                Ok(id) => {
+                    let mut conns = self.conns.write().await;
+                    let old = conns.insert(
+                        conn_id.clone(),
+                        UdpConn {
+                            target_conn: None,
+                            last_seen: Instant::now(),
+                            peer_id: id.clone(),
+                            client_addr: Some(addr),
+                        },
+                    );
+                    if old.is_none() {
+                        self.runtime.record_conn_open();
+                    }
+                    id
+                }
                 Err(e) => {
-                    error!("UDP read error: {}", e);
+                    error!("Tunnel not ready for UDP: {}", e);
                     return;
                 }
+            },
+        };
+
+        {
+            let mut conns = self.conns.write().await;
+            if let Some(uc) = conns.get_mut(&conn_id) {
+                uc.last_seen = Instant::now();
             }
+        }
+
+        let msg = TunnelMessage {
+            msg_type: "data".into(),
+            conn_id,
+            target: self.target.clone(),
+            payload: Some(payload.to_vec()),
+        };
+        if let Err(e) = self.send_to(&peer_id, &msg).await {
+            error!("Failed to send UDP data: {}", e);
+        } else {
+            self.runtime.record_bytes_in(payload.len());
         }
     }
 
@@ -178,17 +210,31 @@ impl UdpManager {
 
     async fn cleanup_loop(&self) {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        let mut shutdown = self.runtime.subscribe();
         loop {
-            interval.tick().await;
-            let mut conns = self.conns.write().await;
-            conns.retain(|id, uc| {
-                if uc.last_seen.elapsed() > UDP_TIMEOUT {
-                    debug!("Cleaned up UDP session: {}", id);
-                    false
-                } else {
-                    true
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut removed = 0;
+                    let mut conns = self.conns.write().await;
+                    conns.retain(|id, uc| {
+                        if uc.last_seen.elapsed() > UDP_TIMEOUT {
+                            debug!("Cleaned up UDP session: {}", id);
+                            removed += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for _ in 0..removed {
+                        self.runtime.record_conn_close();
+                    }
                 }
-            });
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
         }
     }
 }
