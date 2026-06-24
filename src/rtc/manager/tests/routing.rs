@@ -44,6 +44,45 @@ async fn capability_payload_tracks_targeted_server_peers() {
 }
 
 #[tokio::test]
+async fn select_server_peer_round_robins_across_advertised_peers() {
+    let manager = test_manager("self", PeerRole::Client);
+
+    for peer in ["server-b", "server-a", "server-c"] {
+        handle_payload(
+            manager.inner.clone(),
+            peer.to_string(),
+            encode(P2pPayload::Capabilities {
+                forwards: vec!["tcp:80".to_string()],
+            }),
+        )
+        .await;
+    }
+
+    // Deterministic ordering (sorted) with a round-robin cursor.
+    let mut picks = Vec::new();
+    for _ in 0..6 {
+        picks.push(manager.select_server_peer_for("tcp:80").await.unwrap());
+    }
+    assert_eq!(
+        picks,
+        vec![
+            "server-a".to_string(),
+            "server-b".to_string(),
+            "server-c".to_string(),
+            "server-a".to_string(),
+            "server-b".to_string(),
+            "server-c".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn select_server_peer_returns_none_without_advertised_peers() {
+    let manager = test_manager("self", PeerRole::Client);
+    assert_eq!(manager.select_server_peer_for("tcp:80").await, None);
+}
+
+#[tokio::test]
 async fn targeted_tunnel_handlers_receive_only_matching_targets() {
     let manager = test_manager("self", PeerRole::Client);
     let tcp_80 = Arc::new(Mutex::new(Vec::new()));

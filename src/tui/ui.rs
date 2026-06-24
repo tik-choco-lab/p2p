@@ -49,25 +49,53 @@ fn draw_forwards(f: &mut Frame, area: Rect, app: &App) {
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows = app.forwards.iter().enumerate().map(|(i, s)| {
+    let mut rows: Vec<Row> = Vec::new();
+    for (i, s) in app.forwards.iter().enumerate() {
         let selected = app.focus == Focus::Forwards && i == app.forwards_sel;
         let style = if selected {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()
         };
-        Row::new(vec![
-            Cell::from(dir_arrow(s.spec.direction)),
-            Cell::from(s.key.clone()),
-            Cell::from(proto_name(s.spec.proto)),
-            Cell::from(endpoint(&s.spec)),
-            Cell::from(state_name(&s.state)),
-            Cell::from(s.active_conns.to_string()),
-            Cell::from(human_bytes(s.bytes_in)),
-            Cell::from(human_bytes(s.bytes_out)),
-        ])
-        .style(style)
-    });
+        rows.push(
+            Row::new(vec![
+                Cell::from(dir_arrow(s.spec.direction)),
+                Cell::from(s.key.clone()),
+                Cell::from(proto_name(s.spec.proto)),
+                Cell::from(endpoint(&s.spec)),
+                Cell::from(state_name(&s.state)),
+                Cell::from(s.active_conns.to_string()),
+                Cell::from(human_bytes(s.bytes_in)),
+                Cell::from(human_bytes(s.bytes_out)),
+            ])
+            .style(style),
+        );
+
+        // Per-peer breakdown for the selected, expanded forward.
+        if selected && app.expanded {
+            if s.peers.is_empty() {
+                rows.push(
+                    Row::new(vec![Cell::from(""), Cell::from("  └ (no peers)")])
+                        .style(Style::default().add_modifier(Modifier::DIM)),
+                );
+            }
+            for peer in &s.peers {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(format!("  └ {}", short_id(&peer.peer_id))),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(peer.active_conns.to_string()),
+                        Cell::from(human_bytes(peer.bytes_in)),
+                        Cell::from(human_bytes(peer.bytes_out)),
+                    ])
+                    .style(Style::default().add_modifier(Modifier::DIM)),
+                );
+            }
+        }
+    }
 
     let widths = [
         Constraint::Length(4),
@@ -135,8 +163,7 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App) {
         .take(max)
         .map(|e| ListItem::new(format_event(e)))
         .collect();
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Audit log "));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Audit log "));
     f.render_widget(list, area);
 }
 
@@ -144,7 +171,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = if let Some(msg) = &app.message {
         format!(" {} ", msg)
     } else {
-        " [a]dd  [d]elete  [Tab]focus  [t]rust  [y/n]pending  [q]uit ".to_string()
+        " [a]dd  [d]elete  [Enter]expand  [Tab]focus  [t]rust  [y/n]pending  [q]uit ".to_string()
     };
     let p = Paragraph::new(hint).style(Style::default().add_modifier(Modifier::DIM));
     f.render_widget(p, area);

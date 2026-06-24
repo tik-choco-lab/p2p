@@ -60,7 +60,7 @@ impl UdpManager {
                         },
                     );
                     if old.is_none() {
-                        self.runtime.record_conn_open();
+                        self.runtime.record_conn_open_for(&id);
                     }
                     id
                 }
@@ -87,16 +87,15 @@ impl UdpManager {
         if let Err(e) = self.send_to(&peer_id, &msg).await {
             error!("Failed to send UDP data: {}", e);
         } else {
-            self.runtime.record_bytes_in(payload.len());
+            self.runtime.record_bytes_in_for(&peer_id, payload.len());
         }
     }
 
     async fn wait_for_tunnel_ready(&self, timeout: Duration) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let peers = self.rtc_manager.get_server_peers_for(&self.target).await;
-            if let Some(peer_id) = peers.first() {
-                return Ok(peer_id.clone());
+            if let Some(peer_id) = self.rtc_manager.select_server_peer_for(&self.target).await {
+                return Ok(peer_id);
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!("timeout");
@@ -111,19 +110,20 @@ impl UdpManager {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut removed = 0;
+                    let mut removed_peers = Vec::new();
                     let mut conns = self.conns.write().await;
                     conns.retain(|id, uc| {
                         if uc.last_seen.elapsed() > UDP_TIMEOUT {
                             debug!("Cleaned up UDP session: {}", id);
-                            removed += 1;
+                            removed_peers.push(uc.peer_id.clone());
                             false
                         } else {
                             true
                         }
                     });
-                    for _ in 0..removed {
-                        self.runtime.record_conn_close();
+                    drop(conns);
+                    for peer_id in removed_peers {
+                        self.runtime.record_conn_close_for(&peer_id);
                     }
                 }
                 changed = shutdown.changed() => {

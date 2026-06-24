@@ -177,15 +177,15 @@ impl TcpManager {
             .await
             .insert(conn_id.to_string(), Arc::new(RwLock::new(tc)));
         if old.is_none() {
-            self.runtime.record_conn_open();
+            self.runtime.record_conn_open_for(peer_id);
         }
     }
 
     async fn close_conn(&self, conn_id: &str, notify_remote: bool) {
         let tc = self.conns.write().await.remove(conn_id);
         if let Some(tc) = tc {
-            self.runtime.record_conn_close();
             let tc = tc.read().await;
+            self.runtime.record_conn_close_for(&tc.peer_id);
             if notify_remote && tc.notify_remote {
                 let close_msg = TunnelMessage {
                     msg_type: "close".into(),
@@ -222,7 +222,7 @@ impl TcpManager {
             .collect();
         for id in to_remove {
             if conns.remove(&id).is_some() {
-                self.runtime.record_conn_close();
+                self.runtime.record_conn_close_for(peer_id);
             }
         }
     }

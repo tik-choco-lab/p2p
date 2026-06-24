@@ -97,6 +97,25 @@ impl RTCManagerHandle {
             .collect()
     }
 
+    /// Selects a single server peer for the given target, load-balancing across
+    /// all peers that advertise the target key using a per-target round-robin
+    /// cursor. Peers that disconnect drop out of the advertised key set, so this
+    /// also provides failover. Returns `None` when no peer is available yet.
+    pub async fn select_server_peer_for(&self, target: &str) -> Option<String> {
+        let mut peers = self.get_server_peers_for(target).await;
+        if peers.is_empty() {
+            return None;
+        }
+        // Deterministic ordering so the round-robin cursor is stable regardless
+        // of the underlying map iteration order.
+        peers.sort();
+        let mut cursors = self.inner.peer_rr_cursor.write().await;
+        let cursor = cursors.entry(target.to_string()).or_insert(0);
+        let idx = *cursor % peers.len();
+        *cursor = cursor.wrapping_add(1);
+        Some(peers[idx].clone())
+    }
+
     pub async fn publish_tunnel_target(&self, target: &str) {
         self.inner
             .self_forward_keys

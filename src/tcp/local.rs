@@ -45,10 +45,9 @@ impl TcpManager {
     async fn wait_for_tunnel_ready(&self, timeout: std::time::Duration) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let peers = self.rtc_manager.get_server_peers_for(&self.target).await;
-            if let Some(peer_id) = peers.first() {
+            if let Some(peer_id) = self.rtc_manager.select_server_peer_for(&self.target).await {
                 debug!("Selected server peer: {}", peer_id);
-                return Ok(peer_id.clone());
+                return Ok(peer_id);
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!("server peer not connected");
@@ -85,7 +84,7 @@ impl TcpManager {
                                 self.close_conn(&conn_id, false).await;
                                 return;
                             }
-                            self.runtime.record_bytes_in(n);
+                            self.runtime.record_bytes_in_for(&peer_id, n);
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::UnexpectedEof {
