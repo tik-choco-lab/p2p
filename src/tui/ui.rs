@@ -34,11 +34,25 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    let peers = if app.peers.is_empty() {
+        "peers: 0 (待機中…)".to_string()
+    } else {
+        format!(
+            "peers: {} [{}]",
+            app.peers.len(),
+            app.peers
+                .iter()
+                .map(|p| short_id(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let text = format!(
-        " p2p — room: {}   forwards: {}   pending: {} ",
+        " p2p — room: {}   {}   forwards: {}   pending: {} ",
         app.ctx.room,
+        peers,
         app.forwards.len(),
-        app.pending.len()
+        app.pending_rows().len()
     );
     let p = Paragraph::new(text).style(Style::default().add_modifier(Modifier::BOLD));
     f.render_widget(p, area);

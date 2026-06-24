@@ -60,6 +60,15 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
         return;
     }
 
+    // Receiving any message proves the peer is connected. `EVENT_JOIN` only
+    // fires for peers that join after us, so the later-joining side would
+    // otherwise never register peers that were already in the room.
+    if inner.peers.write().await.insert(peer_id.clone()) {
+        notify(&inner.peer_conn_handlers, peer_id.clone()).await;
+        notify(&inner.tunnel_open_handlers, peer_id.clone()).await;
+        notify(&inner.stdio_open_handlers, peer_id.clone()).await;
+    }
+
     let Ok(payload) = serde_json::from_slice::<P2pPayload>(&data) else {
         return;
     };
