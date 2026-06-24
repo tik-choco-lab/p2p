@@ -1,9 +1,12 @@
 use anyhow::Result;
+use tracing::warn;
 
 use crate::auth::{
     default_trust_store_path, AuthAuditLog, PendingAuthorizations, PendingAuthorizer, TrustStore,
 };
 use crate::controller::ForwardController;
+use crate::forward_store::{default_forward_store_path, ForwardStore};
+use crate::negotiation::ForwardNegotiator;
 use crate::rtc::RTCManager;
 use crate::{control_shell, tui};
 
@@ -24,6 +27,8 @@ pub(crate) async fn run_tui(room_id: Option<&str>) -> Result<()> {
     let trust_store = TrustStore::load(default_trust_store_path()).await?;
     let audit_log = AuthAuditLog::default();
     let pending_auth = PendingAuthorizations::new();
+    let negotiator = ForwardNegotiator::new();
+    let forward_store = ForwardStore::load(default_forward_store_path()).await?;
     let controller = ForwardController::with_authorizer(
         manager.clone(),
         PendingAuthorizer::shared_with_audit_log(
@@ -33,12 +38,52 @@ pub(crate) async fn run_tui(room_id: Option<&str>) -> Result<()> {
         ),
     );
 
+    // Re-establish previously approved forwards.
+    for entry in forward_store.list().await {
+        match entry.to_spec() {
+            Ok(spec) => {
+                if let Err(e) = controller.add_forward(spec).await {
+                    warn!("failed to restore forward {}: {}", entry.target, e);
+                }
+            }
+            Err(e) => warn!("skipping invalid persisted forward: {}", e),
+        }
+    }
+
+    // Surface incoming forward proposals into the negotiator queue.
+    {
+        let neg = negotiator.clone();
+        manager
+            .on_forward_request(move |peer_id, ev| {
+                let neg = neg.clone();
+                tokio::spawn(async move {
+                    neg.record_incoming(ev.req_id, peer_id, ev.proto, ev.remote_addr, ev.target)
+                        .await;
+                });
+            })
+            .await;
+    }
+    {
+        let neg = negotiator.clone();
+        manager
+            .on_forward_response(move |_peer_id, ev| {
+                let neg = neg.clone();
+                tokio::spawn(async move {
+                    neg.record_response(&ev.req_id, ev.accepted).await;
+                });
+            })
+            .await;
+    }
+
     let result = tui::run(tui::TuiContext {
         room,
+        manager: manager.clone(),
         controller,
         trust_store,
         audit_log,
         pending_auth,
+        negotiator,
+        forward_store,
     })
     .await;
 

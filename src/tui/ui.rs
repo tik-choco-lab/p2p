@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table};
 
-use super::app::{App, Focus, Popup};
+use super::app::{AddField, AddForm, App, Focus, PeerSelect, PendingRow, Popup};
 use super::format::{
     dir_arrow, endpoint, format_event, human_bytes, proto_name, short_id, state_name, trust_name,
 };
@@ -26,7 +26,8 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, chunks[3], app);
 
     match &app.popup {
-        Popup::Add(buf) => draw_add_popup(f, buf, app.message.as_deref()),
+        Popup::Add(form) => draw_add_popup(f, form, app.message.as_deref()),
+        Popup::SelectPeer(sel) => draw_peer_select_popup(f, sel),
         Popup::Trust(sel) => draw_trust_popup(f, app, *sel),
         Popup::None => {}
     }
@@ -119,21 +120,28 @@ fn draw_forwards(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_pending(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = if app.pending.is_empty() {
+    let rows = app.pending_rows();
+    let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new("(none)")]
     } else {
-        app.pending
-            .iter()
+        rows.iter()
             .enumerate()
-            .map(|(i, p)| {
+            .map(|(i, row)| {
                 let selected = app.focus == Focus::Pending && i == app.pending_sel;
-                let text = format!(
-                    "#{} {} → {} ({})",
-                    p.id,
-                    short_id(&p.request.peer_id),
-                    p.request.forward_key,
-                    p.request.target_addr
-                );
+                let text = match row {
+                    PendingRow::Forward(r) => format!(
+                        "[FWD] {} → {} ({})",
+                        short_id(&r.peer_id),
+                        r.proto.to_uppercase(),
+                        r.remote_addr
+                    ),
+                    PendingRow::Conn(p) => format!(
+                        "[CONN] {} → {} ({})",
+                        short_id(&p.request.peer_id),
+                        p.request.forward_key,
+                        p.request.target_addr
+                    ),
+                };
                 let style = if selected {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
@@ -171,39 +179,96 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = if let Some(msg) = &app.message {
         format!(" {} ", msg)
     } else {
-        " [a]dd  [d]elete  [Enter]expand  [Tab]focus  [t]rust  [y/n]pending  [q]uit ".to_string()
+        " [a]dd forward  [d]elete  [Enter]expand  [Tab]focus  [t]rust  [y/n]approve  [q]uit "
+            .to_string()
     };
     let p = Paragraph::new(hint).style(Style::default().add_modifier(Modifier::DIM));
     f.render_widget(p, area);
 }
 
-fn draw_add_popup(f: &mut Frame, buf: &str, message: Option<&str>) {
-    let area = centered_rect(70, 30, f.area());
+fn draw_add_popup(f: &mut Frame, form: &AddForm, message: Option<&str>) {
+    let area = centered_rect(70, 45, f.area());
     f.render_widget(Clear, area);
-    let inner = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(1),
-    ])
-    .split(area);
-
-    let input = Paragraph::new(format!("{}_", buf)).block(
+    f.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .title(" Add forward "),
+        area,
     );
-    f.render_widget(input, inner[0]);
+    let inner = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .margin(1)
+    .split(area);
+
+    let proto_label = if form.proto_tcp {
+        "( TCP )  UDP "
+    } else {
+        " TCP  ( UDP )"
+    };
+    f.render_widget(
+        field_line("Proto", proto_label, form.field == AddField::Proto),
+        inner[0],
+    );
+    f.render_widget(
+        field_line("Local ", &form.local, form.field == AddField::Local),
+        inner[1],
+    );
+    f.render_widget(
+        field_line("Remote", &form.remote, form.field == AddField::Remote),
+        inner[2],
+    );
 
     let help = Paragraph::new(
-        "例:  serve tcp://127.0.0.1:80   |   connect 15432:5432\nEnter=追加  Esc=キャンセル",
+        "Local=自分のlisten ip:port  Remote=相手のip:port\nTab/↑↓=項目  ←→/Space=proto  Enter=要求送信  Esc=中止",
     )
-    .block(Block::default().borders(Borders::ALL).title(" 記法 "));
-    f.render_widget(help, inner[1]);
+    .style(Style::default().add_modifier(Modifier::DIM));
+    f.render_widget(help, inner[3]);
 
     if let Some(msg) = message {
         let err = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::BOLD));
-        f.render_widget(err, inner[2]);
+        f.render_widget(err, inner[4]);
     }
+}
+
+fn field_line<'a>(label: &'a str, value: &'a str, focused: bool) -> Paragraph<'a> {
+    let marker = if focused { "▶ " } else { "  " };
+    let cursor = if focused { "_" } else { "" };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Paragraph::new(format!("{}{}: {}{}", marker, label, value, cursor)).style(style)
+}
+
+fn draw_peer_select_popup(f: &mut Frame, sel: &PeerSelect) {
+    let area = centered_rect(60, 50, f.area());
+    f.render_widget(Clear, area);
+    let items: Vec<ListItem> = sel
+        .peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let style = if i == sel.sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(short_id(p)).style(style)
+        })
+        .collect();
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+        " Send '{}' to ([Enter]選択 [Esc]中止) ",
+        sel.draft.target
+    )));
+    f.render_widget(list, area);
 }
 
 fn draw_trust_popup(f: &mut Frame, app: &App, sel: usize) {

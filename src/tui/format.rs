@@ -1,38 +1,5 @@
-use anyhow::Result;
-
 use crate::auth::{AuthDecision, AuthEvent, AuthEventSource, TrustDecision};
 use crate::controller::{Direction, ForwardSpec, ForwardState, Proto};
-use crate::forward_args::{forward_key, parse_connect_forward, parse_forward};
-
-pub(super) fn parse_add_line(line: &str) -> Result<ForwardSpec> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 2 {
-        anyhow::bail!("`<serve|connect> <forward>` の形式で入力");
-    }
-    match parts[0] {
-        "serve" | "s" => {
-            let (proto, addr, _) = parse_forward(parts[1]);
-            Ok(ForwardSpec {
-                direction: Direction::Serve,
-                proto: Proto::from_name(proto)?,
-                addr: addr.to_string(),
-                listen_port: -1,
-                target: forward_key(proto, addr),
-            })
-        }
-        "connect" | "c" => {
-            let (proto, listen_port, target) = parse_connect_forward(parts[1]);
-            Ok(ForwardSpec {
-                direction: Direction::Connect,
-                proto: Proto::from_name(proto)?,
-                addr: String::new(),
-                listen_port,
-                target,
-            })
-        }
-        _ => anyhow::bail!("方向は serve / connect"),
-    }
-}
 
 pub(super) fn dir_arrow(d: Direction) -> &'static str {
     match d {

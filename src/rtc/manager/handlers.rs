@@ -10,6 +10,32 @@ impl RTCManagerHandle {
         self.inner.chat_handlers.write().await.push(Arc::new(f));
     }
 
+    pub async fn on_forward_request<
+        F: Fn(String, super::ForwardRequestEvent) + Send + Sync + 'static,
+    >(
+        &self,
+        f: F,
+    ) {
+        self.inner
+            .forward_request_handlers
+            .write()
+            .await
+            .push(Arc::new(f));
+    }
+
+    pub async fn on_forward_response<
+        F: Fn(String, super::ForwardResponseEvent) + Send + Sync + 'static,
+    >(
+        &self,
+        f: F,
+    ) {
+        self.inner
+            .forward_response_handlers
+            .write()
+            .await
+            .push(Arc::new(f));
+    }
+
     pub async fn on_tunnel_message<F: Fn(String, Vec<u8>) + Send + Sync + 'static>(
         &self,
         f: F,

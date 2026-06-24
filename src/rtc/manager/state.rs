@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 
 type ChatHandler = Arc<dyn Fn(String, String) + Send + Sync>;
 type PeerHandler = Arc<dyn Fn(String) + Send + Sync>;
+pub(super) type FwdReqHandler = Arc<dyn Fn(String, super::ForwardRequestEvent) + Send + Sync>;
+pub(super) type FwdRespHandler = Arc<dyn Fn(String, super::ForwardResponseEvent) + Send + Sync>;
 
 pub(super) type DataHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
 
@@ -58,6 +60,8 @@ pub(super) struct RTCManagerInner {
     pub(super) tunnel_close_handlers: RwLock<Vec<PeerHandler>>,
     pub(super) stdio_close_handlers: RwLock<Vec<PeerHandler>>,
     pub(super) peer_conn_handlers: RwLock<Vec<PeerHandler>>,
+    pub(super) forward_request_handlers: RwLock<Vec<FwdReqHandler>>,
+    pub(super) forward_response_handlers: RwLock<Vec<FwdRespHandler>>,
 }
 
 impl RTCManagerInner {
@@ -80,6 +84,8 @@ impl RTCManagerInner {
             tunnel_close_handlers: RwLock::new(Vec::new()),
             stdio_close_handlers: RwLock::new(Vec::new()),
             peer_conn_handlers: RwLock::new(Vec::new()),
+            forward_request_handlers: RwLock::new(Vec::new()),
+            forward_response_handlers: RwLock::new(Vec::new()),
         }
     }
 }
