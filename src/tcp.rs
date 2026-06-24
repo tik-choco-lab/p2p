@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::debug;
 
+use crate::forward_runtime::ForwardRuntime;
 use crate::rtc::{RTCManager, TunnelMessage};
 
+mod local;
 mod tunnel;
 
 const TCP_BUFFER_SIZE: usize = 4096;
@@ -26,6 +27,7 @@ pub struct TcpManager {
     conns: Arc<RwLock<HashMap<String, Arc<RwLock<TunnelConn>>>>>,
     remote_addr: String,
     target: String,
+    runtime: ForwardRuntime,
 }
 
 impl TcpManager {
@@ -40,7 +42,14 @@ impl TcpManager {
         } else {
             forward_key("tcp", &remote_addr)
         };
-        Self::listen_and_serve_with_target(rtc_manager, listen_port, remote_addr, target).await
+        Self::listen_and_serve_with_target(
+            rtc_manager,
+            listen_port,
+            remote_addr,
+            target,
+            ForwardRuntime::new(),
+        )
+        .await
     }
 
     pub async fn listen_and_serve_with_target(
@@ -48,6 +57,7 @@ impl TcpManager {
         listen_port: i32,
         remote_addr: String,
         target: String,
+        runtime: ForwardRuntime,
     ) -> Result<()> {
         let resolved = if !remote_addr.is_empty() {
             if remote_addr.contains(':') {
@@ -64,6 +74,7 @@ impl TcpManager {
             conns: Arc::new(RwLock::new(HashMap::new())),
             remote_addr: resolved,
             target: target.clone(),
+            runtime,
         });
 
         let mgr_msg = mgr.clone();
@@ -97,97 +108,25 @@ impl TcpManager {
         let listener = TcpListener::bind(&addr).await?;
         debug!("TCP server listening on port {}", listen_port);
 
+        let mut shutdown = mgr.runtime.subscribe();
         loop {
-            let (stream, _) = listener.accept().await?;
-            let mgr = mgr.clone();
-            tokio::spawn(async move {
-                mgr.handle_local_connection(stream).await;
-            });
-        }
-    }
-
-    async fn handle_local_connection(self: &Arc<Self>, stream: TcpStream) {
-        let conn_id = uuid::Uuid::new_v4().to_string();
-
-        let peer_id = match self.wait_for_tunnel_ready(TUNNEL_READY_TIMEOUT).await {
-            Ok(id) => id,
-            Err(e) => {
-                error!("tunnel not ready: {}", e);
-                return;
-            }
-        };
-
-        let (read_half, write_half) = stream.into_split();
-        self.track_conn(&conn_id, write_half, &peer_id, true).await;
-
-        let connect_msg = TunnelMessage {
-            msg_type: "connect".into(),
-            conn_id: conn_id.clone(),
-            target: self.target.clone(),
-            payload: None,
-        };
-        if let Err(e) = self.send_to(&peer_id, &connect_msg).await {
-            error!("failed to send tunnel connect: {}", e);
-            self.close_conn(&conn_id, false).await;
-            return;
-        }
-
-        let mgr = self.clone();
-        let cid = conn_id.clone();
-        let pid = peer_id.clone();
-        tokio::spawn(async move { mgr.forward_tcp_to_dc(cid, pid, read_half).await });
-    }
-
-    async fn wait_for_tunnel_ready(&self, timeout: std::time::Duration) -> Result<String> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let peers = self.rtc_manager.get_server_peers_for(&self.target).await;
-            if let Some(peer_id) = peers.first() {
-                debug!("Selected server peer: {}", peer_id);
-                return Ok(peer_id.clone());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("server peer not connected");
-            }
-            tokio::time::sleep(RETRY_INTERVAL).await;
-        }
-    }
-
-    async fn forward_tcp_to_dc(
-        self: Arc<Self>,
-        conn_id: String,
-        peer_id: String,
-        mut read_half: tokio::net::tcp::OwnedReadHalf,
-    ) {
-        let mut buf = vec![0u8; TCP_BUFFER_SIZE];
-        loop {
-            match read_half.read(&mut buf).await {
-                Ok(0) => {
-                    self.close_conn(&conn_id, true).await;
-                    return;
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, _) = result?;
+                    let mgr = mgr.clone();
+                    tokio::spawn(async move {
+                        mgr.handle_local_connection(stream).await;
+                    });
                 }
-                Ok(n) => {
-                    let msg = TunnelMessage {
-                        msg_type: "data".into(),
-                        conn_id: conn_id.clone(),
-                        target: self.target.clone(),
-                        payload: Some(buf[..n].to_vec()),
-                    };
-                    if let Err(e) = self.send_to(&peer_id, &msg).await {
-                        error!("failed to send tunnel data: {}", e);
-                        self.close_conn(&conn_id, false).await;
-                        return;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
                     }
                 }
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                        error!("tcp read error: {}", e);
-                    }
-                    self.close_conn(&conn_id, true).await;
-                    return;
-                }
             }
         }
+
+        Ok(())
     }
 
     async fn track_conn(
@@ -202,15 +141,20 @@ impl TcpManager {
             peer_id: peer_id.to_string(),
             notify_remote,
         };
-        self.conns
+        let old = self
+            .conns
             .write()
             .await
             .insert(conn_id.to_string(), Arc::new(RwLock::new(tc)));
+        if old.is_none() {
+            self.runtime.record_conn_open();
+        }
     }
 
     async fn close_conn(&self, conn_id: &str, notify_remote: bool) {
         let tc = self.conns.write().await.remove(conn_id);
         if let Some(tc) = tc {
+            self.runtime.record_conn_close();
             let tc = tc.read().await;
             if notify_remote && tc.notify_remote {
                 let close_msg = TunnelMessage {
@@ -247,7 +191,9 @@ impl TcpManager {
             })
             .collect();
         for id in to_remove {
-            conns.remove(&id);
+            if conns.remove(&id).is_some() {
+                self.runtime.record_conn_close();
+            }
         }
     }
 
@@ -257,6 +203,7 @@ impl TcpManager {
             conns: self.conns.clone(),
             remote_addr: self.remote_addr.clone(),
             target: self.target.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }

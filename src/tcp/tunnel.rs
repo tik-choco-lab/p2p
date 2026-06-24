@@ -30,7 +30,8 @@ impl TcpManager {
         match TcpStream::connect(addr).await {
             Ok(stream) => {
                 let (read_half, write_half) = stream.into_split();
-                self.track_conn(&tm.conn_id, write_half, peer_id, true).await;
+                self.track_conn(&tm.conn_id, write_half, peer_id, true)
+                    .await;
                 let mgr = Arc::new(self.clone_inner());
                 let cid = tm.conn_id.clone();
                 let pid = peer_id.to_string();
@@ -64,6 +65,8 @@ impl TcpManager {
                 drop(tc);
                 drop(conns);
                 self.close_conn(&tm.conn_id, true).await;
+            } else {
+                self.runtime.record_bytes_out(payload.len());
             }
         }
     }

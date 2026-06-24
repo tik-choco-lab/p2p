@@ -20,10 +20,14 @@ impl UdpManager {
         let conns = self.conns.read().await;
         if let Some(uc) = conns.get(&tm.conn_id) {
             if let Some(ref target) = uc.target_conn {
-                let _ = target.send(&payload).await;
+                if target.send(&payload).await.is_ok() {
+                    self.runtime.record_bytes_out(payload.len());
+                }
             } else if let Some(ref addr) = uc.client_addr {
                 if let Some(ref sock) = *self.local_socket.read().await {
-                    let _ = sock.send_to(&payload, addr).await;
+                    if sock.send_to(&payload, addr).await.is_ok() {
+                        self.runtime.record_bytes_out(payload.len());
+                    }
                 }
             }
             return;
@@ -38,10 +42,12 @@ impl UdpManager {
                         return;
                     }
                     let sock = Arc::new(sock);
-                    let _ = sock.send(&payload).await;
+                    if sock.send(&payload).await.is_ok() {
+                        self.runtime.record_bytes_out(payload.len());
+                    }
 
                     let mut conns = self.conns.write().await;
-                    conns.insert(
+                    let old = conns.insert(
                         tm.conn_id.clone(),
                         UdpConn {
                             target_conn: Some(sock.clone()),
@@ -50,21 +56,30 @@ impl UdpManager {
                             client_addr: None,
                         },
                     );
+                    if old.is_none() {
+                        self.runtime.record_conn_open();
+                    }
 
                     let mgr_conns = self.conns.clone();
                     let rtc = self.rtc_manager.clone();
                     let cid = tm.conn_id.clone();
                     let pid = peer_id.to_string();
                     let target = self.target.clone();
+                    let runtime = self.runtime.clone();
                     tokio::spawn(async move {
-                        Self::forward_target_to_tunnel(sock, mgr_conns, rtc, cid, pid, target).await;
+                        Self::forward_target_to_tunnel(
+                            sock, mgr_conns, rtc, cid, pid, target, runtime,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => error!("Failed to bind UDP: {}", e),
             }
         } else if let Some(ref sock) = *self.local_socket.read().await {
             if let Ok(addr) = tm.conn_id.parse::<std::net::SocketAddr>() {
-                let _ = sock.send_to(&payload, &addr).await;
+                if sock.send_to(&payload, &addr).await.is_ok() {
+                    self.runtime.record_bytes_out(payload.len());
+                }
             }
         }
     }
@@ -76,32 +91,45 @@ impl UdpManager {
         conn_id: String,
         peer_id: String,
         target: String,
+        runtime: crate::forward_runtime::ForwardRuntime,
     ) {
         let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let mut shutdown = runtime.subscribe();
         loop {
-            match sock.recv(&mut buf).await {
-                Ok(n) => {
-                    {
-                        let mut conns = conns.write().await;
-                        if let Some(uc) = conns.get_mut(&conn_id) {
-                            uc.last_seen = Instant::now();
+            tokio::select! {
+                result = sock.recv(&mut buf) => {
+                    match result {
+                        Ok(n) => {
+                            {
+                                let mut conns = conns.write().await;
+                                if let Some(uc) = conns.get_mut(&conn_id) {
+                                    uc.last_seen = Instant::now();
+                                }
+                            }
+                            let msg = TunnelMessage {
+                                msg_type: "data".into(),
+                                conn_id: conn_id.clone(),
+                                target: target.clone(),
+                                payload: Some(buf[..n].to_vec()),
+                            };
+                            let data = match serde_json::to_vec(&msg) {
+                                Ok(d) => d,
+                                Err(_) => continue,
+                            };
+                            if rtc_manager.send_tunnel_to(&peer_id, data).await.is_ok() {
+                                runtime.record_bytes_in(n);
+                            }
+                        }
+                        Err(e) => {
+                            error!("UDP target read error: {}", e);
+                            return;
                         }
                     }
-                    let msg = TunnelMessage {
-                        msg_type: "data".into(),
-                        conn_id: conn_id.clone(),
-                        target: target.clone(),
-                        payload: Some(buf[..n].to_vec()),
-                    };
-                    let data = match serde_json::to_vec(&msg) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    let _ = rtc_manager.send_tunnel_to(&peer_id, data).await;
                 }
-                Err(e) => {
-                    error!("UDP target read error: {}", e);
-                    return;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
                 }
             }
         }
