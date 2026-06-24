@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tracing::error;
+use tracing::{debug, error};
 
+use crate::auth::AuthRequest;
 use crate::rtc::TunnelMessage;
 
 use super::TcpManager;
@@ -26,6 +27,22 @@ impl TcpManager {
     }
 
     async fn handle_remote_connect(&self, peer_id: &str, tm: &TunnelMessage) {
+        let req = AuthRequest {
+            peer_id: peer_id.to_string(),
+            forward_key: self.target.clone(),
+            target_addr: self.remote_addr.clone(),
+            proto: "tcp".to_string(),
+        };
+        let decision = self.authorizer.authorize(&req).await;
+        if !decision.is_allowed() {
+            debug!(
+                "denied tcp tunnel connection from {} to {}",
+                peer_id, self.target
+            );
+            self.send_close(peer_id, &tm.conn_id).await;
+            return;
+        }
+
         let addr = &self.remote_addr;
         match TcpStream::connect(addr).await {
             Ok(stream) => {
@@ -39,15 +56,19 @@ impl TcpManager {
             }
             Err(e) => {
                 error!("failed to connect to remote ({}): {}", addr, e);
-                let close_msg = TunnelMessage {
-                    msg_type: "close".into(),
-                    conn_id: tm.conn_id.clone(),
-                    target: self.target.clone(),
-                    payload: None,
-                };
-                let _ = self.send_to(peer_id, &close_msg).await;
+                self.send_close(peer_id, &tm.conn_id).await;
             }
         }
+    }
+
+    async fn send_close(&self, peer_id: &str, conn_id: &str) {
+        let close_msg = TunnelMessage {
+            msg_type: "close".into(),
+            conn_id: conn_id.to_string(),
+            target: self.target.clone(),
+            payload: None,
+        };
+        let _ = self.send_to(peer_id, &close_msg).await;
     }
 
     async fn handle_remote_data(&self, tm: &TunnelMessage) {

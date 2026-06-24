@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::error;
 
+use crate::auth::{allow_all, SharedAuthorizer};
 use crate::forward_runtime::ForwardRuntime;
 use crate::rtc::RTCManager;
 use crate::{tcp, udp};
@@ -79,13 +80,19 @@ struct ForwardHandle {
 #[derive(Clone)]
 pub struct ForwardController {
     rtc_manager: Option<RTCManager>,
+    authorizer: SharedAuthorizer,
     forwards: Arc<RwLock<HashMap<String, ForwardHandle>>>,
 }
 
 impl ForwardController {
     pub fn new(rtc_manager: RTCManager) -> Self {
+        Self::with_authorizer(rtc_manager, allow_all())
+    }
+
+    pub fn with_authorizer(rtc_manager: RTCManager, authorizer: SharedAuthorizer) -> Self {
         Self {
             rtc_manager: Some(rtc_manager),
+            authorizer,
             forwards: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -94,6 +101,7 @@ impl ForwardController {
     pub(crate) fn new_inert() -> Self {
         Self {
             rtc_manager: None,
+            authorizer: allow_all(),
             forwards: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -175,27 +183,30 @@ impl ForwardController {
         runtime: ForwardRuntime,
     ) -> Option<JoinHandle<()>> {
         let manager = self.rtc_manager.clone()?;
+        let authorizer = self.authorizer.clone();
         let state = self.forwards.clone();
 
         Some(tokio::spawn(async move {
             let result = match spec.proto {
                 Proto::Tcp => {
-                    tcp::TcpManager::listen_and_serve_with_target(
+                    tcp::TcpManager::listen_and_serve_with_target_and_auth(
                         manager,
                         spec.listen_port,
                         spec.addr.clone(),
                         spec.target.clone(),
                         runtime,
+                        authorizer,
                     )
                     .await
                 }
                 Proto::Udp => {
-                    udp::UdpManager::listen_and_serve_with_target(
+                    udp::UdpManager::listen_and_serve_with_target_and_auth(
                         manager,
                         spec.listen_port,
                         spec.addr.clone(),
                         spec.target.clone(),
                         runtime,
+                        authorizer,
                     )
                     .await
                 }
