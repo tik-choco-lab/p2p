@@ -3,7 +3,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::rtc::RTCManager;
 
-use super::generate_room_id;
+use super::{generate_room_id, load_or_create_node_id};
 
 pub(crate) async fn run_chat(room_id: Option<&str>) -> Result<()> {
     let room = match room_id {
@@ -15,7 +15,7 @@ pub(crate) async fn run_chat(room_id: Option<&str>) -> Result<()> {
         }
     };
 
-    let self_id = uuid::Uuid::new_v4().to_string();
+    let self_id = load_or_create_node_id().await?;
     let manager = RTCManager::new(self_id.clone(), room, false).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);

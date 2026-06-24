@@ -9,7 +9,7 @@ use crate::forward_args::{forward_key, parse_forward, split_serve_args};
 use crate::proxy;
 use crate::rtc::RTCManager;
 
-use super::generate_room_id;
+use super::{generate_room_id, load_or_create_node_id};
 
 pub(crate) async fn run_serve(
     args: &[String],
@@ -25,7 +25,7 @@ pub(crate) async fn run_serve(
         eprintln!("Room ID: {}", room_id);
     }
 
-    let self_id = uuid::Uuid::new_v4().to_string();
+    let self_id = load_or_create_node_id().await?;
     let manager = RTCManager::new(self_id, room_id, true).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
