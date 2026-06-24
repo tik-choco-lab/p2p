@@ -22,7 +22,7 @@ fn tunnel_message_payload_is_encoded_as_hex_string() {
 
     assert_eq!(
         String::from_utf8(encoded).unwrap(),
-        r#"{"type":"data","conn_id":"conn-1","target":"tcp:80","payload":"2a"}"#
+        r#"{"type":"data","conn_id":"conn-1","target":"tcp:80","payload":"b64:Kg=="}"#
     );
 }
 
@@ -30,6 +30,14 @@ fn tunnel_message_payload_is_encoded_as_hex_string() {
 fn legacy_tunnel_message_payload_array_is_still_accepted() {
     let decoded: TunnelMessage =
         serde_json::from_slice(br#"{"type":"data","conn_id":"conn-1","payload":[42]}"#).unwrap();
+
+    assert_eq!(decoded.payload, Some(vec![42]));
+}
+
+#[test]
+fn legacy_tunnel_message_payload_hex_is_still_accepted() {
+    let decoded: TunnelMessage =
+        serde_json::from_slice(br#"{"type":"data","conn_id":"conn-1","payload":"2a"}"#).unwrap();
 
     assert_eq!(decoded.payload, Some(vec![42]));
 }

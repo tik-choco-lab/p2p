@@ -1,3 +1,4 @@
+use base64::prelude::*;
 use serde::{Deserialize, Deserializer, Serializer};
 
 #[derive(Deserialize)]
@@ -9,8 +10,20 @@ enum BytesRepr {
 
 fn decode_repr<E: serde::de::Error>(repr: BytesRepr) -> Result<Vec<u8>, E> {
     match repr {
-        BytesRepr::Hex(hex) => hex::decode(hex).map_err(E::custom),
+        BytesRepr::Hex(encoded) => decode_string(&encoded).map_err(E::custom),
         BytesRepr::Legacy(bytes) => Ok(bytes),
+    }
+}
+
+fn encode_bytes(bytes: &[u8]) -> String {
+    format!("b64:{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn decode_string(encoded: &str) -> Result<Vec<u8>, String> {
+    if let Some(base64) = encoded.strip_prefix("b64:") {
+        BASE64_STANDARD.decode(base64).map_err(|e| e.to_string())
+    } else {
+        hex::decode(encoded).map_err(|e| e.to_string())
     }
 }
 
@@ -21,7 +34,7 @@ pub(crate) mod vec_hex {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&hex::encode(bytes))
+        serializer.serialize_str(&encode_bytes(bytes))
     }
 
     pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -41,7 +54,7 @@ pub(crate) mod option_hex {
         S: Serializer,
     {
         match bytes {
-            Some(bytes) => serializer.serialize_some(&hex::encode(bytes)),
+            Some(bytes) => serializer.serialize_some(&encode_bytes(bytes)),
             None => serializer.serialize_none(),
         }
     }

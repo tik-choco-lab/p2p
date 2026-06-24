@@ -16,7 +16,10 @@ mod tunnel;
 
 use lifecycle::{forward_key, spawn_handler_cleanup};
 
-const TCP_BUFFER_SIZE: usize = 16 * 1024;
+// Keep tunnel chunks below mistlib/WebRTC's message limit after JSON/hex
+// framing overhead. Larger reads can produce "outbound packet larger than
+// maximum message size" errors.
+const TCP_BUFFER_SIZE: usize = 4096;
 const TUNNEL_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
