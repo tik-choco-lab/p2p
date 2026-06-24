@@ -27,28 +27,48 @@ pub struct UdpManager {
     conns: Arc<RwLock<HashMap<String, UdpConn>>>,
     remote_addr: String,
     local_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
+    target: String,
 }
 
 impl UdpManager {
+    #[allow(dead_code)]
     pub async fn listen_and_serve(
         rtc_manager: RTCManager,
         listen_port: i32,
         remote_addr: String,
+    ) -> Result<()> {
+        let target = if remote_addr.is_empty() {
+            format!("udp:{}", listen_port)
+        } else {
+            forward_key("udp", &remote_addr)
+        };
+        Self::listen_and_serve_with_target(rtc_manager, listen_port, remote_addr, target).await
+    }
+
+    pub async fn listen_and_serve_with_target(
+        rtc_manager: RTCManager,
+        listen_port: i32,
+        remote_addr: String,
+        target: String,
     ) -> Result<()> {
         let mgr = Arc::new(Self {
             rtc_manager: rtc_manager.clone(),
             conns: Arc::new(RwLock::new(HashMap::new())),
             remote_addr,
             local_socket: Arc::new(RwLock::new(None)),
+            target: target.clone(),
         });
 
         let mgr_msg = mgr.clone();
         rtc_manager
-            .on_tunnel_message(move |peer_id, data| {
+            .on_tunnel_message_for(target.clone(), move |peer_id, data| {
                 let mgr = mgr_msg.clone();
                 tokio::spawn(async move { mgr.on_tunnel_message(&peer_id, &data).await });
             })
             .await;
+        if !mgr.remote_addr.is_empty() {
+            rtc_manager.publish_tunnel_target(&target).await;
+        }
 
         if listen_port != -1 {
             let addr = format!("0.0.0.0:{}", listen_port);
@@ -109,6 +129,7 @@ impl UdpManager {
                     let msg = TunnelMessage {
                         msg_type: "data".into(),
                         conn_id,
+                        target: self.target.clone(),
                         payload: Some(payload),
                     };
                     if let Err(e) = self.send_to(&peer_id, &msg).await {
@@ -177,8 +198,9 @@ impl UdpManager {
                     let rtc = self.rtc_manager.clone();
                     let cid = tm.conn_id.clone();
                     let pid = peer_id.to_string();
+                    let target = self.target.clone();
                     tokio::spawn(async move {
-                        Self::forward_target_to_tunnel(sock, mgr_conns, rtc, cid, pid).await;
+                        Self::forward_target_to_tunnel(sock, mgr_conns, rtc, cid, pid, target).await;
                     });
                 }
                 Err(e) => error!("Failed to bind UDP: {}", e),
@@ -196,6 +218,7 @@ impl UdpManager {
         rtc_manager: RTCManager,
         conn_id: String,
         peer_id: String,
+        target: String,
     ) {
         let mut buf = vec![0u8; MAX_UDP_SIZE];
         loop {
@@ -210,6 +233,7 @@ impl UdpManager {
                     let msg = TunnelMessage {
                         msg_type: "data".into(),
                         conn_id: conn_id.clone(),
+                        target: target.clone(),
                         payload: Some(buf[..n].to_vec()),
                     };
                     let data = match serde_json::to_vec(&msg) {
@@ -235,7 +259,7 @@ impl UdpManager {
     async fn wait_for_tunnel_ready(&self, timeout: Duration) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let peers = self.rtc_manager.get_server_peers().await;
+            let peers = self.rtc_manager.get_server_peers_for(&self.target).await;
             if let Some(peer_id) = peers.first() {
                 return Ok(peer_id.clone());
             }
@@ -261,4 +285,14 @@ impl UdpManager {
             });
         }
     }
+}
+
+#[allow(dead_code)]
+fn forward_key(proto: &str, addr: &str) -> String {
+    let port = addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<i32>().ok())
+        .unwrap_or(-1);
+    format!("{}:{}", proto, port)
 }

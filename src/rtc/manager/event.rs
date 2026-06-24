@@ -42,12 +42,14 @@ async fn handle_join(inner: Arc<RTCManagerInner>, peer_id: String) {
         Ok(data) => data,
         Err(_) => return,
     };
-    let _ = mistlib::send_message_direct(peer_id, data, mistlib::DELIVERY_RELIABLE).await;
+    let _ = mistlib::send_message_direct(peer_id.clone(), data, mistlib::DELIVERY_RELIABLE).await;
+    send_capabilities_to_peer(&inner, peer_id).await;
 }
 
 pub(super) async fn handle_leave(inner: Arc<RTCManagerInner>, peer_id: String) {
     inner.peers.write().await.remove(&peer_id);
     inner.peer_roles.write().await.remove(&peer_id);
+    inner.peer_forward_keys.write().await.remove(&peer_id);
     notify(&inner.tunnel_close_handlers, peer_id.clone()).await;
     notify(&inner.stdio_close_handlers, peer_id).await;
 }
@@ -69,6 +71,13 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
                 .await
                 .insert(peer_id, PeerRole::from_str(&role));
         }
+        P2pPayload::Capabilities { forwards } => {
+            inner
+                .peer_forward_keys
+                .write()
+                .await
+                .insert(peer_id, forwards.into_iter().collect());
+        }
         P2pPayload::Chat { text } => {
             let handlers = inner.chat_handlers.read().await;
             for h in handlers.iter() {
@@ -88,6 +97,21 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
             }
         }
     }
+}
+
+async fn send_capabilities_to_peer(inner: &Arc<RTCManagerInner>, peer_id: String) {
+    let forwards = inner
+        .self_forward_keys
+        .read()
+        .await
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let data = match serde_json::to_vec(&P2pPayload::Capabilities { forwards }) {
+        Ok(data) => data,
+        Err(_) => return,
+    };
+    let _ = mistlib::send_message_direct(peer_id, data, mistlib::DELIVERY_RELIABLE).await;
 }
 
 async fn notify(handlers: &RwLock<Vec<Arc<dyn Fn(String) + Send + Sync>>>, peer_id: String) {
