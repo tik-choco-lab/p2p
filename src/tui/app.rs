@@ -73,6 +73,7 @@ pub(super) struct App {
     pub(super) forward_pending: Vec<IncomingForward>,
     pub(super) events: Vec<AuthEvent>,
     pub(super) trust: Vec<TrustEntry>,
+    pub(super) peers: Vec<String>,
     pub(super) forwards_sel: usize,
     pub(super) pending_sel: usize,
     pub(super) expanded: bool,
@@ -91,6 +92,7 @@ impl App {
             forward_pending: Vec::new(),
             events: Vec::new(),
             trust: Vec::new(),
+            peers: Vec::new(),
             forwards_sel: 0,
             pending_sel: 0,
             expanded: false,
@@ -121,6 +123,7 @@ impl App {
         self.forward_pending = self.ctx.negotiator.list_incoming().await;
         self.events = self.ctx.audit_log.list().await;
         self.trust = self.ctx.trust_store.list().await;
+        self.peers = self.ctx.manager.connected_peers().await;
         if self.forwards_sel >= self.forwards.len() {
             self.forwards_sel = self.forwards.len().saturating_sub(1);
         }
