@@ -8,6 +8,9 @@ This project is a functional port of the original Go implementation [webrtc-p2p-
 
 - **P2P Connectivity**: Establishes direct peer-to-peer connections through mistlib, allowing connectivity even behind restrictive NATs.
 - **TCP/UDP Forwarding**: Tunnel any TCP or UDP traffic through the P2P connection.
+- **Multiple Forwards**: Publish or connect to several ports at once, multiplexed over a single room via per-forward target keys.
+- **Interactive TUI**: A ratatui-based terminal UI (the default `p2p` mode) to add/remove forwards at runtime, approve incoming connections, and watch live metrics.
+- **Connection Authorization**: Serve side approves inbound connections (who connects to which target), with a persisted trust store and an audit log.
 - **Stdio Bridging**: Bridge remote standard input/output to your local terminal, similar to SSH execution.
 - **Multi-Channel Architecture**: Routes tunnel, chat, and stdio payloads over mistlib messages.
 - **Embedded Chat**: Simple built-in P2P chat mode for coordination.
@@ -25,40 +28,84 @@ The binary will be located at `target/release/p2p`.
 
 ## Usage
 
-### 1. Chat Mode (Default)
-Start p2p in chat mode. If no room ID is provided, one will be generated for you.
+The launch mode is selected by whether a subcommand is given:
+
+| Command | Behavior |
+|---------|----------|
+| `p2p` (no args) | Starts the **interactive TUI**. Add/remove serve and connect forwards at runtime and approve incoming connections. |
+| `p2p serve ...` / `p2p connect ...` | Static, non-interactive mode for scripts/daemons. Forwards are fixed by the arguments; no TUI. |
+| `p2p chat [room-id]` | Built-in P2P chat mode. |
+
+If no room ID is provided, one is generated and printed to stderr as `Room ID: <id>`.
+
+### 1. Interactive TUI (Default)
 
 ```bash
-# Start a new room
+# Start a new room with a generated ID
 p2p
 
-# Join an existing room
+# Open the TUI on an existing room
 p2p [room-id]
 ```
 
+Inside the TUI:
+
+- `a` — add a forward. A small form opens: pick **Proto** (TCP/UDP), type your **Local** `ip:port` (what you listen on) and the peer's **Remote** `ip:port` (the target on their side). There is no serve/connect choice — you always listen locally and reach the peer's remote address.
+- `d` — delete the selected forward
+- `t` — manage trust entries
+- `Tab` — switch focus between the forwards table and the Pending pane
+- `Enter` — expand the selected forward to show per-peer connection details
+- `y` / `n` — approve / deny the selected pending item (`Y` / `N` to also remember it)
+- `q` — quit
+
+When you add a forward, a request is sent to the connected peer (a picker appears if several are connected). The peer sees it in the Pending pane as a `[FWD]` row and approves or denies it. On approval both sides show the established forward, the peer is trusted for that target, and the forward is **saved** — it is re-established automatically on the next launch (`forwards.json`).
+
+The forwards table shows direction, target key, protocol, endpoint, state, active connections, and in/out byte counters.
+
 ### 2. Serve Mode (Server side)
-Publish a local port or a command to a room.
+Publish one or more local ports (or a command) to a room. Multiple forwards can be given.
 
 ```bash
-# Serve a local TCP port (:80) to a room
+# Serve a single local TCP port (:80) to a room
 p2p serve my-room :80
 
-# Serve a local UDP port
-p2p serve my-room udp://127.0.0.1:9000
+# Publish HTTP and a database at once
+p2p serve my-room tcp://127.0.0.1:80 tcp://127.0.0.1:5432
+
+# Mix TCP and UDP
+p2p serve my-room :8080 udp://127.0.0.1:9000
 
 # Execute a command and bridge its stdio to the room
 p2p serve my-room -- python3 -m http.server
 ```
 
+Authorization policy flags (serve only):
+
+- `--auto-accept` — accept all inbound connections automatically.
+- `--allow-peer <peer-id>` — accept connections from the given peer(s); repeatable.
+- (default) — unknown peers are denied. Use the TUI to approve interactively, or pre-populate the trust store.
+
 ### 3. Connect Mode (Client side)
-Connect to a room to access a served port or interact with a remote command via stdio.
+Connect to a room to access served ports or interact with a remote command via stdio. Multiple forwards can be given.
 
 ```bash
 # Join a room and bridge remote stdio to your local terminal
 p2p connect my-room
 
-# Join a room and map a local port to the remote served port
-p2p connect my-room :8080
+# Map local 8080 to the remote served port 80
+p2p connect my-room 8080:80
+
+# Multiple forwards: local 8080->remote 80, local 15432->remote 5432
+p2p connect my-room 8080:80 15432:5432
+```
+
+Forward notation for `connect` is `[proto://]<listen-port>:<remote-port>`. If `remote-port` is omitted it defaults to `listen-port`. The matching peer is selected automatically from the forward keys it advertises.
+
+### 4. Chat Mode
+
+```bash
+p2p chat            # start a new room
+p2p chat [room-id]  # join an existing room
 ```
 
 ## Global Options
@@ -92,7 +139,11 @@ just test-nostr
 ## Architecture
 
 This Rust implementation follows the same internal logic as the Go version:
-- **mistlib**: Provides the P2P transport, room membership, and Nostr signaling.
-- **RTC Manager**: Adapts mistlib events and raw payloads to the tunnel, chat, and stdio handlers.
+- **mistlib**: Provides the P2P transport, room membership, and Nostr signaling. mistlib is a single-room-per-process singleton, so one `p2p` process operates within one room.
+- **RTC Manager**: Adapts mistlib events and raw payloads to the tunnel, chat, and stdio handlers, and routes tunnel messages by per-forward target key.
+- **Forward Controller**: A UI-independent layer (`add_forward` / `remove_forward` / `list_forwards`) shared by the CLI subcommands, the legacy text shell, and the TUI. Each forward carries a direction (serve/connect), protocol, address/listen port, and target key.
 - **Bridges**: Dedicated logic for mapping TCP, UDP, and stdio to mistlib messages.
+- **Authorization**: A `ConnectionAuthorizer` checked before serve-side connections are dialed, backed by a persisted trust store and an audit log.
+
+A single room can host both serve and connect forwards simultaneously (a "virtual client/server" model); the direction is chosen per forward rather than per process.
 
