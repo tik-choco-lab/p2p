@@ -1,13 +1,17 @@
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::auth::TrustStore;
 use crate::controller::{Direction, ForwardController, ForwardSpec, ForwardState, Proto};
 use crate::forward_args::{forward_key, parse_connect_forward, parse_forward};
+
+mod trust;
 
 enum ShellCommand {
     Add(ForwardSpec),
     Remove(String),
     List,
+    Trust(trust::Command),
     Help,
     Quit,
 }
@@ -20,6 +24,7 @@ pub(crate) struct ShellOutcome {
 
 pub(crate) async fn run<R, W>(
     controller: ForwardController,
+    trust_store: TrustStore,
     mut reader: R,
     mut writer: W,
 ) -> Result<()>
@@ -38,7 +43,7 @@ where
             break;
         }
 
-        let outcome = execute_line(&controller, &line).await?;
+        let outcome = execute_line_with_trust(&controller, Some(&trust_store), &line).await?;
         if !outcome.output.is_empty() {
             writer.write_all(outcome.output.as_bytes()).await?;
         }
@@ -52,8 +57,17 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_line(
     controller: &ForwardController,
+    line: &str,
+) -> Result<ShellOutcome> {
+    execute_line_with_trust(controller, None, line).await
+}
+
+pub(crate) async fn execute_line_with_trust(
+    controller: &ForwardController,
+    trust_store: Option<&TrustStore>,
     line: &str,
 ) -> Result<ShellOutcome> {
     let Some(command) = parse_command(line)? else {
@@ -82,6 +96,10 @@ pub(crate) async fn execute_line(
             output: format_statuses(controller.list_forwards().await),
             should_quit: false,
         }),
+        ShellCommand::Trust(command) => Ok(ShellOutcome {
+            output: trust::execute(trust_store, command).await?,
+            should_quit: false,
+        }),
         ShellCommand::Help => Ok(ShellOutcome {
             output: help_text(),
             should_quit: false,
@@ -103,6 +121,7 @@ fn parse_command(line: &str) -> Result<Option<ShellCommand>> {
         "add" if parts.len() == 3 => parse_add(parts[1], parts[2]).map(Some),
         "remove" | "rm" if parts.len() == 2 => Ok(Some(ShellCommand::Remove(parts[1].into()))),
         "list" | "ls" if parts.len() == 1 => Ok(Some(ShellCommand::List)),
+        "trust" | "t" => trust::parse(&parts).map(ShellCommand::Trust).map(Some),
         "help" | "h" if parts.len() == 1 => Ok(Some(ShellCommand::Help)),
         "quit" | "q" | "exit" if parts.len() == 1 => Ok(Some(ShellCommand::Quit)),
         _ => Err(anyhow!("unknown command; type `help` for usage")),
@@ -186,6 +205,10 @@ fn help_text() -> String {
         "  add connect <[proto://]<listen-port>[:remote-port]>",
         "  remove <target>",
         "  list",
+        "  trust list",
+        "  trust allow <peer-id> <target>",
+        "  trust deny <peer-id> <target>",
+        "  trust remove <peer-id> <target>",
         "  quit",
         "",
     ]

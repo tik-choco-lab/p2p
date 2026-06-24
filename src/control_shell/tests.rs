@@ -1,5 +1,15 @@
 use super::*;
 
+use crate::auth::{TrustDecision, TrustKey, TrustStore};
+
+fn temp_store_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "p2p-shell-trust-{}-{}.json",
+        name,
+        uuid::Uuid::new_v4()
+    ))
+}
+
 #[tokio::test]
 async fn add_serve_registers_forward() {
     let controller = ForwardController::new_inert();
@@ -51,6 +61,74 @@ async fn list_renders_registered_forwards() {
 
     assert!(outcome.output.contains("key direction proto endpoint"));
     assert!(outcome.output.contains("tcp:80 serve tcp :80 listening"));
+}
+
+#[tokio::test]
+async fn trust_allow_persists_entry() {
+    let controller = ForwardController::new_inert();
+    let path = temp_store_path("allow");
+    let store = TrustStore::load(&path).await.unwrap();
+
+    let outcome = execute_line_with_trust(&controller, Some(&store), "trust allow peer-a tcp:80")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.output, "trusted peer-a tcp:80 allow\n");
+    assert_eq!(
+        store
+            .get(&TrustKey {
+                peer_id: "peer-a".to_string(),
+                forward_key: "tcp:80".to_string(),
+            })
+            .await,
+        Some(TrustDecision::Allow)
+    );
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn trust_deny_and_list_render_entries() {
+    let controller = ForwardController::new_inert();
+    let path = temp_store_path("list");
+    let store = TrustStore::load(&path).await.unwrap();
+    execute_line_with_trust(&controller, Some(&store), "trust deny peer-a udp:53")
+        .await
+        .unwrap();
+
+    let outcome = execute_line_with_trust(&controller, Some(&store), "trust list")
+        .await
+        .unwrap();
+
+    assert!(outcome.output.contains("peer target decision"));
+    assert!(outcome.output.contains("peer-a udp:53 deny"));
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn trust_remove_deletes_entry() {
+    let controller = ForwardController::new_inert();
+    let path = temp_store_path("remove");
+    let store = TrustStore::load(&path).await.unwrap();
+    execute_line_with_trust(&controller, Some(&store), "trust allow peer-a tcp:80")
+        .await
+        .unwrap();
+
+    let outcome = execute_line_with_trust(&controller, Some(&store), "trust remove peer-a tcp:80")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.output, "removed trust peer-a tcp:80\n");
+    assert!(store.list().await.is_empty());
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn trust_commands_require_store() {
+    let controller = ForwardController::new_inert();
+
+    let err = execute_line(&controller, "trust list").await.unwrap_err();
+
+    assert!(err.to_string().contains("trust commands are unavailable"));
 }
 
 #[tokio::test]

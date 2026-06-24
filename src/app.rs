@@ -31,11 +31,12 @@ pub(crate) async fn run_control_shell(room_id: Option<&str>) -> Result<()> {
     let self_id = uuid::Uuid::new_v4().to_string();
     let manager = RTCManager::new(self_id, room, false).await;
     let controller = ForwardController::new(manager.clone());
+    let trust_store = TrustStore::load(default_trust_store_path()).await?;
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
     tokio::select! {
-        result = control_shell::run(controller, stdin, stdout) => {
+        result = control_shell::run(controller, trust_store, stdin, stdout) => {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {}
