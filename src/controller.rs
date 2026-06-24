@@ -91,7 +91,7 @@ impl ForwardController {
     }
 
     #[cfg(test)]
-    fn new_inert() -> Self {
+    pub(crate) fn new_inert() -> Self {
         Self {
             rtc_manager: None,
             forwards: Arc::new(RwLock::new(HashMap::new())),

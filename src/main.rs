@@ -1,3 +1,4 @@
+mod control_shell;
 mod controller;
 mod forward_args;
 mod forward_runtime;
@@ -81,8 +82,35 @@ async fn main() -> Result<()> {
         Some(Commands::Connect { room_id, forwards }) => run_connect(&room_id, &forwards).await,
         Some(Commands::Serve { args, command }) => run_serve(&args, &command).await,
         Some(Commands::Chat { room_id }) => run_chat(room_id.as_deref()).await,
-        None => run_chat(cli.room_id.as_deref()).await,
+        None => run_control_shell(cli.room_id.as_deref()).await,
     }
+}
+
+async fn run_control_shell(room_id: Option<&str>) -> Result<()> {
+    let room = match room_id {
+        Some(r) => r.to_string(),
+        None => {
+            let id = generate_room_id();
+            eprintln!("Room ID: {}", id);
+            id
+        }
+    };
+
+    let self_id = uuid::Uuid::new_v4().to_string();
+    let manager = RTCManager::new(self_id, room, false).await;
+    let controller = ForwardController::new(manager.clone());
+
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let stdout = tokio::io::stdout();
+    tokio::select! {
+        result = control_shell::run(controller, stdin, stdout) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {}
+    }
+
+    manager.close().await;
+    Ok(())
 }
 
 async fn run_chat(room_id: Option<&str>) -> Result<()> {
