@@ -193,6 +193,11 @@ impl RTCManagerHandle {
         self.send_capabilities_to_all().await;
     }
 
+    pub async fn unpublish_tunnel_target(&self, target: &str) {
+        self.inner.self_forward_keys.write().await.remove(target);
+        self.send_capabilities_to_all().await;
+    }
+
     pub async fn send_chat_to_all(&self, msg: &str) {
         let _ = self
             .send_payload("", P2pPayload::Chat { text: msg.into() })
