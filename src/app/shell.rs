@@ -10,7 +10,7 @@ use crate::negotiation::ForwardNegotiator;
 use crate::rtc::RTCManager;
 use crate::{control_shell, tui};
 
-use super::generate_room_id;
+use super::{generate_room_id, load_or_create_node_id};
 
 pub(crate) async fn run_tui(room_id: Option<&str>) -> Result<()> {
     let room = match room_id {
@@ -22,7 +22,7 @@ pub(crate) async fn run_tui(room_id: Option<&str>) -> Result<()> {
         }
     };
 
-    let self_id = uuid::Uuid::new_v4().to_string();
+    let self_id = load_or_create_node_id().await?;
     let manager = RTCManager::new(self_id, room.clone(), true).await;
     let trust_store = TrustStore::load(default_trust_store_path()).await?;
     let audit_log = AuthAuditLog::default();
@@ -102,7 +102,7 @@ pub(crate) async fn run_control_shell(room_id: Option<&str>) -> Result<()> {
         }
     };
 
-    let self_id = uuid::Uuid::new_v4().to_string();
+    let self_id = load_or_create_node_id().await?;
     let manager = RTCManager::new(self_id, room, false).await;
     let trust_store = TrustStore::load(default_trust_store_path()).await?;
     let audit_log = AuthAuditLog::default();

@@ -7,8 +7,10 @@ use crate::forward_args::parse_connect_forward;
 use crate::rtc::RTCManager;
 use crate::stdio;
 
+use super::load_or_create_node_id;
+
 pub(crate) async fn run_connect(room_id: &str, forwards: &[String]) -> Result<()> {
-    let self_id = uuid::Uuid::new_v4().to_string();
+    let self_id = load_or_create_node_id().await?;
     let manager = RTCManager::new(self_id, room_id.to_string(), false).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
