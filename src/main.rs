@@ -8,6 +8,7 @@ mod proxy;
 mod rtc;
 mod stdio;
 mod tcp;
+mod tui;
 mod udp;
 
 use anyhow::Result;
@@ -83,6 +84,6 @@ async fn main() -> Result<()> {
             command,
         }) => app::run_serve(&args, &command, auto_accept, &allow_peer).await,
         Some(Commands::Chat { room_id }) => app::run_chat(room_id.as_deref()).await,
-        None => app::run_control_shell(cli.room_id.as_deref()).await,
+        None => app::run_tui(cli.room_id.as_deref()).await,
     }
 }
