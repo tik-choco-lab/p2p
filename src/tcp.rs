@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::auth::{allow_all, SharedAuthorizer};
-use crate::forward_runtime::ForwardRuntime;
+use crate::forward_runtime::{ForwardPeerRuntime, ForwardRuntime};
 use crate::rtc::{RTCManager, TunnelMessage};
 
 mod lifecycle;
@@ -16,13 +16,14 @@ mod tunnel;
 
 use lifecycle::{forward_key, spawn_handler_cleanup};
 
-const TCP_BUFFER_SIZE: usize = 4096;
+const TCP_BUFFER_SIZE: usize = 16 * 1024;
 const TUNNEL_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct TunnelConn {
     writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     peer_id: String,
+    metrics: ForwardPeerRuntime,
     notify_remote: bool,
 }
 
@@ -102,15 +103,25 @@ impl TcpManager {
             authorizer,
         });
 
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
         let mgr_msg = mgr.clone();
+        let msg_runtime = mgr.runtime.clone();
+        tokio::spawn(async move {
+            while let Some((peer_id, data)) = msg_rx.recv().await {
+                if msg_runtime.is_cancelled() {
+                    break;
+                }
+                mgr_msg.on_tunnel_message(&peer_id, &data).await;
+            }
+        });
+
         let msg_runtime = mgr.runtime.clone();
         let handler_id = rtc_manager
             .on_tunnel_message_for(target.clone(), move |peer_id, data| {
                 if msg_runtime.is_cancelled() {
                     return;
                 }
-                let mgr = mgr_msg.clone();
-                tokio::spawn(async move { mgr.on_tunnel_message(&peer_id, &data).await });
+                let _ = msg_tx.send((peer_id, data));
             })
             .await;
         spawn_handler_cleanup(rtc_manager.clone(), mgr.runtime.clone(), handler_id);
@@ -166,9 +177,11 @@ impl TcpManager {
         peer_id: &str,
         notify_remote: bool,
     ) {
+        let metrics = self.runtime.peer(peer_id);
         let tc = TunnelConn {
             writer: Arc::new(tokio::sync::Mutex::new(write_half)),
             peer_id: peer_id.to_string(),
+            metrics: metrics.clone(),
             notify_remote,
         };
         let old = self
@@ -177,7 +190,7 @@ impl TcpManager {
             .await
             .insert(conn_id.to_string(), Arc::new(RwLock::new(tc)));
         if old.is_none() {
-            self.runtime.record_conn_open_for(peer_id);
+            metrics.record_conn_open();
         }
     }
 
@@ -185,7 +198,7 @@ impl TcpManager {
         let tc = self.conns.write().await.remove(conn_id);
         if let Some(tc) = tc {
             let tc = tc.read().await;
-            self.runtime.record_conn_close_for(&tc.peer_id);
+            tc.metrics.record_conn_close();
             if notify_remote && tc.notify_remote {
                 let close_msg = TunnelMessage {
                     msg_type: "close".into(),
@@ -206,12 +219,12 @@ impl TcpManager {
 
     async fn close_all_for_peer(&self, peer_id: &str) {
         let mut conns = self.conns.write().await;
-        let to_remove: Vec<String> = conns
+        let to_remove: Vec<(String, ForwardPeerRuntime)> = conns
             .iter()
             .filter_map(|(id, tc)| {
                 if let Ok(tc) = tc.try_read() {
                     if tc.peer_id == peer_id {
-                        Some(id.clone())
+                        Some((id.clone(), tc.metrics.clone()))
                     } else {
                         None
                     }
@@ -220,9 +233,9 @@ impl TcpManager {
                 }
             })
             .collect();
-        for id in to_remove {
+        for (id, metrics) in to_remove {
             if conns.remove(&id).is_some() {
-                self.runtime.record_conn_close_for(peer_id);
+                metrics.record_conn_close();
             }
         }
     }

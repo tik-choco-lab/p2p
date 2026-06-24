@@ -64,6 +64,7 @@ impl TcpManager {
     ) {
         let mut buf = vec![0u8; TCP_BUFFER_SIZE];
         let mut shutdown = self.runtime.subscribe();
+        let metrics = self.runtime.peer(&peer_id);
         loop {
             tokio::select! {
                 read = read_half.read(&mut buf) => {
@@ -84,7 +85,7 @@ impl TcpManager {
                                 self.close_conn(&conn_id, false).await;
                                 return;
                             }
-                            self.runtime.record_bytes_in_for(&peer_id, n);
+                            metrics.record_bytes_in(n);
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::UnexpectedEof {
