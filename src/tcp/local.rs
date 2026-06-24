@@ -7,7 +7,7 @@ use tracing::{debug, error};
 
 use crate::rtc::TunnelMessage;
 
-use super::{TcpManager, RETRY_INTERVAL, TCP_BUFFER_SIZE, TUNNEL_READY_TIMEOUT};
+use super::{log_tcp_io_error, TcpManager, RETRY_INTERVAL, TCP_BUFFER_SIZE, TUNNEL_READY_TIMEOUT};
 
 impl TcpManager {
     pub(super) async fn handle_local_connection(self: &Arc<Self>, stream: TcpStream) {
@@ -88,9 +88,7 @@ impl TcpManager {
                             metrics.record_bytes_in(n);
                         }
                         Err(e) => {
-                            if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                                error!("tcp read error: {}", e);
-                            }
+                            log_tcp_io_error("tcp read error", &e);
                             self.close_conn(&conn_id, true).await;
                             return;
                         }
