@@ -16,6 +16,24 @@ fn encode_tunnel(target: &str, conn_id: &str) -> Vec<u8> {
     .unwrap()
 }
 
+#[test]
+fn tunnel_message_payload_is_encoded_as_hex_string() {
+    let encoded = encode_tunnel("tcp:80", "conn-1");
+
+    assert_eq!(
+        String::from_utf8(encoded).unwrap(),
+        r#"{"type":"data","conn_id":"conn-1","target":"tcp:80","payload":"2a"}"#
+    );
+}
+
+#[test]
+fn legacy_tunnel_message_payload_array_is_still_accepted() {
+    let decoded: TunnelMessage =
+        serde_json::from_slice(br#"{"type":"data","conn_id":"conn-1","payload":[42]}"#).unwrap();
+
+    assert_eq!(decoded.payload, Some(vec![42]));
+}
+
 #[tokio::test]
 async fn capability_payload_tracks_targeted_server_peers() {
     let manager = test_manager("self", PeerRole::Client);

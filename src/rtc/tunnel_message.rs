@@ -11,6 +11,11 @@ pub struct TunnelMessage {
     #[serde(rename = "target", default, skip_serializing_if = "String::is_empty")]
     pub target: String,
 
-    #[serde(rename = "payload", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "payload",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::rtc::wire_bytes::option_hex"
+    )]
     pub payload: Option<Vec<u8>>,
 }

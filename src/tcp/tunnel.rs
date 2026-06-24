@@ -76,20 +76,26 @@ impl TcpManager {
             Some(p) if !p.is_empty() => p,
             _ => return,
         };
-        let conns = self.conns.read().await;
-        if let Some(tc) = conns.get(&tm.conn_id) {
-            let tc = tc.read().await;
-            let mut writer = tc.writer.lock().await;
-            if let Err(e) = writer.write_all(payload).await {
-                error!("failed to write to tcp: {}", e);
-                drop(writer);
-                drop(tc);
-                drop(conns);
-                self.close_conn(&tm.conn_id, true).await;
-            } else {
-                self.runtime
-                    .record_bytes_out_for(&tc.peer_id, payload.len());
+        let Some((writer, peer_id)) = ({
+            let conns = self.conns.read().await;
+            match conns.get(&tm.conn_id) {
+                Some(tc) => {
+                    let tc = tc.read().await;
+                    Some((tc.writer.clone(), tc.peer_id.clone()))
+                }
+                None => None,
             }
+        }) else {
+            return;
+        };
+
+        let mut writer = writer.lock().await;
+        if let Err(e) = writer.write_all(payload).await {
+            error!("failed to write to tcp: {}", e);
+            drop(writer);
+            self.close_conn(&tm.conn_id, true).await;
+        } else {
+            self.runtime.record_bytes_out_for(&peer_id, payload.len());
         }
     }
 }
