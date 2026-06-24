@@ -9,6 +9,7 @@ mod state;
 use event::dispatch_event;
 use payload::P2pPayload;
 use state::{PeerRole, RTCManagerInner};
+use crate::rtc::TunnelMessage;
 
 #[cfg(test)]
 mod tests;
@@ -73,6 +74,33 @@ impl RTCManagerHandle {
             .push(Arc::new(f));
     }
 
+    pub async fn on_tunnel_message_for<F: Fn(String, Vec<u8>) + Send + Sync + 'static>(
+        &self,
+        target: String,
+        f: F,
+    ) {
+        let is_default = {
+            let mut default = self.inner.default_tunnel_target.write().await;
+            if default.is_none() {
+                *default = Some(target.clone());
+                true
+            } else {
+                default.as_deref() == Some(target.as_str())
+            }
+        };
+
+        let f = Arc::new(f);
+        self.on_tunnel_message(move |peer_id, data| {
+            let Ok(tm) = serde_json::from_slice::<TunnelMessage>(&data) else {
+                return;
+            };
+            if tm.target == target || (tm.target.is_empty() && is_default) {
+                f(peer_id, data);
+            }
+        })
+        .await;
+    }
+
     pub async fn on_stdio_message<F: Fn(String, Vec<u8>) + Send + Sync + 'static>(&self, f: F) {
         self.inner
             .stdio_msg_handlers
@@ -122,6 +150,27 @@ impl RTCManagerHandle {
     }
 
     pub async fn get_server_peers(&self) -> Vec<String> {
+        self.get_server_peers_for("").await
+    }
+
+    pub async fn get_server_peers_for(&self, target: &str) -> Vec<String> {
+        if !target.is_empty() {
+            let keys = self.inner.peer_forward_keys.read().await;
+            let matched = keys
+                .iter()
+                .filter_map(|(id, keys)| {
+                    if keys.contains(target) {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !matched.is_empty() {
+                return matched;
+            }
+        }
+
         let roles = self.inner.peer_roles.read().await;
         roles
             .iter()
@@ -133,6 +182,15 @@ impl RTCManagerHandle {
                 }
             })
             .collect()
+    }
+
+    pub async fn publish_tunnel_target(&self, target: &str) {
+        self.inner
+            .self_forward_keys
+            .write()
+            .await
+            .insert(target.to_string());
+        self.send_capabilities_to_all().await;
     }
 
     pub async fn send_chat_to_all(&self, msg: &str) {
@@ -158,6 +216,20 @@ impl RTCManagerHandle {
                     role: self.inner.self_role.as_str().to_string(),
                 },
             )
+            .await;
+    }
+
+    async fn send_capabilities_to_all(&self) {
+        let forwards = self
+            .inner
+            .self_forward_keys
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        let _ = self
+            .send_payload("", P2pPayload::Capabilities { forwards })
             .await;
     }
 

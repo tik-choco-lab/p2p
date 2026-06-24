@@ -34,7 +34,7 @@ enum Commands {
     Connect {
         room_id: String,
 
-        forward: Option<String>,
+        forwards: Vec<String>,
     },
 
     Serve {
@@ -42,6 +42,10 @@ enum Commands {
 
         #[arg(last = true)]
         command: Vec<String>,
+    },
+
+    Chat {
+        room_id: Option<String>,
     },
 }
 
@@ -71,6 +75,39 @@ fn parse_forward(f: &str) -> (&str, &str, i32) {
     (proto, addr, port)
 }
 
+fn parse_connect_forward(f: &str) -> (&str, i32, String) {
+    let (proto, addr, fallback_port) = parse_forward(f);
+    let addr = addr.trim_start_matches(':');
+
+    let (listen_port, remote_port) =
+        if let Some((listen, remote)) = addr.split_once(':') {
+            let listen_port = listen.parse::<i32>().unwrap_or(fallback_port);
+            let remote_port = remote.parse::<i32>().unwrap_or(listen_port);
+            (listen_port, remote_port)
+        } else {
+            (fallback_port, fallback_port)
+        };
+
+    (proto, listen_port, format!("{}:{}", proto, remote_port))
+}
+
+fn split_serve_args(args: &[String]) -> (Option<String>, Vec<String>) {
+    let Some(first) = args.first() else {
+        return (None, Vec::new());
+    };
+
+    let is_forward =
+        first.contains(':') || first.starts_with("tcp://") || first.starts_with("udp://");
+    if is_forward {
+        (None, args.to_vec())
+    } else {
+        (
+            Some(first.clone()),
+            args.iter().skip(1).cloned().collect::<Vec<_>>(),
+        )
+    }
+}
+
 fn init_tracing(verbose: u8) {
     let filter = match verbose {
         0 => "error",
@@ -89,10 +126,9 @@ async fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     match cli.command {
-        Some(Commands::Connect { room_id, forward }) => {
-            run_connect(&room_id, forward.as_deref()).await
-        }
+        Some(Commands::Connect { room_id, forwards }) => run_connect(&room_id, &forwards).await,
         Some(Commands::Serve { args, command }) => run_serve(&args, &command).await,
+        Some(Commands::Chat { room_id }) => run_chat(room_id.as_deref()).await,
         None => run_chat(cli.room_id.as_deref()).await,
     }
 }
@@ -153,7 +189,7 @@ async fn run_chat(room_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn run_connect(room_id: &str, forward: Option<&str>) -> Result<()> {
+async fn run_connect(room_id: &str, forwards: &[String]) -> Result<()> {
     let self_id = uuid::Uuid::new_v4().to_string();
     let manager = RTCManager::new(self_id, room_id.to_string(), false).await;
 
@@ -170,18 +206,34 @@ async fn run_connect(room_id: &str, forward: Option<&str>) -> Result<()> {
         let _ = shutdown_tx.send(()).await;
     });
 
-    if let Some(f) = forward {
-        let (proto, _, port) = parse_forward(f);
+    for f in forwards {
+        let (proto, listen_port, target) = parse_connect_forward(f);
         let mgr = manager.clone();
         if proto == "tcp" {
             tokio::spawn(async move {
-                if let Err(e) = tcp::TcpManager::listen_and_serve(mgr, port, String::new()).await {
+                if let Err(e) =
+                    tcp::TcpManager::listen_and_serve_with_target(
+                        mgr,
+                        listen_port,
+                        String::new(),
+                        target,
+                    )
+                    .await
+                {
                     error!("TCP error: {}", e);
                 }
             });
         } else {
             tokio::spawn(async move {
-                if let Err(e) = udp::UdpManager::listen_and_serve(mgr, port, String::new()).await {
+                if let Err(e) =
+                    udp::UdpManager::listen_and_serve_with_target(
+                        mgr,
+                        listen_port,
+                        String::new(),
+                        target,
+                    )
+                    .await
+                {
                     error!("UDP error: {}", e);
                 }
             });
@@ -199,22 +251,8 @@ async fn run_connect(room_id: &str, forward: Option<&str>) -> Result<()> {
 }
 
 async fn run_serve(args: &[String], command: &[String]) -> Result<()> {
-    let mut room_id = String::new();
-    let mut forwards: Vec<String> = Vec::new();
-
-    if !args.is_empty() {
-        let arg = &args[0];
-        let is_forward =
-            arg.contains(':') || arg.starts_with("tcp://") || arg.starts_with("udp://");
-        if is_forward && args.len() == 1 {
-            forwards.push(arg.clone());
-        } else {
-            room_id = arg.clone();
-            if args.len() > 1 {
-                forwards.push(args[1].clone());
-            }
-        }
-    }
+    let (room_id, forwards) = split_serve_args(args);
+    let mut room_id = room_id.unwrap_or_default();
 
     if room_id.is_empty() {
         room_id = generate_room_id();
@@ -236,17 +274,22 @@ async fn run_serve(args: &[String], command: &[String]) -> Result<()> {
 
     for f in &forwards {
         let (proto, addr, _) = parse_forward(f);
+        let target = forward_key(proto, addr);
         let mgr = manager.clone();
         let addr = addr.to_string();
         if proto == "tcp" {
             tokio::spawn(async move {
-                if let Err(e) = tcp::TcpManager::listen_and_serve(mgr, -1, addr).await {
+                if let Err(e) =
+                    tcp::TcpManager::listen_and_serve_with_target(mgr, -1, addr, target).await
+                {
                     error!("TCP error: {}", e);
                 }
             });
         } else {
             tokio::spawn(async move {
-                if let Err(e) = udp::UdpManager::listen_and_serve(mgr, -1, addr).await {
+                if let Err(e) =
+                    udp::UdpManager::listen_and_serve_with_target(mgr, -1, addr, target).await
+                {
                     error!("UDP error: {}", e);
                 }
             });
@@ -270,4 +313,69 @@ async fn run_serve(args: &[String], command: &[String]) -> Result<()> {
     shutdown_rx.recv().await;
     manager.close().await;
     Ok(())
+}
+
+fn forward_key(proto: &str, addr: &str) -> String {
+    let port = addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<i32>().ok())
+        .unwrap_or(-1);
+    format!("{}:{}", proto, port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn connect_forward_defaults_remote_port_to_listen_port() {
+        assert_eq!(
+            parse_connect_forward(":8080"),
+            ("tcp", 8080, "tcp:8080".to_string())
+        );
+        assert_eq!(
+            parse_connect_forward("udp://9000"),
+            ("udp", 9000, "udp:9000".to_string())
+        );
+    }
+
+    #[test]
+    fn connect_forward_maps_listen_port_to_remote_target() {
+        assert_eq!(
+            parse_connect_forward("15432:5432"),
+            ("tcp", 15432, "tcp:5432".to_string())
+        );
+        assert_eq!(
+            parse_connect_forward("udp://19000:9000"),
+            ("udp", 19000, "udp:9000".to_string())
+        );
+    }
+
+    #[test]
+    fn serve_args_keep_all_forwards_when_room_is_present() {
+        let (room, forwards) =
+            split_serve_args(&strings(&["my-room", ":80", "tcp://127.0.0.1:5432"]));
+
+        assert_eq!(room, Some("my-room".to_string()));
+        assert_eq!(forwards, strings(&[":80", "tcp://127.0.0.1:5432"]));
+    }
+
+    #[test]
+    fn serve_args_treat_leading_forward_as_generated_room_mode() {
+        let (room, forwards) = split_serve_args(&strings(&[":80", "udp://127.0.0.1:9000"]));
+
+        assert_eq!(room, None);
+        assert_eq!(forwards, strings(&[":80", "udp://127.0.0.1:9000"]));
+    }
+
+    #[test]
+    fn forward_key_uses_protocol_and_port() {
+        assert_eq!(forward_key("tcp", "127.0.0.1:80"), "tcp:80");
+        assert_eq!(forward_key("udp", ":9000"), "udp:9000");
+    }
 }

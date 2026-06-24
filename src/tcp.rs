@@ -23,13 +23,29 @@ pub struct TcpManager {
     rtc_manager: RTCManager,
     conns: Arc<RwLock<HashMap<String, Arc<RwLock<TunnelConn>>>>>,
     remote_addr: String,
+    target: String,
 }
 
 impl TcpManager {
+    #[allow(dead_code)]
     pub async fn listen_and_serve(
         rtc_manager: RTCManager,
         listen_port: i32,
         remote_addr: String,
+    ) -> Result<()> {
+        let target = if remote_addr.is_empty() {
+            format!("tcp:{}", listen_port)
+        } else {
+            forward_key("tcp", &remote_addr)
+        };
+        Self::listen_and_serve_with_target(rtc_manager, listen_port, remote_addr, target).await
+    }
+
+    pub async fn listen_and_serve_with_target(
+        rtc_manager: RTCManager,
+        listen_port: i32,
+        remote_addr: String,
+        target: String,
     ) -> Result<()> {
         let resolved = if !remote_addr.is_empty() {
             if remote_addr.contains(':') {
@@ -45,15 +61,19 @@ impl TcpManager {
             rtc_manager: rtc_manager.clone(),
             conns: Arc::new(RwLock::new(HashMap::new())),
             remote_addr: resolved,
+            target: target.clone(),
         });
 
         let mgr_msg = mgr.clone();
         rtc_manager
-            .on_tunnel_message(move |peer_id, data| {
+            .on_tunnel_message_for(target.clone(), move |peer_id, data| {
                 let mgr = mgr_msg.clone();
                 tokio::spawn(async move { mgr.on_tunnel_message(&peer_id, &data).await });
             })
             .await;
+        if !mgr.remote_addr.is_empty() {
+            rtc_manager.publish_tunnel_target(&target).await;
+        }
 
         let mgr_close = mgr.clone();
         rtc_manager
@@ -101,6 +121,7 @@ impl TcpManager {
         let connect_msg = TunnelMessage {
             msg_type: "connect".into(),
             conn_id: conn_id.clone(),
+            target: self.target.clone(),
             payload: None,
         };
         if let Err(e) = self.send_to(&peer_id, &connect_msg).await {
@@ -118,7 +139,7 @@ impl TcpManager {
     async fn wait_for_tunnel_ready(&self, timeout: std::time::Duration) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let peers = self.rtc_manager.get_server_peers().await;
+            let peers = self.rtc_manager.get_server_peers_for(&self.target).await;
             if let Some(peer_id) = peers.first() {
                 debug!("Selected server peer: {}", peer_id);
                 return Ok(peer_id.clone());
@@ -147,6 +168,7 @@ impl TcpManager {
                     let msg = TunnelMessage {
                         msg_type: "data".into(),
                         conn_id: conn_id.clone(),
+                        target: self.target.clone(),
                         payload: Some(buf[..n].to_vec()),
                     };
                     if let Err(e) = self.send_to(&peer_id, &msg).await {
@@ -199,6 +221,7 @@ impl TcpManager {
                 let close_msg = TunnelMessage {
                     msg_type: "close".into(),
                     conn_id: tm.conn_id.clone(),
+                    target: self.target.clone(),
                     payload: None,
                 };
                 let _ = self.send_to(peer_id, &close_msg).await;
@@ -251,6 +274,7 @@ impl TcpManager {
                 let close_msg = TunnelMessage {
                     msg_type: "close".into(),
                     conn_id: conn_id.to_string(),
+                    target: self.target.clone(),
                     payload: None,
                 };
                 let _ = self.send_to(&tc.peer_id, &close_msg).await;
@@ -290,6 +314,17 @@ impl TcpManager {
             rtc_manager: self.rtc_manager.clone(),
             conns: self.conns.clone(),
             remote_addr: self.remote_addr.clone(),
+            target: self.target.clone(),
         }
     }
+}
+
+#[allow(dead_code)]
+fn forward_key(proto: &str, addr: &str) -> String {
+    let port = addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<i32>().ok())
+        .unwrap_or(-1);
+    format!("{}:{}", proto, port)
 }
