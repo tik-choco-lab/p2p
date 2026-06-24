@@ -124,3 +124,73 @@ async fn empty_tunnel_target_routes_to_first_registered_target() {
     );
     assert!(second.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn removed_tunnel_handler_no_longer_receives_targeted_messages() {
+    let manager = test_manager("self", PeerRole::Client);
+    let received = Arc::new(Mutex::new(Vec::new()));
+
+    let handler_id = {
+        let received = received.clone();
+        manager
+            .on_tunnel_message_for("tcp:80".to_string(), move |peer, data| {
+                let tm: TunnelMessage = serde_json::from_slice(&data).unwrap();
+                received.lock().unwrap().push((peer, tm.conn_id));
+            })
+            .await
+    };
+
+    assert!(manager.remove_tunnel_message_handler(handler_id).await);
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        encode(P2pPayload::Tunnel {
+            data: encode_tunnel("tcp:80", "conn-80"),
+        }),
+    )
+    .await;
+
+    assert!(received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn empty_tunnel_target_uses_next_handler_after_default_removed() {
+    let manager = test_manager("self", PeerRole::Client);
+    let first = Arc::new(Mutex::new(Vec::new()));
+    let second = Arc::new(Mutex::new(Vec::new()));
+
+    let first_handler = {
+        let first = first.clone();
+        manager
+            .on_tunnel_message_for("tcp:80".to_string(), move |peer, data| {
+                let tm: TunnelMessage = serde_json::from_slice(&data).unwrap();
+                first.lock().unwrap().push((peer, tm.conn_id));
+            })
+            .await
+    };
+    {
+        let second = second.clone();
+        manager
+            .on_tunnel_message_for("tcp:5432".to_string(), move |peer, data| {
+                let tm: TunnelMessage = serde_json::from_slice(&data).unwrap();
+                second.lock().unwrap().push((peer, tm.conn_id));
+            })
+            .await;
+    }
+
+    assert!(manager.remove_tunnel_message_handler(first_handler).await);
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        encode(P2pPayload::Tunnel {
+            data: encode_tunnel("", "legacy-conn"),
+        }),
+    )
+    .await;
+
+    assert!(first.lock().unwrap().is_empty());
+    assert_eq!(
+        *second.lock().unwrap(),
+        vec![("peer-1".to_string(), "legacy-conn".to_string())]
+    );
+}

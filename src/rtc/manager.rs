@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 
 mod event;
+mod handlers;
 mod payload;
 mod state;
 
-use crate::rtc::TunnelMessage;
 use event::dispatch_event;
 use payload::P2pPayload;
 use state::{PeerRole, RTCManagerInner};
@@ -60,93 +60,6 @@ impl RTCManagerHandle {
 
     pub fn self_id(&self) -> &str {
         &self.inner.self_id
-    }
-
-    pub async fn on_chat_message<F: Fn(String, String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.chat_handlers.write().await.push(Arc::new(f));
-    }
-
-    pub async fn on_tunnel_message<F: Fn(String, Vec<u8>) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .tunnel_msg_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
-    }
-
-    pub async fn on_tunnel_message_for<F: Fn(String, Vec<u8>) + Send + Sync + 'static>(
-        &self,
-        target: String,
-        f: F,
-    ) {
-        let is_default = {
-            let mut default = self.inner.default_tunnel_target.write().await;
-            if default.is_none() {
-                *default = Some(target.clone());
-                true
-            } else {
-                default.as_deref() == Some(target.as_str())
-            }
-        };
-
-        let f = Arc::new(f);
-        self.on_tunnel_message(move |peer_id, data| {
-            let Ok(tm) = serde_json::from_slice::<TunnelMessage>(&data) else {
-                return;
-            };
-            if tm.target == target || (tm.target.is_empty() && is_default) {
-                f(peer_id, data);
-            }
-        })
-        .await;
-    }
-
-    pub async fn on_stdio_message<F: Fn(String, Vec<u8>) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .stdio_msg_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
-    }
-
-    pub async fn on_tunnel_open<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .tunnel_open_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
-    }
-
-    pub async fn on_stdio_open<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .stdio_open_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
-    }
-
-    pub async fn on_tunnel_close<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .tunnel_close_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
-    }
-
-    pub async fn on_stdio_close<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .stdio_close_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
-    }
-
-    pub async fn on_peer_connected<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner
-            .peer_conn_handlers
-            .write()
-            .await
-            .push(Arc::new(f));
     }
 
     pub async fn get_server_peers(&self) -> Vec<String> {

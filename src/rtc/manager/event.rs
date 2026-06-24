@@ -4,6 +4,7 @@ use tokio::sync::RwLock;
 
 use super::payload::P2pPayload;
 use super::state::{PeerRole, RTCManagerInner};
+use crate::rtc::TunnelMessage;
 
 pub(super) fn dispatch_event(
     runtime: &tokio::runtime::Handle,
@@ -85,9 +86,22 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
             }
         }
         P2pPayload::Tunnel { data } => {
+            let tunnel_msg = serde_json::from_slice::<TunnelMessage>(&data).ok();
+            let default_target = if tunnel_msg.as_ref().is_some_and(|msg| msg.target.is_empty()) {
+                inner.default_tunnel_target.read().await.clone()
+            } else {
+                None
+            };
             let handlers = inner.tunnel_msg_handlers.read().await;
-            for h in handlers.iter() {
-                h(peer_id.clone(), data.clone());
+            for entry in handlers.iter() {
+                if !tunnel_handler_matches(
+                    entry.target.as_deref(),
+                    tunnel_msg.as_ref(),
+                    &default_target,
+                ) {
+                    continue;
+                }
+                (entry.handler)(peer_id.clone(), data.clone());
             }
         }
         P2pPayload::Stdio { data } => {
@@ -96,6 +110,20 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
                 h(peer_id.clone(), data.clone());
             }
         }
+    }
+}
+
+fn tunnel_handler_matches(
+    handler_target: Option<&str>,
+    msg: Option<&TunnelMessage>,
+    default_target: &Option<String>,
+) -> bool {
+    match handler_target {
+        None => true,
+        Some(target) => msg.is_some_and(|msg| {
+            msg.target == target
+                || (msg.target.is_empty() && default_target.as_deref() == Some(target))
+        }),
     }
 }
 

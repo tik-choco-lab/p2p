@@ -1,11 +1,19 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
 type ChatHandler = Arc<dyn Fn(String, String) + Send + Sync>;
-type DataHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
 type PeerHandler = Arc<dyn Fn(String) + Send + Sync>;
+
+pub(super) type DataHandler = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
+
+pub(super) struct DataHandlerEntry {
+    pub(super) id: u64,
+    pub(super) target: Option<String>,
+    pub(super) handler: DataHandler,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum PeerRole {
@@ -37,9 +45,10 @@ pub(super) struct RTCManagerInner {
     pub(super) peer_forward_keys: RwLock<HashMap<String, HashSet<String>>>,
     pub(super) self_forward_keys: RwLock<HashSet<String>>,
     pub(super) default_tunnel_target: RwLock<Option<String>>,
+    pub(super) next_tunnel_handler_id: AtomicU64,
 
     pub(super) chat_handlers: RwLock<Vec<ChatHandler>>,
-    pub(super) tunnel_msg_handlers: RwLock<Vec<DataHandler>>,
+    pub(super) tunnel_msg_handlers: RwLock<Vec<DataHandlerEntry>>,
     pub(super) stdio_msg_handlers: RwLock<Vec<DataHandler>>,
     pub(super) tunnel_open_handlers: RwLock<Vec<PeerHandler>>,
     pub(super) stdio_open_handlers: RwLock<Vec<PeerHandler>>,
@@ -58,6 +67,7 @@ impl RTCManagerInner {
             peer_forward_keys: RwLock::new(HashMap::new()),
             self_forward_keys: RwLock::new(HashSet::new()),
             default_tunnel_target: RwLock::new(None),
+            next_tunnel_handler_id: AtomicU64::new(1),
             chat_handlers: RwLock::new(Vec::new()),
             tunnel_msg_handlers: RwLock::new(Vec::new()),
             stdio_msg_handlers: RwLock::new(Vec::new()),
