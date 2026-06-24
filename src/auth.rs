@@ -4,9 +4,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub use audit::{AuthAuditLog, AuthEvent, AuthEventSource};
+#[allow(unused_imports)]
+pub use pending::PendingAuthorization;
+pub use pending::{PendingAuthorizations, PendingAuthorizer};
 pub use trust::{default_trust_store_path, TrustDecision, TrustEntry, TrustKey, TrustStore};
 
 mod audit;
+mod pending;
 mod trust;
 
 pub type AuthFuture<'a> = Pin<Box<dyn Future<Output = AuthDecision> + Send + 'a>>;
@@ -98,6 +102,7 @@ impl PolicyAuthorizer {
         Arc::new(Self::new(policy, store))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_audit_log(policy: AuthPolicy, store: TrustStore, audit_log: AuthAuditLog) -> Self {
         Self {
             policy,
@@ -106,6 +111,7 @@ impl PolicyAuthorizer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn shared_with_audit_log(
         policy: AuthPolicy,
         store: TrustStore,

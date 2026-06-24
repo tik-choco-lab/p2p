@@ -1,0 +1,183 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use tokio::sync::{oneshot, Mutex};
+
+use crate::auth::{
+    AuthAuditLog, AuthDecision, AuthEventSource, AuthFuture, AuthRequest, ConnectionAuthorizer,
+    SharedAuthorizer, TrustDecision, TrustKey, TrustStore,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAuthorization {
+    pub id: u64,
+    pub request: AuthRequest,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAuthorizations {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    next_id: u64,
+    pending: BTreeMap<u64, PendingItem>,
+}
+
+#[derive(Debug)]
+struct PendingItem {
+    request: AuthRequest,
+    responder: oneshot::Sender<AuthDecision>,
+}
+
+impl Default for PendingAuthorizations {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingAuthorizations {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                next_id: 1,
+                pending: BTreeMap::new(),
+            })),
+        }
+    }
+
+    pub async fn list(&self) -> Vec<PendingAuthorization> {
+        self.inner
+            .lock()
+            .await
+            .pending
+            .iter()
+            .map(|(id, item)| PendingAuthorization {
+                id: *id,
+                request: item.request.clone(),
+            })
+            .collect()
+    }
+
+    pub async fn resolve(&self, id: u64, decision: AuthDecision) -> bool {
+        let item = self.inner.lock().await.pending.remove(&id);
+        match item {
+            Some(item) => {
+                let _ = item.responder.send(decision);
+                true
+            }
+            None => false,
+        }
+    }
+
+    async fn enqueue(&self, request: AuthRequest) -> oneshot::Receiver<AuthDecision> {
+        let (sender, receiver) = oneshot::channel();
+        let mut inner = self.inner.lock().await;
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.pending.insert(
+            id,
+            PendingItem {
+                request,
+                responder: sender,
+            },
+        );
+        receiver
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn enqueue_for_test(
+        &self,
+        request: AuthRequest,
+    ) -> oneshot::Receiver<AuthDecision> {
+        self.enqueue(request).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAuthorizer {
+    store: TrustStore,
+    pending: PendingAuthorizations,
+    audit_log: Option<AuthAuditLog>,
+}
+
+impl PendingAuthorizer {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(store: TrustStore, pending: PendingAuthorizations) -> Self {
+        Self {
+            store,
+            pending,
+            audit_log: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn shared(store: TrustStore, pending: PendingAuthorizations) -> SharedAuthorizer {
+        Arc::new(Self::new(store, pending))
+    }
+
+    pub fn with_audit_log(
+        store: TrustStore,
+        pending: PendingAuthorizations,
+        audit_log: AuthAuditLog,
+    ) -> Self {
+        Self {
+            store,
+            pending,
+            audit_log: Some(audit_log),
+        }
+    }
+
+    pub fn shared_with_audit_log(
+        store: TrustStore,
+        pending: PendingAuthorizations,
+        audit_log: AuthAuditLog,
+    ) -> SharedAuthorizer {
+        Arc::new(Self::with_audit_log(store, pending, audit_log))
+    }
+
+    async fn decide(&self, req: &AuthRequest) -> AuthDecision {
+        let key = TrustKey {
+            peer_id: req.peer_id.clone(),
+            forward_key: req.forward_key.clone(),
+        };
+        if let Some(decision) = self.store.get(&key).await {
+            let decision = match decision {
+                TrustDecision::Allow => AuthDecision::Allow,
+                TrustDecision::Deny => AuthDecision::Deny,
+            };
+            self.record(req, decision, AuthEventSource::TrustStore)
+                .await;
+            return decision;
+        }
+
+        let receiver = self.pending.enqueue(req.clone()).await;
+        let decision = receiver.await.unwrap_or(AuthDecision::Deny);
+        if let Some(trust) = trust_decision(decision) {
+            let _ = self.store.remember(key, trust).await;
+        }
+        self.record(req, decision, AuthEventSource::Pending).await;
+        decision
+    }
+
+    async fn record(&self, req: &AuthRequest, decision: AuthDecision, source: AuthEventSource) {
+        if let Some(log) = &self.audit_log {
+            log.record(req, decision, source).await;
+        }
+    }
+}
+
+impl ConnectionAuthorizer for PendingAuthorizer {
+    fn authorize<'a>(&'a self, req: &'a AuthRequest) -> AuthFuture<'a> {
+        Box::pin(async move { self.decide(req).await })
+    }
+}
+
+fn trust_decision(decision: AuthDecision) -> Option<TrustDecision> {
+    match decision {
+        AuthDecision::AllowAlways => Some(TrustDecision::Allow),
+        AuthDecision::DenyAlways => Some(TrustDecision::Deny),
+        AuthDecision::Allow | AuthDecision::Deny => None,
+    }
+}

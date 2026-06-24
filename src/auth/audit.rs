@@ -10,6 +10,7 @@ use crate::auth::{AuthDecision, AuthRequest};
 pub enum AuthEventSource {
     Policy,
     TrustStore,
+    Pending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

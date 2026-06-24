@@ -3,6 +3,9 @@ use super::*;
 use crate::auth::{
     AuthAuditLog, AuthDecision, AuthEventSource, AuthRequest, TrustDecision, TrustKey, TrustStore,
 };
+use crate::controller::Proto;
+
+mod pending_commands;
 
 fn temp_store_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -150,7 +153,7 @@ async fn events_render_auth_audit_log() {
         )
         .await;
 
-    let outcome = execute_line_with_context(&controller, None, Some(&audit_log), "events")
+    let outcome = execute_line_with_context(&controller, None, Some(&audit_log), None, "events")
         .await
         .unwrap();
 
