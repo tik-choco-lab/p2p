@@ -73,12 +73,17 @@ impl UdpManager {
         });
 
         let mgr_msg = mgr.clone();
-        rtc_manager
+        let msg_runtime = mgr.runtime.clone();
+        let handler_id = rtc_manager
             .on_tunnel_message_for(target.clone(), move |peer_id, data| {
+                if msg_runtime.is_cancelled() {
+                    return;
+                }
                 let mgr = mgr_msg.clone();
                 tokio::spawn(async move { mgr.on_tunnel_message(&peer_id, &data).await });
             })
             .await;
+        spawn_handler_cleanup(rtc_manager.clone(), mgr.runtime.clone(), handler_id);
         if !mgr.remote_addr.is_empty() {
             rtc_manager.publish_tunnel_target(&target).await;
         }
@@ -247,4 +252,19 @@ fn forward_key(proto: &str, addr: &str) -> String {
         .and_then(|p| p.parse::<i32>().ok())
         .unwrap_or(-1);
     format!("{}:{}", proto, port)
+}
+
+fn spawn_handler_cleanup(rtc_manager: RTCManager, runtime: ForwardRuntime, handler_id: u64) {
+    tokio::spawn(async move {
+        let mut shutdown = runtime.subscribe();
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        rtc_manager.remove_tunnel_message_handler(handler_id).await;
+    });
 }

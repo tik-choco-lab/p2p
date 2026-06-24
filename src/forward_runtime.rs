@@ -48,6 +48,10 @@ impl ForwardRuntime {
         let _ = self.shutdown_tx.send(true);
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
     pub fn record_conn_open(&self) {
         self.counters.active_conns.fetch_add(1, Ordering::Relaxed);
     }
@@ -136,5 +140,6 @@ mod tests {
         shutdown.changed().await.unwrap();
 
         assert!(*shutdown.borrow());
+        assert!(runtime.is_cancelled());
     }
 }
