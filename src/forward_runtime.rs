@@ -21,11 +21,11 @@ pub struct PeerMetrics {
     pub bytes_out: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default)]
 struct PeerCounters {
-    active_conns: usize,
-    bytes_in: u64,
-    bytes_out: u64,
+    active_conns: AtomicUsize,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -33,13 +33,19 @@ struct ForwardCounters {
     active_conns: AtomicUsize,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
-    per_peer: Mutex<HashMap<String, PeerCounters>>,
+    per_peer: Mutex<HashMap<String, Arc<PeerCounters>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ForwardRuntime {
     counters: Arc<ForwardCounters>,
     shutdown_tx: watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForwardPeerRuntime {
+    counters: Arc<ForwardCounters>,
+    peer: Arc<PeerCounters>,
 }
 
 impl ForwardRuntime {
@@ -67,18 +73,25 @@ impl ForwardRuntime {
             .iter()
             .map(|(peer_id, c)| PeerMetrics {
                 peer_id: peer_id.clone(),
-                active_conns: c.active_conns,
-                bytes_in: c.bytes_in,
-                bytes_out: c.bytes_out,
+                active_conns: c.active_conns.load(Ordering::Relaxed),
+                bytes_in: c.bytes_in.load(Ordering::Relaxed),
+                bytes_out: c.bytes_out.load(Ordering::Relaxed),
             })
             .collect::<Vec<_>>();
         metrics.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
         metrics
     }
 
-    fn with_peer<F: FnOnce(&mut PeerCounters)>(&self, peer_id: &str, f: F) {
+    pub fn peer(&self, peer_id: &str) -> ForwardPeerRuntime {
         let mut per_peer = self.counters.per_peer.lock().unwrap();
-        f(per_peer.entry(peer_id.to_string()).or_default());
+        let peer = per_peer
+            .entry(peer_id.to_string())
+            .or_insert_with(|| Arc::new(PeerCounters::default()))
+            .clone();
+        ForwardPeerRuntime {
+            counters: self.counters.clone(),
+            peer,
+        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<bool> {
@@ -93,10 +106,12 @@ impl ForwardRuntime {
         *self.shutdown_tx.borrow()
     }
 
+    #[allow(dead_code)]
     pub fn record_conn_open(&self) {
         self.counters.active_conns.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn record_conn_close(&self) {
         let _ = self.counters.active_conns.fetch_update(
             Ordering::Relaxed,
@@ -105,38 +120,71 @@ impl ForwardRuntime {
         );
     }
 
+    #[allow(dead_code)]
     pub fn record_bytes_in(&self, bytes: usize) {
         self.counters
             .bytes_in
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn record_bytes_out(&self, bytes: usize) {
         self.counters
             .bytes_out
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn record_conn_open_for(&self, peer_id: &str) {
-        self.record_conn_open();
-        self.with_peer(peer_id, |c| c.active_conns += 1);
+        self.peer(peer_id).record_conn_open();
     }
 
+    #[allow(dead_code)]
     pub fn record_conn_close_for(&self, peer_id: &str) {
-        self.record_conn_close();
-        self.with_peer(peer_id, |c| {
-            c.active_conns = c.active_conns.saturating_sub(1)
-        });
+        self.peer(peer_id).record_conn_close();
     }
 
+    #[allow(dead_code)]
     pub fn record_bytes_in_for(&self, peer_id: &str, bytes: usize) {
-        self.record_bytes_in(bytes);
-        self.with_peer(peer_id, |c| c.bytes_in += bytes as u64);
+        self.peer(peer_id).record_bytes_in(bytes);
     }
 
+    #[allow(dead_code)]
     pub fn record_bytes_out_for(&self, peer_id: &str, bytes: usize) {
-        self.record_bytes_out(bytes);
-        self.with_peer(peer_id, |c| c.bytes_out += bytes as u64);
+        self.peer(peer_id).record_bytes_out(bytes);
+    }
+}
+
+impl ForwardPeerRuntime {
+    pub fn record_conn_open(&self) {
+        self.counters.active_conns.fetch_add(1, Ordering::Relaxed);
+        self.peer.active_conns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_conn_close(&self) {
+        let _ = self.counters.active_conns.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
+        let _ =
+            self.peer
+                .active_conns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                });
+    }
+
+    pub fn record_bytes_in(&self, bytes: usize) {
+        let bytes = bytes as u64;
+        self.counters.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+        self.peer.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_bytes_out(&self, bytes: usize) {
+        let bytes = bytes as u64;
+        self.counters.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+        self.peer.bytes_out.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 

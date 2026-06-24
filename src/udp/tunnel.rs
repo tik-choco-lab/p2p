@@ -20,18 +20,22 @@ impl UdpManager {
         };
 
         enum SendTarget {
-            Connected(Arc<UdpSocket>, String),
-            Local(Arc<UdpSocket>, SocketAddr, String),
+            Connected(Arc<UdpSocket>, crate::forward_runtime::ForwardPeerRuntime),
+            Local(
+                Arc<UdpSocket>,
+                SocketAddr,
+                crate::forward_runtime::ForwardPeerRuntime,
+            ),
         }
 
         let existing = {
             let conns = self.conns.read().await;
             if let Some(uc) = conns.get(&tm.conn_id) {
                 if let Some(target) = &uc.target_conn {
-                    Some(SendTarget::Connected(target.clone(), uc.peer_id.clone()))
+                    Some(SendTarget::Connected(target.clone(), uc.metrics.clone()))
                 } else if let Some(addr) = uc.client_addr {
                     let sock = self.local_socket.read().await.clone();
-                    sock.map(|sock| SendTarget::Local(sock, addr, uc.peer_id.clone()))
+                    sock.map(|sock| SendTarget::Local(sock, addr, uc.metrics.clone()))
                 } else {
                     None
                 }
@@ -46,10 +50,10 @@ impl UdpManager {
                 SendTarget::Local(sock, addr, _) => sock.send_to(payload, addr).await.is_ok(),
             };
             if sent {
-                let peer_id = match target {
-                    SendTarget::Connected(_, peer_id) | SendTarget::Local(_, _, peer_id) => peer_id,
+                let metrics = match target {
+                    SendTarget::Connected(_, metrics) | SendTarget::Local(_, _, metrics) => metrics,
                 };
-                self.runtime.record_bytes_out_for(&peer_id, payload.len());
+                metrics.record_bytes_out(payload.len());
             }
             return;
         }
@@ -70,8 +74,9 @@ impl UdpManager {
                         return;
                     }
                     let sock = Arc::new(sock);
+                    let metrics = self.runtime.peer(peer_id);
                     if sock.send(payload).await.is_ok() {
-                        self.runtime.record_bytes_out_for(peer_id, payload.len());
+                        metrics.record_bytes_out(payload.len());
                     }
 
                     let mut conns = self.conns.write().await;
@@ -81,11 +86,12 @@ impl UdpManager {
                             target_conn: Some(sock.clone()),
                             last_seen: Instant::now(),
                             peer_id: peer_id.to_string(),
+                            metrics: metrics.clone(),
                             client_addr: None,
                         },
                     );
                     if old.is_none() {
-                        self.runtime.record_conn_open_for(peer_id);
+                        metrics.record_conn_open();
                     }
 
                     let mgr_conns = self.conns.clone();
@@ -106,7 +112,7 @@ impl UdpManager {
         } else if let Some(ref sock) = *self.local_socket.read().await {
             if let Ok(addr) = tm.conn_id.parse::<std::net::SocketAddr>() {
                 if sock.send_to(payload, &addr).await.is_ok() {
-                    self.runtime.record_bytes_out_for(peer_id, payload.len());
+                    self.runtime.peer(peer_id).record_bytes_out(payload.len());
                 }
             }
         }
@@ -133,6 +139,7 @@ impl UdpManager {
     ) {
         let mut buf = vec![0u8; MAX_UDP_SIZE];
         let mut shutdown = runtime.subscribe();
+        let metrics = runtime.peer(&peer_id);
         loop {
             tokio::select! {
                 result = sock.recv(&mut buf) => {
@@ -155,7 +162,7 @@ impl UdpManager {
                                 Err(_) => continue,
                             };
                             if rtc_manager.send_tunnel_to(&peer_id, data).await.is_ok() {
-                                runtime.record_bytes_in_for(&peer_id, n);
+                                metrics.record_bytes_in(n);
                             }
                         }
                         Err(e) => {

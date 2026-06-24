@@ -40,15 +40,18 @@ impl UdpManager {
 
     async fn handle_local_packet(&self, payload: &[u8], addr: std::net::SocketAddr) {
         let conn_id = addr.to_string();
-        let peer_id = {
+        let existing = {
             let conns = self.conns.read().await;
-            conns.get(&conn_id).map(|c| c.peer_id.clone())
+            conns
+                .get(&conn_id)
+                .map(|c| (c.peer_id.clone(), c.metrics.clone()))
         };
 
-        let peer_id = match peer_id {
-            Some(id) => id,
+        let (peer_id, metrics) = match existing {
+            Some(existing) => existing,
             None => match self.wait_for_tunnel_ready(TUNNEL_READY_TIMEOUT).await {
                 Ok(id) => {
+                    let metrics = self.runtime.peer(&id);
                     let mut conns = self.conns.write().await;
                     let old = conns.insert(
                         conn_id.clone(),
@@ -56,13 +59,14 @@ impl UdpManager {
                             target_conn: None,
                             last_seen: Instant::now(),
                             peer_id: id.clone(),
+                            metrics: metrics.clone(),
                             client_addr: Some(addr),
                         },
                     );
                     if old.is_none() {
-                        self.runtime.record_conn_open_for(&id);
+                        metrics.record_conn_open();
                     }
-                    id
+                    (id, metrics)
                 }
                 Err(e) => {
                     error!("Tunnel not ready for UDP: {}", e);
@@ -87,7 +91,7 @@ impl UdpManager {
         if let Err(e) = self.send_to(&peer_id, &msg).await {
             error!("Failed to send UDP data: {}", e);
         } else {
-            self.runtime.record_bytes_in_for(&peer_id, payload.len());
+            metrics.record_bytes_in(payload.len());
         }
     }
 
@@ -110,20 +114,20 @@ impl UdpManager {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut removed_peers = Vec::new();
+                    let mut removed_metrics = Vec::new();
                     let mut conns = self.conns.write().await;
                     conns.retain(|id, uc| {
                         if uc.last_seen.elapsed() > UDP_TIMEOUT {
                             debug!("Cleaned up UDP session: {}", id);
-                            removed_peers.push(uc.peer_id.clone());
+                            removed_metrics.push(uc.metrics.clone());
                             false
                         } else {
                             true
                         }
                     });
                     drop(conns);
-                    for peer_id in removed_peers {
-                        self.runtime.record_conn_close_for(&peer_id);
+                    for metrics in removed_metrics {
+                        metrics.record_conn_close();
                     }
                 }
                 changed = shutdown.changed() => {

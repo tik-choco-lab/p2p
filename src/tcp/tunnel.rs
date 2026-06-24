@@ -76,12 +76,12 @@ impl TcpManager {
             Some(p) if !p.is_empty() => p,
             _ => return,
         };
-        let Some((writer, peer_id)) = ({
+        let Some((writer, metrics)) = ({
             let conns = self.conns.read().await;
             match conns.get(&tm.conn_id) {
                 Some(tc) => {
                     let tc = tc.read().await;
-                    Some((tc.writer.clone(), tc.peer_id.clone()))
+                    Some((tc.writer.clone(), tc.metrics.clone()))
                 }
                 None => None,
             }
@@ -95,7 +95,7 @@ impl TcpManager {
             drop(writer);
             self.close_conn(&tm.conn_id, true).await;
         } else {
-            self.runtime.record_bytes_out_for(&peer_id, payload.len());
+            metrics.record_bytes_out(payload.len());
         }
     }
 }

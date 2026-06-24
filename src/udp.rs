@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::auth::{allow_all, SharedAuthorizer};
-use crate::forward_runtime::ForwardRuntime;
+use crate::forward_runtime::{ForwardPeerRuntime, ForwardRuntime};
 use crate::rtc::{RTCManager, TunnelMessage};
 
 mod lifecycle;
@@ -27,6 +27,7 @@ struct UdpConn {
     target_conn: Option<Arc<UdpSocket>>,
     last_seen: Instant,
     peer_id: String,
+    metrics: ForwardPeerRuntime,
     client_addr: Option<std::net::SocketAddr>,
 }
 
@@ -98,15 +99,25 @@ impl UdpManager {
             authorizer,
         });
 
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
         let mgr_msg = mgr.clone();
+        let msg_runtime = mgr.runtime.clone();
+        tokio::spawn(async move {
+            while let Some((peer_id, data)) = msg_rx.recv().await {
+                if msg_runtime.is_cancelled() {
+                    break;
+                }
+                mgr_msg.on_tunnel_message(&peer_id, &data).await;
+            }
+        });
+
         let msg_runtime = mgr.runtime.clone();
         let handler_id = rtc_manager
             .on_tunnel_message_for(target.clone(), move |peer_id, data| {
                 if msg_runtime.is_cancelled() {
                     return;
                 }
-                let mgr = mgr_msg.clone();
-                tokio::spawn(async move { mgr.on_tunnel_message(&peer_id, &data).await });
+                let _ = msg_tx.send((peer_id, data));
             })
             .await;
         spawn_handler_cleanup(rtc_manager.clone(), mgr.runtime.clone(), handler_id);
