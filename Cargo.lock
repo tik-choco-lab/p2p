@@ -1364,6 +1364,7 @@ dependencies = [
 [[package]]
 name = "mistlib-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/tik-choco-lab/mistlib-dev.git?branch=enhance%2Fpeer-connection#cb6d73fc4fd03685e72c129051919f279ec62564"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1388,6 +1389,7 @@ dependencies = [
 [[package]]
 name = "mistlib-native"
 version = "0.1.0"
+source = "git+ssh://git@github.com/tik-choco-lab/mistlib-dev.git?branch=enhance%2Fpeer-connection#cb6d73fc4fd03685e72c129051919f279ec62564"
 dependencies = [
  "anyhow",
  "async-trait",
