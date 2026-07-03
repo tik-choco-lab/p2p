@@ -1,10 +1,10 @@
 use crate::auth::{AuthDecision, AuthEvent, AuthEventSource, TrustDecision};
 use crate::controller::{Direction, ForwardSpec, ForwardState, Proto};
 
-pub(super) fn dir_arrow(d: Direction) -> &'static str {
+pub(super) fn role_label(d: Direction) -> &'static str {
     match d {
-        Direction::Serve => "→",
-        Direction::Connect => "←",
+        Direction::Serve => "SERVE→",
+        Direction::Connect => "←CONN",
     }
 }
 
@@ -25,8 +25,8 @@ pub(super) fn state_name(s: &ForwardState) -> &str {
 
 pub(super) fn endpoint(spec: &ForwardSpec) -> String {
     match spec.direction {
-        Direction::Serve => spec.addr.clone(),
-        Direction::Connect => format!(":{}→{}", spec.listen_port, spec.target),
+        Direction::Serve => format!("serving {}", spec.addr),
+        Direction::Connect => format!(":{} → peer {}", spec.listen_port, spec.target),
     }
 }
 
