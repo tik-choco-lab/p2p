@@ -26,6 +26,17 @@ cargo build --release
 
 The binary will be located at `target/release/p2p`.
 
+### mistlib dependency
+
+The `mistlib` (mistlib-native) source tree is **vendored** into `vendor/mistlib/` and referenced as a path dependency, so the project builds without access to the private mistlib repository. The vendored ref and commit are recorded in `vendor/mistlib/VENDORED_FROM`.
+
+To update the vendored copy (requires access to the mistlib repository): copy `.env.example` to `.env`, set
+
+- `MISTLIB_REPO` — git URL of the mistlib repository
+- `MISTLIB_REF` — branch name, or a full 40-char commit hash to pin a revision (defaults to `develop`)
+
+then run `just vendor-mistlib` and commit the resulting diff.
+
 ## Usage
 
 The launch mode is selected by whether a subcommand is given:
@@ -126,14 +137,10 @@ $env:P2P_NOSTR_E2E = "1"
 cargo test --test nostr_signaling -- --ignored --nocapture
 ```
 
-With `just`:
+With `just`, `test-nostr` targets a relay on `127.0.0.1:7777` by default. Start your own relay there, or pass a different port:
 
 ```powershell
-# terminal 1
-just nostr-relay
-
-# terminal 2
-just test-nostr
+just test-nostr 7778
 ```
 
 ## Architecture
