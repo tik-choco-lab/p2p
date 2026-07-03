@@ -8,7 +8,7 @@ name = "p2p"
 path = "src/main.rs"
 
 [dependencies]
-mistlib = { package = "mistlib-native", git = "ssh://git@github.com/tik-choco-lab/mistlib-dev.git", branch = "enhance/peer-connection" }
+mistlib = { package = "mistlib-native", path = "vendor/mistlib/mistlib-native" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
