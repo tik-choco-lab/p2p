@@ -514,7 +514,7 @@ mod security;
 mod topology;
 
 #[tokio::test]
-#[ignore = "requires MIST_NOSTR_RELAY_URL or another reachable Nostr relay"]
+#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_relay_accepts_signed_discovery_event() {
     use futures_util::{SinkExt, StreamExt};
     use mistlib_core::signaling::nostr::{
@@ -576,7 +576,7 @@ async fn live_relay_accepts_signed_discovery_event() {
 }
 
 #[tokio::test]
-#[ignore = "requires MIST_NOSTR_RELAY_URL or another reachable Nostr relay"]
+#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_exchanges_nostr_signaling() {
     let ids = LiveIds::generate();
     let alice = NostrSignaler::new(ids.alice.clone(), config());
@@ -675,7 +675,7 @@ async fn wait_any_discovery_binding(
 }
 
 #[tokio::test]
-#[ignore = "requires MIST_NOSTR_RELAY_URL or another reachable Nostr relay"]
+#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_reconnects_rejoined_node_with_same_id() {
     let ids = LiveIds::generate();
     let alice = NostrSignaler::new(ids.alice.clone(), config());
@@ -788,7 +788,7 @@ async fn live_go_relay_reconnects_rejoined_node_with_same_id() {
 }
 
 #[tokio::test]
-#[ignore = "requires MIST_NOSTR_RELAY_URL or another reachable Nostr relay"]
+#[ignore = "requires `just nostr-relay` or MIST_NOSTR_RELAY_URL"]
 async fn live_go_relay_reconnects_rejoined_node_with_same_id_among_four_nodes() {
     let run_id = random_subscription_id();
     let room_id = format!("nostr-live-four-rejoin-room-{run_id}");
