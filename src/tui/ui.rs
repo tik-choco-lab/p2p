@@ -3,7 +3,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, R
 
 use super::app::{AddField, AddForm, App, Focus, PeerSelect, PendingRow, Popup};
 use super::format::{
-    dir_arrow, endpoint, format_event, human_bytes, proto_name, short_id, state_name, trust_name,
+    endpoint, format_event, human_bytes, proto_name, role_label, short_id, state_name, trust_name,
 };
 
 pub(super) fn draw(f: &mut Frame, app: &App) {
@@ -35,7 +35,7 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let peers = if app.peers.is_empty() {
-        "peers: 0 (待機中…)".to_string()
+        "peers: 0 (waiting…)".to_string()
     } else {
         format!(
             "peers: {} [{}]",
@@ -47,11 +47,18 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 .join(", ")
         )
     };
+    let serve = app
+        .forwards
+        .iter()
+        .filter(|s| matches!(s.spec.direction, crate::controller::Direction::Serve))
+        .count();
+    let conn = app.forwards.len() - serve;
     let text = format!(
-        " p2p — room: {}   {}   forwards: {}   pending: {} ",
+        " p2p — room: {}   {}   serve: {} / conn: {}   pending: {} ",
         app.ctx.room,
         peers,
-        app.forwards.len(),
+        serve,
+        conn,
         app.pending_rows().len()
     );
     let p = Paragraph::new(text).style(Style::default().add_modifier(Modifier::BOLD));
@@ -60,7 +67,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_forwards(f: &mut Frame, area: Rect, app: &App) {
     let header = Row::new(vec![
-        "DIR", "KEY", "PROTO", "ENDPOINT", "STATE", "CONNS", "IN", "OUT",
+        "ROLE", "KEY", "PROTO", "ENDPOINT", "STATE", "CONNS", "IN", "OUT",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -74,7 +81,7 @@ fn draw_forwards(f: &mut Frame, area: Rect, app: &App) {
         };
         rows.push(
             Row::new(vec![
-                Cell::from(dir_arrow(s.spec.direction)),
+                Cell::from(role_label(s.spec.direction)),
                 Cell::from(s.key.clone()),
                 Cell::from(proto_name(s.spec.proto)),
                 Cell::from(endpoint(&s.spec)),
@@ -113,7 +120,7 @@ fn draw_forwards(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let widths = [
-        Constraint::Length(4),
+        Constraint::Length(6),
         Constraint::Length(12),
         Constraint::Length(5),
         Constraint::Min(14),
@@ -144,7 +151,7 @@ fn draw_pending(f: &mut Frame, area: Rect, app: &App) {
                 let selected = app.focus == Focus::Pending && i == app.pending_sel;
                 let text = match row {
                     PendingRow::Forward(r) => format!(
-                        "[FWD] {} → {} ({})",
+                        "[FWD] {} wants {} {} (you become the server)",
                         short_id(&r.peer_id),
                         r.proto.to_uppercase(),
                         r.remote_addr
