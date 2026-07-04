@@ -23,7 +23,7 @@ pub(crate) async fn run_chat(room_id: Option<&str>) -> Result<()> {
 
     println!("=== Chat Mode ===");
     println!("Type a message and press Enter to send.");
-    println!("Ctrl+T or /id: toggle peer ID display. Ctrl+C: quit.");
+    println!("Ctrl+T: show/hide chat log. /id: toggle peer ID display. Ctrl+C: quit.");
 
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
     manager
@@ -56,6 +56,8 @@ async fn chat_loop(
     mut key_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) -> Result<()> {
     let mut show_ids = true;
+    let mut log_visible = true;
+    let mut history: Vec<String> = Vec::new();
     let mut input = String::new();
     redraw_input(&input)?;
 
@@ -68,7 +70,10 @@ async fn chat_loop(
                 } else {
                     msg
                 };
-                print_line(&line, &input)?;
+                history.push(line.clone());
+                if log_visible {
+                    print_line(&line, &input)?;
+                }
             }
             Some(ev) = key_rx.recv() => {
                 let Event::Key(key) = ev else { continue };
@@ -79,7 +84,7 @@ async fn chat_loop(
                     match key.code {
                         KeyCode::Char('c') => return Ok(()),
                         KeyCode::Char('t') => {
-                            show_ids = toggle_ids(show_ids, &input)?;
+                            log_visible = toggle_log(log_visible, &history, &input)?;
                         }
                         _ => {}
                     }
@@ -92,7 +97,13 @@ async fn chat_loop(
                         if msg == "/id" {
                             show_ids = toggle_ids(show_ids, &input)?;
                         } else if !msg.is_empty() {
-                            print_line(&format!("> {}", msg), &input)?;
+                            let line = format!("> {}", msg);
+                            history.push(line.clone());
+                            if log_visible {
+                                print_line(&line, &input)?;
+                            } else {
+                                redraw_input(&input)?;
+                            }
                             manager.send_chat_to_all(&msg).await;
                         } else {
                             redraw_input(&input)?;
@@ -120,6 +131,28 @@ fn toggle_ids(show_ids: bool, input: &str) -> Result<bool> {
         &format!("(peer ID display: {})", if now { "on" } else { "off" }),
         input,
     )?;
+    Ok(now)
+}
+
+/// Toggle visibility of the chat log. When hiding, clear the screen so past
+/// history is no longer shown. When showing again, redraw the full history
+/// (which was kept in memory even while hidden).
+fn toggle_log(log_visible: bool, history: &[String], input: &str) -> Result<bool> {
+    let now = !log_visible;
+    let mut out = io::stdout();
+    // Clear the whole screen and move the cursor home.
+    write!(out, "\x1b[2J\x1b[H")?;
+    out.flush()?;
+    if now {
+        for line in history {
+            write!(out, "{}\r\n", line)?;
+        }
+        write!(out, "(chat log: shown)\r\n")?;
+    } else {
+        write!(out, "(chat log: hidden)\r\n")?;
+    }
+    out.flush()?;
+    redraw_input(input)?;
     Ok(now)
 }
 
