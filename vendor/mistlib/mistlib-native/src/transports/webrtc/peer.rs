@@ -26,95 +26,6 @@ const ISOLATION_RECOVERY_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const ISOLATION_RECOVERY_DELAY_MS: u64 = 3000;
 
-/// Attempts for [`send_signaling_with_retry`]'s bounded retry of a
-/// fire-and-forget signaling send (ICE candidates today; see its call site in
-/// `setup_ice_candidate_handler`). Small and fixed -- this is meant to ride
-/// out a transient signaling-layer hiccup within the same tick, not to be a
-/// long-running retry policy. If every attempt fails, the send is still
-/// dropped (as it always was): nothing here changes the fire-and-forget
-/// contract, it just makes a single blip far less likely to be the thing
-/// that drops the message.
-const SIGNALING_SEND_RETRY_ATTEMPTS: u32 = 3;
-#[cfg(test)]
-const SIGNALING_SEND_RETRY_BACKOFF_MS: u64 = 5;
-#[cfg(not(test))]
-const SIGNALING_SEND_RETRY_BACKOFF_MS: u64 = 100;
-
-/// How many times [`PeerSharedHandles::try_ice_restart`] retries its whole
-/// create-offer/apply/send sequence within one ICE-restart episode before
-/// giving up and leaving the sweeper's grace-period teardown as the only
-/// remaining recovery path. Kept small: this all still needs to complete
-/// well inside `DISCONNECTED_GRACE_MS`, and a signaling-state precondition
-/// failure that persists across every attempt (some other negotiation
-/// genuinely in flight) won't be fixed by trying a fourth time either.
-const ICE_RESTART_RETRY_ATTEMPTS: u32 = 3;
-#[cfg(test)]
-const ICE_RESTART_RETRY_BACKOFF_MS: u64 = 5;
-#[cfg(not(test))]
-const ICE_RESTART_RETRY_BACKOFF_MS: u64 = 500;
-
-/// Bounded retry for a `send_signaling` call: tries up to
-/// [`SIGNALING_SEND_RETRY_ATTEMPTS`] times with a short fixed backoff between
-/// attempts, logging (`debug`) each intermediate failure and a final `warn`
-/// only if every attempt failed. Returns the last error if every attempt
-/// failed. Callers that only ever discarded the original one-shot `Result`
-/// (`let _ = ...`) can keep doing exactly that (`let _ = send_signaling_with_retry(...).await;`)
-/// -- the retry is purely an internal implementation detail of the send, not
-/// a change to the fire-and-forget contract at the call site.
-async fn send_signaling_with_retry(
-    signaler: &Arc<dyn Signaler>,
-    to: &NodeId,
-    msg: &MessageContent,
-    context: &str,
-) -> mistlib_core::error::Result<()> {
-    let mut last_err = None;
-    for attempt in 1..=SIGNALING_SEND_RETRY_ATTEMPTS {
-        match signaler.send_signaling(to, msg.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if attempt < SIGNALING_SEND_RETRY_ATTEMPTS {
-                    tracing::debug!(
-                        "[{}] send_signaling attempt {}/{} failed for {}: {}; retrying",
-                        context,
-                        attempt,
-                        SIGNALING_SEND_RETRY_ATTEMPTS,
-                        to,
-                        err
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        SIGNALING_SEND_RETRY_BACKOFF_MS,
-                    ))
-                    .await;
-                } else {
-                    tracing::warn!(
-                        "[{}] send_signaling failed after {} attempts for {}: {}",
-                        context,
-                        SIGNALING_SEND_RETRY_ATTEMPTS,
-                        to,
-                        err
-                    );
-                }
-                last_err = Some(err);
-            }
-        }
-    }
-    Err(last_err.expect("loop runs SIGNALING_SEND_RETRY_ATTEMPTS >= 1 times"))
-}
-
-/// Result of a single [`PeerSharedHandles::try_ice_restart_once`] attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IceRestartOutcome {
-    /// The restart offer was applied locally and sent.
-    Sent,
-    /// No live peer for this node -- retrying would not help, nothing to
-    /// restart.
-    NoPeer,
-    /// A transient failure (non-`Stable` signaling state, a `create_offer`/
-    /// `set_local_description` error, or a signaling send that failed even
-    /// after its own bounded retry) -- worth retrying the whole sequence.
-    Retryable,
-}
-
 /// How long `Peer::close_all` waits, after asking each data channel to close,
 /// before tearing down the underlying peer connection. See the comment at
 /// its call site for why this is needed.
@@ -344,67 +255,33 @@ impl PeerSharedHandles {
         self.mark_connection_state(node, ConnectionState::Connected)
     }
 
-    /// ICE restart attempt for `node`'s existing `RTCPeerConnection`, fired
-    /// right when its ICE-origin disconnect grace begins (see the
+    /// One-shot ICE restart attempt for `node`'s existing `RTCPeerConnection`,
+    /// fired right when its ICE-origin disconnect grace begins (see the
     /// `RTCPeerConnectionState::Disconnected` arm below) -- only for the
     /// initiator side (`super::is_ice_restart_initiator`); the other side
     /// waits for this restart offer and lets the ordinary `apply_offer`
     /// (Stable -> in-place renegotiation, `signaling.rs`) path handle it.
     ///
-    /// Retries the whole create-offer/apply/send sequence
-    /// ([`try_ice_restart_once`]) up to [`ICE_RESTART_RETRY_ATTEMPTS`] times
-    /// with a short backoff -- a single transient failure (a `create_offer`
-    /// hiccup, a signaling send that briefly can't route) used to mean giving
-    /// up immediately and waiting out the entire `DISCONNECTED_GRACE_MS` for
-    /// the sweeper's teardown-and-redial instead. The one outcome that is
-    /// never retried is "no live peer" (`IceRestartOutcome::NoPeer`): if the
-    /// peer is gone there is nothing left to restart, and no amount of
-    /// retrying changes that.
+    /// Deliberately bypasses `WebRtcTransport::can_send_offer`'s Disconnected
+    /// -reject guard: that guard protects a *healthy* connection from a stray
+    /// offer, but here the entire point is to recover a connection that's
+    /// already in trouble, so the same guard would just block the recovery
+    /// it's meant to enable.
     ///
-    /// If every attempt fails, this is logged and dropped: the grace-period
-    /// sweeper's full teardown-and-redial (`DISCONNECTED_GRACE_MS`) remains
-    /// the final safety net.
+    /// Any failure -- no live peer, non-`Stable` signaling state (a
+    /// renegotiation or another restart already in flight), or an error from
+    /// `create_offer`/`set_local_description`/`send_signaling` -- is logged
+    /// and dropped. Nothing retries: the grace-period sweeper's full
+    /// teardown-and-redial (`DISCONNECTED_GRACE_MS`) remains the safety net
+    /// if this doesn't work.
     pub(crate) async fn try_ice_restart(&self, node: &NodeId) {
-        for attempt in 1..=ICE_RESTART_RETRY_ATTEMPTS {
-            match self.try_ice_restart_once(node).await {
-                IceRestartOutcome::Sent | IceRestartOutcome::NoPeer => return,
-                IceRestartOutcome::Retryable => {
-                    if attempt < ICE_RESTART_RETRY_ATTEMPTS {
-                        tracing::debug!(
-                            "[IceRestart] attempt {}/{} failed for {}; retrying",
-                            attempt,
-                            ICE_RESTART_RETRY_ATTEMPTS,
-                            node
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            ICE_RESTART_RETRY_BACKOFF_MS,
-                        ))
-                        .await;
-                    }
-                }
-            }
-        }
-        tracing::warn!(
-            "[IceRestart] all {} attempts failed for {}; the sweeper's grace-period teardown is now the only remaining recovery path",
-            ICE_RESTART_RETRY_ATTEMPTS,
-            node
-        );
-    }
-
-    /// Single create-offer/apply/send attempt backing `try_ice_restart`'s
-    /// retry loop. Deliberately bypasses `WebRtcTransport::can_send_offer`'s
-    /// Disconnected-reject guard: that guard protects a *healthy* connection
-    /// from a stray offer, but here the entire point is to recover a
-    /// connection that's already in trouble, so the same guard would just
-    /// block the recovery it's meant to enable.
-    async fn try_ice_restart_once(&self, node: &NodeId) -> IceRestartOutcome {
         let peer = {
             let peers = self.peers.read().await;
             peers.get(node).cloned()
         };
         let Some(peer) = peer else {
             tracing::debug!("[IceRestart] skip {}: no active peer", node);
-            return IceRestartOutcome::NoPeer;
+            return;
         };
 
         let signaling_state = peer.pc.signaling_state();
@@ -414,7 +291,7 @@ impl PeerSharedHandles {
                 node,
                 signaling_state
             );
-            return IceRestartOutcome::Retryable;
+            return;
         }
 
         let offer = match peer
@@ -428,7 +305,7 @@ impl PeerSharedHandles {
             Ok(offer) => offer,
             Err(err) => {
                 tracing::warn!("[IceRestart] create_offer failed for {}: {}", node, err);
-                return IceRestartOutcome::Retryable;
+                return;
             }
         };
 
@@ -438,34 +315,33 @@ impl PeerSharedHandles {
                 node,
                 err
             );
-            return IceRestartOutcome::Retryable;
+            return;
         }
 
         let Some(offer_desc) = peer.pc.local_description().await else {
             tracing::warn!("[IceRestart] no local_description after set for {}", node);
-            return IceRestartOutcome::Retryable;
+            return;
         };
 
-        let msg = MessageContent::Data(SignalingData {
-            sender_id: self.local_node_id.clone(),
-            receiver_id: node.clone(),
-            room_id: self.room_id.clone(),
-            data: offer_desc.sdp,
-            signaling_type: SignalingType::Offer,
-        });
-        // The send itself already gets its own short bounded retry (a
-        // transient route-not-found/network blip shouldn't force a whole new
-        // offer to be created) -- only fall back to this function's own
-        // retry-from-scratch if every one of those attempts still failed.
-        if send_signaling_with_retry(&self.signaler, node, &msg, "IceRestart")
+        if let Err(err) = self
+            .signaler
+            .send_signaling(
+                node,
+                MessageContent::Data(SignalingData {
+                    sender_id: self.local_node_id.clone(),
+                    receiver_id: node.clone(),
+                    room_id: self.room_id.clone(),
+                    data: offer_desc.sdp,
+                    signaling_type: SignalingType::Offer,
+                }),
+            )
             .await
-            .is_err()
         {
-            return IceRestartOutcome::Retryable;
+            tracing::warn!("[IceRestart] send_signaling failed for {}: {}", node, err);
+            return;
         }
 
         tracing::info!("[IceRestart] sent restart offer to {}", node);
-        IceRestartOutcome::Sent
     }
 
     pub async fn cleanup_session(&self, node: &NodeId, force_failed: bool) {
@@ -807,14 +683,17 @@ impl Peer {
                     let Ok(json) = cand.to_json() else { return };
 
                     let data = serde_json::to_string(&json).unwrap_or_default();
-                    let msg = MessageContent::Data(SignalingData {
-                        sender_id: local_id,
-                        receiver_id: remote_id.clone(),
-                        room_id,
-                        data,
-                        signaling_type: SignalingType::Candidate,
-                    });
-                    let _ = send_signaling_with_retry(&signaler, &remote_id, &msg, "IceCandidate")
+                    let _ = signaler
+                        .send_signaling(
+                            &remote_id,
+                            MessageContent::Data(SignalingData {
+                                sender_id: local_id,
+                                receiver_id: remote_id.clone(),
+                                room_id,
+                                data,
+                                signaling_type: SignalingType::Candidate,
+                            }),
+                        )
                         .await;
                 })
             },
@@ -1396,200 +1275,5 @@ mod tests {
         let second = rx.recv().await.unwrap();
         assert_eq!(second.from, NodeId("peer-a".to_string()));
         assert_eq!(&second.data[..], b"second");
-    }
-
-    /// A `Signaler` that fails its first `fail_count` calls to
-    /// `send_signaling` (recording every attempt), then succeeds on every
-    /// call after that. Used to drive [`send_signaling_with_retry`] through
-    /// exactly the transient-failure-then-recovery shape a real signaling
-    /// layer would produce (e.g. `RoutedSignaler` returning `RouteNotFound`
-    /// for a route that hasn't caught up yet, then succeeding a moment
-    /// later).
-    struct FlakySignaler {
-        fail_count: usize,
-        attempts: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl Signaler for FlakySignaler {
-        async fn send_signaling(
-            &self,
-            _to: &NodeId,
-            _msg: MessageContent,
-        ) -> mistlib_core::error::Result<()> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            if attempt <= self.fail_count {
-                Err(mistlib_core::error::MistError::Internal(format!(
-                    "simulated transient failure (attempt {})",
-                    attempt
-                )))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn close(&self) -> mistlib_core::error::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn test_signaling_msg() -> MessageContent {
-        MessageContent::Data(SignalingData {
-            sender_id: NodeId("local".to_string()),
-            receiver_id: NodeId("remote".to_string()),
-            room_id: "room".to_string(),
-            data: "payload".to_string(),
-            signaling_type: SignalingType::Candidate,
-        })
-    }
-
-    /// Regression test for the ICE-candidate-send fix: a signaling send that
-    /// fails on its first attempt(s) but recovers within
-    /// `SIGNALING_SEND_RETRY_ATTEMPTS` must still succeed overall, instead of
-    /// the single transient failure being the end of the story (the old
-    /// `let _ = signaler.send_signaling(...).await;` behavior).
-    #[tokio::test]
-    async fn send_signaling_with_retry_recovers_from_transient_failures() {
-        let signaler: Arc<dyn Signaler> = Arc::new(FlakySignaler {
-            fail_count: SIGNALING_SEND_RETRY_ATTEMPTS as usize - 1,
-            attempts: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let to = NodeId("remote".to_string());
-
-        let result = send_signaling_with_retry(&signaler, &to, &test_signaling_msg(), "test").await;
-
-        assert!(
-            result.is_ok(),
-            "a send that recovers within the attempt budget must ultimately succeed"
-        );
-    }
-
-    /// Counterpart: once every attempt is exhausted, the retry must still
-    /// report failure (not silently swallow it forever) so the final `warn`
-    /// log fires and callers that check the `Result` (like
-    /// `try_ice_restart_once`) can react.
-    #[tokio::test]
-    async fn send_signaling_with_retry_reports_failure_after_exhausting_all_attempts() {
-        let signaler: Arc<dyn Signaler> = Arc::new(FlakySignaler {
-            fail_count: SIGNALING_SEND_RETRY_ATTEMPTS as usize + 5,
-            attempts: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let to = NodeId("remote".to_string());
-
-        let result = send_signaling_with_retry(&signaler, &to, &test_signaling_msg(), "test").await;
-
-        assert!(
-            result.is_err(),
-            "a send that never recovers within the attempt budget must report failure"
-        );
-    }
-
-    /// Exactly `SIGNALING_SEND_RETRY_ATTEMPTS` attempts must be made -- not
-    /// more (that would be an unbounded/too-long retry) and not fewer (that
-    /// would silently drop the bounded-retry contract this fix adds).
-    #[tokio::test]
-    async fn send_signaling_with_retry_makes_exactly_the_configured_number_of_attempts() {
-        let attempts_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        struct CountingAlwaysFailSignaler(Arc<std::sync::atomic::AtomicUsize>);
-        #[async_trait::async_trait]
-        impl Signaler for CountingAlwaysFailSignaler {
-            async fn send_signaling(
-                &self,
-                _to: &NodeId,
-                _msg: MessageContent,
-            ) -> mistlib_core::error::Result<()> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Err(mistlib_core::error::MistError::Internal(
-                    "always fails".to_string(),
-                ))
-            }
-            async fn close(&self) -> mistlib_core::error::Result<()> {
-                Ok(())
-            }
-        }
-        let signaler: Arc<dyn Signaler> =
-            Arc::new(CountingAlwaysFailSignaler(attempts_counter.clone()));
-        let to = NodeId("remote".to_string());
-
-        let result = send_signaling_with_retry(&signaler, &to, &test_signaling_msg(), "test").await;
-
-        assert!(result.is_err());
-        assert_eq!(
-            attempts_counter.load(Ordering::SeqCst),
-            SIGNALING_SEND_RETRY_ATTEMPTS as usize,
-            "must attempt exactly SIGNALING_SEND_RETRY_ATTEMPTS times, no more, no less"
-        );
-    }
-
-    /// `try_ice_restart` must not retry when there is no live peer at all --
-    /// nothing about retrying would ever bring a removed peer back, so it
-    /// should return promptly on the very first attempt instead of running
-    /// out `ICE_RESTART_RETRY_ATTEMPTS` worth of backoff for nothing.
-    #[tokio::test]
-    async fn try_ice_restart_does_not_retry_when_there_is_no_live_peer() {
-        let handles = crate::transports::webrtc::tests::make_transport().peer_handles();
-        let node = NodeId("no-such-peer".to_string());
-
-        let start = std::time::Instant::now();
-        handles.try_ice_restart(&node).await;
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_millis(ICE_RESTART_RETRY_BACKOFF_MS),
-            "a missing peer must short-circuit immediately, not burn through the retry backoff \
-             (elapsed={:?})",
-            elapsed
-        );
-    }
-
-    /// Regression test for the `try_ice_restart` retry fix: a signaling
-    /// state that isn't `Stable` when the first attempt runs (some other
-    /// negotiation already in flight) used to mean giving up immediately.
-    /// Now it retries across `ICE_RESTART_RETRY_ATTEMPTS` attempts with a
-    /// backoff between them -- observable here as the call taking measurably
-    /// longer than a single immediate check would, since the signaling state
-    /// in this test never becomes `Stable` again.
-    #[tokio::test]
-    async fn try_ice_restart_retries_across_backoff_when_signaling_state_stays_unstable() {
-        let t = crate::transports::webrtc::tests::make_transport();
-        let node = NodeId("perpetually-unstable-peer".to_string());
-        let peer = t
-            .create_pc(node.clone())
-            .await
-            .expect("peer connection should be created for this test");
-
-        // Wedge signaling state away from `Stable` -- mirrors what an
-        // in-flight renegotiation looks like from `try_ice_restart`'s point
-        // of view (`send_offer`'s own precondition check treats this the
-        // same way).
-        let offer = peer
-            .pc
-            .create_offer(None)
-            .await
-            .expect("create_offer should succeed on a fresh pc");
-        peer.pc
-            .set_local_description(offer)
-            .await
-            .expect("set_local_description should succeed on a fresh pc");
-        assert_ne!(peer.pc.signaling_state(), RTCSignalingState::Stable);
-
-        t.peers.write().await.insert(node.clone(), peer);
-
-        let start = std::time::Instant::now();
-        t.peer_handles().try_ice_restart(&node).await;
-        let elapsed = start.elapsed();
-
-        // With ICE_RESTART_RETRY_ATTEMPTS attempts there are
-        // (ICE_RESTART_RETRY_ATTEMPTS - 1) backoff sleeps of
-        // ICE_RESTART_RETRY_BACKOFF_MS each before giving up.
-        let expected_min = std::time::Duration::from_millis(
-            (ICE_RESTART_RETRY_ATTEMPTS as u64 - 1) * ICE_RESTART_RETRY_BACKOFF_MS,
-        );
-        assert!(
-            elapsed >= expected_min,
-            "expected try_ice_restart to retry across every attempt's backoff (elapsed={:?}, expected_min={:?})",
-            elapsed,
-            expected_min
-        );
     }
 }

@@ -4,22 +4,10 @@ use mistlib_core::signaling::reconnect::random_reconnect_backoff_delay;
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingData};
 use mistlib_core::stats::STATS;
 use mistlib_core::types::{NodeId, SessionReestablishedHook};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
-use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
-
-/// Interval between keepalive `Ping` frames sent on the signaling websocket.
-///
-/// Chosen well below typical proxy/NAT idle websocket timeouts (30-120s), so
-/// a silently dropped connection is detected via a failed send instead of
-/// surviving as a zombie until the next application-level message.
-#[cfg(not(test))]
-const WS_PING_INTERVAL: Duration = Duration::from_secs(25);
-#[cfg(test)]
-const WS_PING_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Watch channel a caller of `reset_session` waits on when a reset is already
 /// in flight (see `start_supervisor`): `None` while running, `Some(_)` once
@@ -163,10 +151,6 @@ impl WebSocketSupervisor {
             let (mut write, mut read) = ws_stream.split();
             let (tx, mut rx) = mpsc::channel::<String>(1024);
             *self.sender.lock().await = Some(tx);
-            // Tracks the last time any frame was read from the socket, so the
-            // writer's ping loop can notice a connection that has gone
-            // completely silent despite our keepalive pings.
-            let last_activity = Arc::new(StdMutex::new(Instant::now()));
 
             if let Some(tx) = initial_tx.take() {
                 let _ = tx.send(Ok(()));
@@ -179,43 +163,19 @@ impl WebSocketSupervisor {
             reconnected = true;
 
             let incoming_tx = self.incoming_tx.clone();
-            let writer_last_activity = last_activity.clone();
             let mut writer = tokio::spawn(async move {
-                let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
-                ping_interval.tick().await; // first tick fires immediately; skip it
-                loop {
-                    tokio::select! {
-                        maybe_msg = rx.recv() => {
-                            let Some(msg) = maybe_msg else { break };
-                            let bytes = msg.len() as u64;
-                            if let Err(err) = write.send(Message::Text(msg.into())).await {
-                                tracing::warn!("WebSocketSignaler: send failed: {}", err);
-                                break;
-                            }
-                            STATS.add_send(bytes);
-                        }
-                        _ = ping_interval.tick() => {
-                            let silent_for = writer_last_activity.lock().unwrap().elapsed();
-                            if silent_for >= WS_PING_INTERVAL * 2 {
-                                tracing::warn!(
-                                    "WebSocketSignaler: connection silent for {:?}; treating as dead",
-                                    silent_for
-                                );
-                                break;
-                            }
-                            if let Err(err) = write.send(Message::Ping(Vec::new().into())).await {
-                                tracing::warn!("WebSocketSignaler: ping failed: {}", err);
-                                break;
-                            }
-                        }
+                while let Some(msg) = rx.recv().await {
+                    let bytes = msg.len() as u64;
+                    if let Err(err) = write.send(Message::Text(msg.into())).await {
+                        tracing::warn!("WebSocketSignaler: send failed: {}", err);
+                        break;
                     }
+                    STATS.add_send(bytes);
                 }
             });
 
-            let reader_last_activity = last_activity.clone();
             let mut reader = tokio::spawn(async move {
                 while let Some(msg) = read.next().await {
-                    *reader_last_activity.lock().unwrap() = Instant::now();
                     let parse_result = match msg {
                         Ok(Message::Text(text)) => {
                             STATS.add_receive(text.len() as u64);
@@ -569,85 +529,5 @@ mod tests {
         signaler.close().await.unwrap();
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn sends_periodic_keepalive_pings() {
-        use tokio_tungstenite::tungstenite::protocol::Message;
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (ping_tx, mut ping_rx) = mpsc::channel::<()>(8);
-
-        tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut ws) = accept_async(stream).await else {
-                return;
-            };
-            while let Some(Ok(msg)) = futures_util::StreamExt::next(&mut ws).await {
-                if matches!(msg, Message::Ping(_)) {
-                    let _ = ping_tx.send(()).await;
-                }
-            }
-        });
-
-        let signaler = WebSocketSignaler::new(&format!("ws://{addr}"));
-        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
-        signaler.connect(incoming_tx).await.unwrap();
-
-        timeout(Duration::from_secs(2), ping_rx.recv())
-            .await
-            .expect("timed out waiting for a keepalive ping")
-            .expect("ping channel closed unexpectedly");
-
-        signaler.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn reconnects_after_prolonged_silence_despite_open_socket() {
-        // The server accepts the connection but never reads or writes again,
-        // simulating a relay/proxy that is holding the TCP connection open
-        // without actually servicing it. Pings will keep being written
-        // successfully (buffered), so only the "no inbound activity for ~2
-        // intervals" staleness check can detect this and force a reconnect.
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let accepted_for_task = accepted.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                accepted_for_task.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let Ok(_ws) = accept_async(stream).await else {
-                        return;
-                    };
-                    std::future::pending::<()>().await
-                });
-            }
-        });
-
-        let signaler = WebSocketSignaler::new(&format!("ws://{addr}"));
-        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
-        signaler.connect(incoming_tx).await.unwrap();
-        assert_eq!(accepted.load(Ordering::SeqCst), 1);
-
-        timeout(Duration::from_secs(3), async {
-            loop {
-                if accepted.load(Ordering::SeqCst) >= 2 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("signaler should reconnect after prolonged silence");
-
-        signaler.close().await.unwrap();
     }
 }

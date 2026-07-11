@@ -8,23 +8,9 @@ use mistlib_core::signaling::reconnect::random_reconnect_backoff_delay;
 use mistlib_core::signaling::MessageContent;
 use mistlib_core::stats::STATS;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
-
-/// Interval between keepalive `Ping` frames sent on each relay connection.
-///
-/// Chosen well below typical proxy/NAT idle websocket timeouts (30-120s).
-/// Without this, outbound relay traffic drops to one discovery refresh every
-/// ~5-6 minutes after room join, which is far above those timeouts and leads
-/// to silent relay disconnects that the supervisor cannot detect until the
-/// next send fails.
-#[cfg(not(test))]
-const RELAY_PING_INTERVAL: Duration = Duration::from_secs(25);
-#[cfg(test)]
-const RELAY_PING_INTERVAL: Duration = Duration::from_millis(200);
 
 impl NostrSignaler {
     pub async fn connect(
@@ -126,10 +112,6 @@ impl NostrSignaler {
         let (disconnected_tx, disconnected_rx) = oneshot::channel::<()>();
         let disconnected_tx = Arc::new(StdMutex::new(Some(disconnected_tx)));
         let connection_cancel = cancel.child_token();
-        // Tracks the last time any frame (data, ping, pong, ...) was read from
-        // the relay, so the writer's ping loop can notice a connection that
-        // has gone completely silent despite our keepalive pings.
-        let last_activity = Arc::new(StdMutex::new(Instant::now()));
 
         let room_id = self.current_room_id().await;
         if let Some(room_id) = room_id.as_deref() {
@@ -149,10 +131,7 @@ impl NostrSignaler {
         let writer_cancel = connection_cancel.clone();
         let writer_cancel_on_exit = writer_cancel.clone();
         let writer_disconnected = disconnected_tx.clone();
-        let writer_last_activity = last_activity.clone();
         tokio::spawn(async move {
-            let mut ping_interval = tokio::time::interval(RELAY_PING_INTERVAL);
-            ping_interval.tick().await; // first tick fires immediately; skip it
             loop {
                 tokio::select! {
                     _ = writer_cancel.cancelled() => break,
@@ -160,20 +139,6 @@ impl NostrSignaler {
                         let Some(frame) = maybe_frame else { break };
                         if let Err(err) = write.send(Message::Text(frame.into())).await {
                             tracing::warn!("NostrSignaler: relay write failed: {}", err);
-                            break;
-                        }
-                    }
-                    _ = ping_interval.tick() => {
-                        let silent_for = writer_last_activity.lock().unwrap().elapsed();
-                        if silent_for >= RELAY_PING_INTERVAL * 2 {
-                            tracing::warn!(
-                                "NostrSignaler: relay connection silent for {:?}; treating as dead",
-                                silent_for
-                            );
-                            break;
-                        }
-                        if let Err(err) = write.send(Message::Ping(Vec::new().into())).await {
-                            tracing::warn!("NostrSignaler: relay ping failed: {}", err);
                             break;
                         }
                     }
@@ -189,14 +154,12 @@ impl NostrSignaler {
         let reader_cancel = connection_cancel.clone();
         let reader_cancel_on_exit = reader_cancel.clone();
         let reader_disconnected = disconnected_tx.clone();
-        let reader_last_activity = last_activity.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = reader_cancel.cancelled() => break,
                     maybe_msg = read.next() => {
                         let Some(msg) = maybe_msg else { break };
-                        *reader_last_activity.lock().unwrap() = Instant::now();
                         let raw = match msg {
                             Ok(Message::Text(text)) => text.to_string(),
                             Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
