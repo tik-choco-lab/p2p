@@ -7,7 +7,9 @@ use tracing::{debug, error};
 use crate::auth::AuthRequest;
 use crate::rtc::TunnelMessage;
 
-use super::{log_tcp_io_error, TcpManager};
+use super::{
+    log_tcp_io_error, TcpManager, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_PING,
+};
 
 impl TcpManager {
     pub(super) async fn on_tunnel_message(&self, peer_id: &str, data: &[u8]) {
@@ -19,9 +21,14 @@ impl TcpManager {
             Err(_) => return,
         };
         match tm.msg_type.as_str() {
-            "connect" => self.handle_remote_connect(peer_id, &tm).await,
-            "data" => self.handle_remote_data(&tm).await,
-            "close" => self.close_conn(&tm.conn_id, false).await,
+            MSG_TYPE_CONNECT => self.handle_remote_connect(peer_id, &tm).await,
+            MSG_TYPE_DATA => self.handle_remote_data(&tm).await,
+            MSG_TYPE_CLOSE => self.close_conn(&tm.conn_id, false).await,
+            // Keepalive: purely to keep the channel/NAT mapping warm, no
+            // action needed on receipt.
+            MSG_TYPE_PING => {}
+            // Unknown/unrecognized types (older/newer peer versions) are
+            // ignored for cross-version compat.
             _ => {}
         }
     }
@@ -63,7 +70,7 @@ impl TcpManager {
 
     async fn send_close(&self, peer_id: &str, conn_id: &str) {
         let close_msg = TunnelMessage {
-            msg_type: "close".into(),
+            msg_type: MSG_TYPE_CLOSE.into(),
             conn_id: conn_id.to_string(),
             target: self.target.clone(),
             payload: None,

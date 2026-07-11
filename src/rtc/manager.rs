@@ -41,6 +41,17 @@ pub struct RTCManagerHandle {
 
 #[allow(dead_code)]
 impl RTCManagerHandle {
+    /// Builds a handle backed by fresh in-memory state, without touching
+    /// mistlib's global native singleton (no `init`/`join_room`). Lets other
+    /// modules' tests (e.g. `crate::tcp`) register/fire handlers and drive
+    /// join/leave notifications deterministically.
+    #[cfg(test)]
+    pub(crate) fn for_test(self_id: &str) -> Self {
+        Self {
+            inner: Arc::new(RTCManagerInner::new(self_id.to_string(), PeerRole::Client)),
+        }
+    }
+
     pub async fn new(self_id: String, room_id: String, is_server: bool) -> Self {
         let role = if is_server {
             PeerRole::Server

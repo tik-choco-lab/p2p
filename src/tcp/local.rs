@@ -7,7 +7,10 @@ use tracing::{debug, error};
 
 use crate::rtc::TunnelMessage;
 
-use super::{log_tcp_io_error, TcpManager, RETRY_INTERVAL, TCP_BUFFER_SIZE, TUNNEL_READY_TIMEOUT};
+use super::{
+    log_tcp_io_error, TcpManager, MSG_TYPE_CONNECT, MSG_TYPE_DATA, RETRY_INTERVAL, TCP_BUFFER_SIZE,
+    TUNNEL_READY_TIMEOUT,
+};
 
 impl TcpManager {
     pub(super) async fn handle_local_connection(self: &Arc<Self>, stream: TcpStream) {
@@ -25,14 +28,21 @@ impl TcpManager {
         self.track_conn(&conn_id, write_half, &peer_id, true).await;
 
         let connect_msg = TunnelMessage {
-            msg_type: "connect".into(),
+            msg_type: MSG_TYPE_CONNECT.into(),
             conn_id: conn_id.clone(),
             target: self.target.clone(),
             payload: None,
         };
-        if let Err(e) = self.send_to(&peer_id, &connect_msg).await {
-            error!("failed to send tunnel connect: {}", e);
-            self.close_conn(&conn_id, false).await;
+        let mut shutdown = self.runtime.subscribe();
+        if let Err(e) = self
+            .send_to_with_retry(&peer_id, &connect_msg, &mut shutdown)
+            .await
+        {
+            error!("failed to send tunnel connect after retries: {}", e);
+            // Best-effort notify: the retry budget is exhausted, so the
+            // remote is unlikely to be reachable anyway, but this avoids
+            // leaving a dangling backend socket if it is.
+            self.close_conn(&conn_id, true).await;
             return;
         }
 
@@ -75,14 +85,25 @@ impl TcpManager {
                         }
                         Ok(n) => {
                             let msg = TunnelMessage {
-                                msg_type: "data".into(),
+                                msg_type: MSG_TYPE_DATA.into(),
                                 conn_id: conn_id.clone(),
                                 target: self.target.clone(),
                                 payload: Some(buf[..n].to_vec()),
                             };
-                            if let Err(e) = self.send_to(&peer_id, &msg).await {
-                                error!("failed to send tunnel data: {}", e);
-                                self.close_conn(&conn_id, false).await;
+                            // Sequential await: the next chunk isn't read
+                            // until this send (including any retries) has
+                            // resolved, so byte order is preserved.
+                            if let Err(e) = self
+                                .send_to_with_retry(&peer_id, &msg, &mut shutdown)
+                                .await
+                            {
+                                error!("failed to send tunnel data after retries: {}", e);
+                                // Retry budget exhausted: give up on this
+                                // conn, but still notify the remote
+                                // (best-effort) so it doesn't dangle a
+                                // backend socket waiting for data that will
+                                // never come.
+                                self.close_conn(&conn_id, true).await;
                                 return;
                             }
                             metrics.record_bytes_in(n);
