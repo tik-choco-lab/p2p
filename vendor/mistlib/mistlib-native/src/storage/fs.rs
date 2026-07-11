@@ -81,8 +81,8 @@ impl BlockStore for NativeBlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mistlib_core::storage::compute_cid;
     use mistlib_core::storage::cid::MULTICODEC_RAW;
+    use mistlib_core::storage::compute_cid;
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
