@@ -1334,6 +1334,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bincode",
  "bytes",
  "futures",
@@ -1341,6 +1342,8 @@ dependencies = [
  "mimalloc",
  "mistlib-core",
  "rand 0.8.5",
+ "rtcp",
+ "rtp",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1353,6 +1356,7 @@ dependencies = [
  "url",
  "web-time",
  "webrtc",
+ "webrtc-util",
 ]
 
 [[package]]
