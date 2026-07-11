@@ -43,6 +43,8 @@ impl super::MistEngine {
                 for action in actions {
                     ENGINE.handle_action_for(ctx.clone(), action);
                 }
+
+                ENGINE.flush_expired_reorder(&ctx);
             }
         });
     }
