@@ -11,11 +11,11 @@ pub(super) enum P2pPayload {
         text: String,
     },
     Tunnel {
-        #[serde(with = "crate::rtc::wire_bytes::vec_hex")]
+        #[serde(with = "crate::rtc::wire_bytes::vec_base64")]
         data: Vec<u8>,
     },
     Stdio {
-        #[serde(with = "crate::rtc::wire_bytes::vec_hex")]
+        #[serde(with = "crate::rtc::wire_bytes::vec_base64")]
         data: Vec<u8>,
     },
     ForwardRequest {

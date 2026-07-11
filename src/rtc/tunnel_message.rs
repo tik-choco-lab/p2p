@@ -15,7 +15,7 @@ pub struct TunnelMessage {
         rename = "payload",
         default,
         skip_serializing_if = "Option::is_none",
-        with = "crate::rtc::wire_bytes::option_hex"
+        with = "crate::rtc::wire_bytes::option_base64"
     )]
     pub payload: Option<Vec<u8>>,
 }
