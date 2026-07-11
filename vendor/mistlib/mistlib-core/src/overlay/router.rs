@@ -100,19 +100,6 @@ impl OverlayRouter {
             .accept(from, seq, content)
     }
 
-    /// Flushes any per-source reorder gaps that have been open past the gap
-    /// timeout without new traffic to trigger `reorder_inbound`'s lazy flush
-    /// (e.g. the sender went idle after a relay/direct route switch).
-    /// Intended to be polled from an engine's periodic background tick so a
-    /// stalled gap cannot wait forever for a message that will never arrive.
-    /// Returns `(source, messages)` pairs, messages in seq order.
-    pub fn flush_expired_inbound(&self) -> Vec<(NodeId, Vec<MessageContent>)> {
-        self.reorder_buffer
-            .lock()
-            .expect("reorder_buffer lock poisoned")
-            .flush_expired(web_time::Instant::now())
-    }
-
     /// Synchronises the routing table's direct connected set with a transport snapshot.
     pub fn sync_connection_states(
         &self,

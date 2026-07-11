@@ -43,24 +43,6 @@ impl MistEngine {
         for action in self.step_overlay_tick(&states) {
             self.handle_action(action);
         }
-
-        self.step_reorder_flush();
-    }
-
-    /// Delivers per-source reorder-buffer gaps that timed out without new
-    /// traffic arriving to trigger `OverlayRouter::reorder_inbound`'s lazy
-    /// flush (e.g. the sender went idle after a relay/direct route switch).
-    /// Runs every tick so a stalled gap isn't held forever waiting for a
-    /// message that will never arrive.
-    fn step_reorder_flush(&self) {
-        let Some(ov) = self.running_context().and_then(|ctx| ctx.overlay.clone()) else {
-            return;
-        };
-        for (from, contents) in ov.flush_expired_inbound() {
-            for content in contents {
-                self.handle_message_content(from.clone(), content);
-            }
-        }
     }
 
     /// Collects the current connected set and syncs the routing table.

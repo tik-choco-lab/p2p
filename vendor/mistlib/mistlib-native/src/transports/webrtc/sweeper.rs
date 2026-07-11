@@ -14,67 +14,9 @@ const SWEEPER_INTERVAL_MS: u64 = 10;
 const SWEEPER_INTERVAL_MS: u64 = 2000;
 
 use super::{
-    DisconnectGrace, GraceOrigin, Peer, WebRtcTransport, CONNECTION_TIMEOUT_MS,
-    DATA_CHANNEL_OPEN_TIMEOUT_MS, DISCONNECTED_GRACE_MS, LAST_DISCONNECT_TTL_MS,
+    Peer, WebRtcTransport, CONNECTION_TIMEOUT_MS, DATA_CHANNEL_OPEN_TIMEOUT_MS,
+    DISCONNECTED_GRACE_MS, LAST_DISCONNECT_TTL_MS,
 };
-
-/// Outcome of evaluating a peer's disconnect grace against its actual health.
-/// Pure (no lock/`RTCPeerConnection` access) so the `LivenessSuspect`
-/// false-positive suppression below is exhaustively unit-testable without
-/// mocking a real `RTCPeerConnection` -- see `GraceOrigin`'s doc for why the
-/// distinction exists: a liveness-suspect grace can start against a peer
-/// whose SCTP association (and every data channel except the best-effort
-/// ping one) never actually had a problem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraceExpiryDecision {
-    /// No grace is running, or it hasn't reached the grace duration yet.
-    Wait,
-    /// Grace expired, but the peer looks genuinely healthy (only possible for
-    /// a `LivenessSuspect`-origin grace): restore `Connected` instead of
-    /// tearing the session down.
-    RecoverFalsePositive,
-    /// Grace expired and the peer is still unhealthy, or this is an
-    /// `Ice`-origin grace (never second-guessed against the live pc state) --
-    /// reap as before.
-    Reap,
-}
-
-/// Decides what the sweeper should do about `node`'s disconnect grace, if
-/// any. `grace` is a snapshot of `disconnected_since[node]`; `pc_state` and
-/// `has_required_data_channel` are the sweeper's own live reads of the actual
-/// `RTCPeerConnection`/data-channel state for the same node.
-///
-/// Only a `LivenessSuspect`-origin grace is ever second-guessed: an
-/// `Ice`-origin grace means the peer connection itself already reported
-/// `Disconnected`, so there is nothing to re-validate. A `LivenessSuspect`
-/// grace, by contrast, is started purely on a missed-PONG heuristic
-/// (`OverlayAction::SuspectDisconnected`, mistlib-core's `stats::ping`) that
-/// runs over the best-effort `Unreliable` channel (`max_retransmits: Some(0)`)
-/// and never itself inspects the real peer connection -- packet loss on that
-/// one channel alone is not evidence that the `ReliableOrdered` channel
-/// actually carrying application data (e.g. a tunneled SSH session) is
-/// unhealthy. Reaping on that signal alone tears down a perfectly good
-/// connection; this lets the sweeper re-check reality before doing so.
-pub(crate) fn decide_grace_expiry(
-    grace: Option<DisconnectGrace>,
-    pc_state: RTCPeerConnectionState,
-    has_required_data_channel: bool,
-    grace_ms: u64,
-) -> GraceExpiryDecision {
-    let Some(grace) = grace else {
-        return GraceExpiryDecision::Wait;
-    };
-    if grace.started_at.elapsed() < Duration::from_millis(grace_ms) {
-        return GraceExpiryDecision::Wait;
-    }
-    if grace.origin == GraceOrigin::LivenessSuspect
-        && pc_state == RTCPeerConnectionState::Connected
-        && has_required_data_channel
-    {
-        return GraceExpiryDecision::RecoverFalsePositive;
-    }
-    GraceExpiryDecision::Reap
-}
 
 impl WebRtcTransport {
     pub(crate) fn data_channel_open_timeout() -> Duration {
@@ -231,6 +173,12 @@ impl WebRtcTransport {
                     };
 
                     let pc_state = peer.pc.connection_state();
+                    let state_snapshot = {
+                        let lock = handles.connection_states.read().unwrap();
+                        lock.get(&node)
+                            .copied()
+                            .unwrap_or(ConnectionState::Disconnected)
+                    };
                     let has_required_data_channel = Self::has_required_data_channel(&peer).await;
 
                     // Disarm the DC-open zombie timer the moment the required
@@ -257,40 +205,19 @@ impl WebRtcTransport {
                         pc_state,
                         RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
                     );
-                    let grace_snapshot = handles
-                        .disconnected_since
-                        .read()
-                        .unwrap()
-                        .get(&node)
-                        .copied();
-                    let grace_decision = decide_grace_expiry(
-                        grace_snapshot,
-                        pc_state,
-                        has_required_data_channel,
-                        DISCONNECTED_GRACE_MS,
-                    );
-                    if grace_decision == GraceExpiryDecision::RecoverFalsePositive {
-                        // The missed-PONG heuristic that started this grace
-                        // (mistlib-core's `stats::ping`) only ever watches the
-                        // best-effort `Unreliable` channel -- it never checked
-                        // the real `RTCPeerConnection`. Confirmed healthy here
-                        // (pc Connected + ReliableOrdered DC open), so this was
-                        // a false positive: clear the grace and restore
-                        // `Connected` instead of destroying a working session
-                        // (see `recover_connected_from_grace`'s doc for why
-                        // this is safe to reuse for a non-ICE-restart
-                        // recovery too -- it only checks that a grace is
-                        // pending).
-                        tracing::warn!(
-                            "[Sweeper] liveness false-positive suppressed for {}: pc is Connected \
-                             and the required data channel is open, so the missed-PONG grace is \
-                             being cleared instead of reaping the session",
-                            node
-                        );
-                        handles.recover_connected_from_grace(&node);
-                        continue;
-                    }
-                    let disconnected_grace_expired = grace_decision == GraceExpiryDecision::Reap;
+                    let disconnected_grace_expired =
+                        matches!(pc_state, RTCPeerConnectionState::Disconnected)
+                            || state_snapshot == ConnectionState::Reconnecting;
+                    let disconnected_grace_expired = disconnected_grace_expired
+                        && handles
+                            .disconnected_since
+                            .read()
+                            .unwrap()
+                            .get(&node)
+                            .is_some_and(|grace| {
+                                grace.started_at.elapsed()
+                                    >= Duration::from_millis(DISCONNECTED_GRACE_MS)
+                            });
                     let data_channel_open_timeout = Self::data_channel_open_timeout();
                     let missing_required_channel = !has_required_data_channel
                         && handles

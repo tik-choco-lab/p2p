@@ -233,13 +233,6 @@ impl NostrSignaler {
                     sender_rank,
                     sender_was_requested && incoming.signaling_type == SignalingType::Request,
                 )?;
-                // A signaling message from this sender just passed validation,
-                // dedupe, and ordering checks, so it is proof of life right now.
-                // Renew its discovery entry using our own clock rather than
-                // relying solely on the sender-declared `decoded.expires_at`,
-                // so an active peer never lapses out of `node_to_pubkey` due to
-                // a missed discovery re-announce cycle mid-exchange.
-                table.touch_node(&incoming.sender_id, self.codec_config.ttl_seconds);
                 if !known_sender
                     && incoming.signaling_type == SignalingType::Request
                     && incoming.receiver_id.is_broadcast()

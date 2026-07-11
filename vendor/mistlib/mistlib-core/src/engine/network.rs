@@ -83,11 +83,7 @@ impl MistEngine {
     }
 
     /// Dispatches a decoded message to the appropriate handler based on content type.
-    ///
-    /// `pub(super)` (not private): also called from `tick.rs`'s periodic
-    /// `flush_expired_inbound` poll, which delivers reorder-buffer gaps that
-    /// timed out without new traffic to re-trigger the lazy flush above.
-    pub(super) fn handle_message_content(&self, from: NodeId, content: MessageContent) {
+    fn handle_message_content(&self, from: NodeId, content: MessageContent) {
         match content {
             MessageContent::Raw(payload) => {
                 tracing::debug!(
