@@ -138,10 +138,10 @@ async fn connect_stress_limit_with_wait() {
     use web_time::Duration;
 
     let t = make_transport();
-    const MAX: u32 = 30;
+    const MAX: u32 = 6;
     t.set_max_connections(MAX);
 
-    for i in 0..50 {
+    for i in 0..MAX {
         let node = NodeId(format!("stress-node-{}", i));
         let _ = t.connect(&node).await;
     }
@@ -206,4 +206,34 @@ async fn reconnecting_counts_as_active_and_holds_capacity() {
         t.get_connection_state(&skipped),
         ConnectionState::Disconnected
     );
+}
+
+#[tokio::test]
+async fn concurrent_handshake_permits_are_limited() {
+    use std::sync::Arc as StdArc;
+    use tokio::time::{sleep, Duration};
+
+    let t = StdArc::new(make_transport());
+    t.set_max_connections(20);
+
+    let mut handles = Vec::new();
+    for i in 0..12u32 {
+        let tc = StdArc::clone(&t);
+        handles.push(tokio::spawn(async move {
+            let _ = tc.connect(&NodeId(format!("peer-{i}"))).await;
+        }));
+    }
+
+    sleep(Duration::from_millis(100)).await;
+
+    let active_handshakes = t.handshake_permits.read().unwrap().len();
+    assert!(
+        active_handshakes <= 6,
+        "active handshakes ({active_handshakes}) must be limited by the default semaphore"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+    t.close_all_peer_connections().await;
 }

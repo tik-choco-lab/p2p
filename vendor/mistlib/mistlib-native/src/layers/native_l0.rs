@@ -21,6 +21,25 @@ impl NativeL0 {
     pub fn new() -> Self {
         Self
     }
+
+    /// Native/wasm-specific: not part of the `L0Engine` core trait (single-
+    /// room only), so this is an inherent method alongside it rather than a
+    /// trait override. See SPEC-15.
+    pub fn leave_room_id(&self, room_id: String) {
+        room::leave_room_id(room_id);
+    }
+
+    /// Explicit-position variant of `storage_add` (SPEC-16): like
+    /// `leave_room_id`, not part of the `L0Engine` core trait, so it's an
+    /// inherent method rather than a trait override.
+    pub async fn storage_add_at(
+        &self,
+        name: &str,
+        data: &[u8],
+        position: Option<mistlib_core::types::Vector3>,
+    ) -> mistlib_core::error::Result<String> {
+        storage::add_at(name, data, position).await
+    }
 }
 
 #[async_trait]

@@ -103,4 +103,27 @@ impl MistEngine {
         let config = self.config.lock().expect("config lock poisoned").clone();
         ov.tick(&config, states)
     }
+
+    /// Notifies the overlay strategies that a peer disconnect has been
+    /// confirmed, so a strategy can trigger an immediate re-selection
+    /// instead of waiting for the next periodic `tick`. No-op if the engine
+    /// isn't running. Transports call this right after a disconnect is
+    /// confirmed.
+    pub fn notify_peer_disconnected(&self) {
+        let ctx = {
+            let state = self.state.lock().expect("state lock poisoned");
+            match &*state {
+                EngineState::Running(ctx) => Some(ctx.clone()),
+                _ => None,
+            }
+        };
+        let Some(ctx) = ctx else { return };
+        let Some(ov) = &ctx.overlay else { return };
+
+        let states = ctx.active_connection_states();
+        let config = self.config.lock().expect("config lock poisoned").clone();
+        for action in ov.notify_peer_disconnected(&config, &states) {
+            self.handle_action(action);
+        }
+    }
 }

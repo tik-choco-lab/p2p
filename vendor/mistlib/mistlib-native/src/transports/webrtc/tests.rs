@@ -27,5 +27,10 @@ pub fn make_transport() -> WebRtcTransport {
 pub mod basic;
 pub mod cleanup;
 pub mod disconnect;
+pub mod ice_restart;
+pub mod ice_servers;
 pub mod limits;
+pub mod message_size;
+pub mod pending_candidates;
+pub mod publish;
 pub mod signaling;

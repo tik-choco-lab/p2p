@@ -9,12 +9,17 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
 
+/// Watch channel a caller of `reset_session` waits on when a reset is already
+/// in flight (see `start_supervisor`): `None` while running, `Some(_)` once
+/// the in-flight attempt has resolved.
+type ResetInflightWatch = Arc<Mutex<Option<watch::Receiver<Option<Result<(), String>>>>>>;
+
 pub struct WebSocketSignaler {
     pub url: String,
     sender: Arc<Mutex<Option<mpsc::Sender<String>>>>,
     cancel: Arc<Mutex<Option<CancellationToken>>>,
     incoming_tx: Arc<Mutex<Option<mpsc::Sender<MessageContent>>>>,
-    reset_inflight: Arc<Mutex<Option<watch::Receiver<Option<Result<(), String>>>>>>,
+    reset_inflight: ResetInflightWatch,
     on_session_reestablished: Arc<Mutex<Option<SessionReestablishedHook>>>,
 }
 

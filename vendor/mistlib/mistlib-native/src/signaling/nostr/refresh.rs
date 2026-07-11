@@ -60,16 +60,16 @@ impl NostrSignaler {
                 )
                 .and_then(|event| event_frame_json(&event))
                 {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            tracing::warn!(
-                                "NostrSignaler: discovery refresh failed for room {}: {:?}",
-                                room_id,
-                                err
-                            );
-                            continue;
-                        }
-                    };
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(
+                            "NostrSignaler: discovery refresh failed for room {}: {:?}",
+                            room_id,
+                            err
+                        );
+                        continue;
+                    }
+                };
 
                 let Some(senders) = senders.upgrade() else {
                     break;

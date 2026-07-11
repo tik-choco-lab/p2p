@@ -21,26 +21,6 @@ impl Default for NodeStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn touch_node_refreshes_known_node_only() {
-        let mut store = NodeStore::new();
-        let known = NodeId("known".to_string());
-        let unknown = NodeId("unknown".to_string());
-
-        store.update_node_position(known.clone(), Vector3::zero());
-        assert!(store.touch_node(&known));
-        assert!(store.last_updated.contains_key(&known));
-
-        assert!(!store.touch_node(&unknown));
-        assert!(!store.nodes.contains_key(&unknown));
-        assert!(!store.last_updated.contains_key(&unknown));
-    }
-}
-
 impl NodeStore {
     pub fn new() -> Self {
         Self {
@@ -162,5 +142,25 @@ impl NodeStore {
             }
         }
         in_range
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_node_refreshes_known_node_only() {
+        let mut store = NodeStore::new();
+        let known = NodeId("known".to_string());
+        let unknown = NodeId("unknown".to_string());
+
+        store.update_node_position(known.clone(), Vector3::zero());
+        assert!(store.touch_node(&known));
+        assert!(store.last_updated.contains_key(&known));
+
+        assert!(!store.touch_node(&unknown));
+        assert!(!store.nodes.contains_key(&unknown));
+        assert!(!store.last_updated.contains_key(&unknown));
     }
 }

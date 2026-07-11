@@ -1,4 +1,5 @@
-//! End-to-end test for the `storage_add` / `storage_get` FFI exports.
+//! End-to-end test for the `storage_add` / `storage_add_at` / `storage_get`
+//! FFI exports.
 //!
 //! Sets up a real `P2PStorage` backed by a temp-dir block store (the peer
 //! resolver/transport is never exercised because add/get hit the local store)
@@ -13,12 +14,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use mistlib_core::error::Result as CoreResult;
-use mistlib_core::storage::P2PStorage;
+use mistlib_core::storage::{P2PStorage, SpatialPolicy};
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 
 use mistlib::storage::fs::NativeBlockStore;
-use mistlib::storage::resolver::{NativePeerResolver, WantRegistry};
+use mistlib::storage::resolver::{FixedTransportSource, NativePeerResolver, WantRegistry};
 
 /// Transport stub: storage add/get against the local block store never calls it.
 struct NoopTransport;
@@ -55,9 +56,24 @@ fn ensure_storage() {
     }
     let rt = tokio::runtime::Runtime::new().expect("setup runtime");
     let dir = std::env::temp_dir().join(format!("mistlib_ffi_test_{}", std::process::id()));
-    let store = rt.block_on(NativeBlockStore::new(&dir)).expect("block store init");
-    let resolver = NativePeerResolver::new(Arc::new(NoopTransport), WantRegistry::new(), 5000);
-    let storage = P2PStorage::new(store, resolver, 64 * 1024 * 1024);
+    let store = rt
+        .block_on(NativeBlockStore::new(&dir))
+        .expect("block store init");
+    let resolver = NativePeerResolver::new(
+        Arc::new(FixedTransportSource(vec![Arc::new(NoopTransport)])),
+        WantRegistry::new(),
+        5000,
+    );
+    // No `SelfPositionSource` wired up here: add/get against the local store
+    // never touches spatial eviction, so `None`/default policy keeps this a
+    // pure-LRU setup exactly like before SPEC-16.
+    let storage = P2PStorage::new(
+        store,
+        resolver,
+        64 * 1024 * 1024,
+        None,
+        SpatialPolicy::default(),
+    );
     mistlib::storage::STORAGE
         .set(Arc::new(storage))
         .unwrap_or(());
@@ -86,16 +102,59 @@ fn ffi_storage_add_get_round_trip() {
     let cid = String::from_utf8(cid_buf[..cid_len as usize].to_vec()).expect("CID is utf8");
 
     // --- storage_get: size query with a zero-length buffer ---
-    let needed = unsafe {
-        mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), std::ptr::null_mut(), 0)
-    };
-    assert_eq!(needed as usize, payload.len(), "size query reports full length");
+    let needed =
+        unsafe { mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), std::ptr::null_mut(), 0) };
+    assert_eq!(
+        needed as usize,
+        payload.len(),
+        "size query reports full length"
+    );
 
     // --- storage_get: actual read ---
     let mut out = vec![0u8; needed as usize];
-    let read_len = unsafe {
-        mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), out.as_mut_ptr(), out.len())
+    let read_len =
+        unsafe { mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), out.as_mut_ptr(), out.len()) };
+    assert_eq!(read_len as usize, payload.len());
+    assert_eq!(&out[..read_len as usize], payload.as_slice());
+}
+
+#[test]
+fn ffi_storage_add_at_round_trip() {
+    ensure_storage();
+
+    let payload = b"hello mistlib native storage, spatially tagged".to_vec();
+    let name = "greeting_at.txt";
+
+    // --- storage_add_at: explicit position instead of auto-tagging ---
+    let mut cid_buf = vec![0u8; 256];
+    let cid_len = unsafe {
+        mistlib::ffi::storage_add_at(
+            name.as_ptr(),
+            name.len(),
+            payload.as_ptr(),
+            payload.len(),
+            1.0,
+            2.0,
+            3.0,
+            cid_buf.as_mut_ptr(),
+            cid_buf.len(),
+        )
     };
+    assert!(cid_len > 0, "storage_add_at should return a non-empty CID");
+    let cid = String::from_utf8(cid_buf[..cid_len as usize].to_vec()).expect("CID is utf8");
+
+    // --- storage_get: the block is retrievable exactly like a plain add ---
+    let needed =
+        unsafe { mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), std::ptr::null_mut(), 0) };
+    assert_eq!(
+        needed as usize,
+        payload.len(),
+        "size query reports full length"
+    );
+
+    let mut out = vec![0u8; needed as usize];
+    let read_len =
+        unsafe { mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), out.as_mut_ptr(), out.len()) };
     assert_eq!(read_len as usize, payload.len());
     assert_eq!(&out[..read_len as usize], payload.as_slice());
 }
@@ -106,8 +165,7 @@ fn ffi_storage_get_unknown_cid_returns_zero() {
 
     let cid = "bafy-nonexistent-cid";
     let mut out = vec![0u8; 64];
-    let read_len = unsafe {
-        mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), out.as_mut_ptr(), out.len())
-    };
+    let read_len =
+        unsafe { mistlib::ffi::storage_get(cid.as_ptr(), cid.len(), out.as_mut_ptr(), out.len()) };
     assert_eq!(read_len, 0, "unknown CID should return 0");
 }

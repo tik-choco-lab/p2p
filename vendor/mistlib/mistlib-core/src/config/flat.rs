@@ -2,10 +2,11 @@ use super::{
     Config, ConnectionMode, DensityEncoding, NodeListExchangeMode, SignalingConfig,
     SpatialPartitionType,
 };
+use crate::error::MistError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct FlatConfig {
     signaling_url: Option<String>,
     signaling: Option<SignalingConfig>,
@@ -15,9 +16,16 @@ pub(super) struct FlatConfig {
     aoi_range: Option<f32>,
     hop_count: Option<u32>,
     force_disconnect_count: Option<u32>,
+    max_message_bytes: Option<u32>,
     storage_max_capacity_mb: Option<u64>,
+    storage_spatial_retention_radius: Option<f32>,
+    storage_spatial_decay_enabled: Option<bool>,
+    storage_spatial_decay_interval_secs: Option<u64>,
+    storage_spatial_decay_max_probability: Option<f32>,
     heartbeat_interval_seconds: Option<f32>,
     node_list_interval_seconds: Option<f32>,
+    ping_interval_seconds: Option<f32>,
+    ping_timeout_count: Option<u32>,
     spatial_distance_layers: Option<u32>,
     spatial_density_resolution: Option<u32>,
     spatial_density_encoding: Option<String>,
@@ -38,9 +46,16 @@ impl FlatConfig {
             aoi_range: Some(c.dnve.aoi_range),
             hop_count: Some(c.limits.hop_count),
             force_disconnect_count: Some(c.limits.force_disconnect_count),
+            max_message_bytes: Some(c.limits.max_message_bytes),
             storage_max_capacity_mb: Some(c.storage.max_capacity_mb),
+            storage_spatial_retention_radius: Some(c.storage.spatial_retention_radius),
+            storage_spatial_decay_enabled: Some(c.storage.spatial_decay_enabled),
+            storage_spatial_decay_interval_secs: Some(c.storage.spatial_decay_interval_secs),
+            storage_spatial_decay_max_probability: Some(c.storage.spatial_decay_max_probability),
             heartbeat_interval_seconds: Some(c.intervals.heartbeat),
             node_list_interval_seconds: Some(c.intervals.node_list),
+            ping_interval_seconds: Some(c.intervals.ping),
+            ping_timeout_count: Some(c.limits.ping_timeout_count),
             spatial_distance_layers: Some(c.dnve.distance_layers),
             spatial_density_resolution: Some(c.dnve.density_resolution),
             spatial_density_encoding: Some(c.dnve.density_encoding.as_str().to_owned()),
@@ -51,7 +66,7 @@ impl FlatConfig {
         }
     }
 
-    pub(super) fn apply_to(self, c: &mut Config) -> bool {
+    pub(super) fn apply_to(self, c: &mut Config) -> Result<(), MistError> {
         if let Some(v) = self.signaling_url {
             c.signaling_url = v;
         }
@@ -76,14 +91,35 @@ impl FlatConfig {
         if let Some(v) = self.force_disconnect_count {
             c.limits.force_disconnect_count = v;
         }
+        if let Some(v) = self.max_message_bytes {
+            c.limits.max_message_bytes = v;
+        }
         if let Some(v) = self.storage_max_capacity_mb {
             c.storage.max_capacity_mb = v;
+        }
+        if let Some(v) = self.storage_spatial_retention_radius {
+            c.storage.spatial_retention_radius = v;
+        }
+        if let Some(v) = self.storage_spatial_decay_enabled {
+            c.storage.spatial_decay_enabled = v;
+        }
+        if let Some(v) = self.storage_spatial_decay_interval_secs {
+            c.storage.spatial_decay_interval_secs = v;
+        }
+        if let Some(v) = self.storage_spatial_decay_max_probability {
+            c.storage.spatial_decay_max_probability = v;
         }
         if let Some(v) = self.heartbeat_interval_seconds {
             c.intervals.heartbeat = v;
         }
         if let Some(v) = self.node_list_interval_seconds {
             c.intervals.node_list = v;
+        }
+        if let Some(v) = self.ping_interval_seconds {
+            c.intervals.ping = v;
+        }
+        if let Some(v) = self.ping_timeout_count {
+            c.limits.ping_timeout_count = v;
         }
         if let Some(v) = self.spatial_distance_layers {
             c.dnve.distance_layers = v;
@@ -92,29 +128,41 @@ impl FlatConfig {
             c.dnve.density_resolution = v;
         }
         if let Some(v) = self.spatial_density_encoding {
-            if let Some(parsed) = DensityEncoding::parse(&v) {
-                c.dnve.density_encoding = parsed;
-            }
+            c.dnve.density_encoding = DensityEncoding::parse(&v).ok_or_else(|| {
+                MistError::Config(format!(
+                    "invalid spatialDensityEncoding {v:?}; expected one of: {}",
+                    DensityEncoding::variants().join(", ")
+                ))
+            })?;
         }
         if let Some(v) = self.spatial_partition_type {
-            if let Some(parsed) = SpatialPartitionType::parse(&v) {
-                c.dnve.spatial_partition_type = parsed;
-            }
+            c.dnve.spatial_partition_type = SpatialPartitionType::parse(&v).ok_or_else(|| {
+                MistError::Config(format!(
+                    "invalid spatialPartitionType {v:?}; expected one of: {}",
+                    SpatialPartitionType::variants().join(", ")
+                ))
+            })?;
         }
         if let Some(v) = self.direction_threshold {
             c.dnve.direction_threshold = v;
         }
         if let Some(v) = self.connection_mode {
-            if let Some(parsed) = ConnectionMode::parse(&v) {
-                c.dnve.connection_mode = parsed;
-            }
+            c.dnve.connection_mode = ConnectionMode::parse(&v).ok_or_else(|| {
+                MistError::Config(format!(
+                    "invalid connectionMode {v:?}; expected one of: {}",
+                    ConnectionMode::variants().join(", ")
+                ))
+            })?;
         }
         if let Some(v) = self.node_list_exchange_mode {
-            if let Some(parsed) = NodeListExchangeMode::parse(&v) {
-                c.dnve.node_list_exchange_mode = parsed;
-            }
+            c.dnve.node_list_exchange_mode = NodeListExchangeMode::parse(&v).ok_or_else(|| {
+                MistError::Config(format!(
+                    "invalid nodeListExchangeMode {v:?}; expected one of: {}",
+                    NodeListExchangeMode::variants().join(", ")
+                ))
+            })?;
         }
         c.normalize_legacy_signaling();
-        true
+        Ok(())
     }
 }

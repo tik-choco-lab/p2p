@@ -1,5 +1,5 @@
 use crate::types::NodeId;
-use std::collections::HashMap;
+use crate::util::TtlCache;
 use web_time::{Duration, Instant};
 
 pub const OVERLAY_SEEN_TTL: Duration = Duration::from_secs(30);
@@ -7,17 +7,13 @@ pub const OVERLAY_SEEN_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug)]
 pub struct OverlaySeenCache {
-    ttl: Duration,
-    max_entries: usize,
-    seen: HashMap<(NodeId, u64), Instant>,
+    seen: TtlCache<(NodeId, u64)>,
 }
 
 impl OverlaySeenCache {
     pub fn new(ttl: Duration, max_entries: usize) -> Self {
         Self {
-            ttl,
-            max_entries,
-            seen: HashMap::new(),
+            seen: TtlCache::new(ttl, max_entries),
         }
     }
 
@@ -33,7 +29,7 @@ impl OverlaySeenCache {
             return false;
         }
 
-        self.evict_oldest_until_below_limit();
+        self.seen.evict_oldest_until_below_limit();
         self.seen.insert(key, now);
         true
     }
@@ -50,29 +46,13 @@ impl OverlaySeenCache {
             return false;
         }
 
-        self.evict_oldest_until_below_limit();
+        self.seen.evict_oldest_until_below_limit();
         self.seen.insert(key, now);
         true
     }
 
     pub fn sweep(&mut self, now: Instant) {
-        let ttl = self.ttl;
-        self.seen
-            .retain(|_, inserted_at| now.duration_since(*inserted_at) < ttl);
-    }
-
-    fn evict_oldest_until_below_limit(&mut self) {
-        while self.seen.len() >= self.max_entries {
-            let Some(oldest_key) = self
-                .seen
-                .iter()
-                .min_by_key(|(_, inserted_at)| **inserted_at)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.seen.remove(&oldest_key);
-        }
+        self.seen.sweep(now);
     }
 
     #[cfg(test)]

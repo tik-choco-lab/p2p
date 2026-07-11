@@ -1,11 +1,12 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
-use mistlib_core::types::{ConnectionState, NodeId};
+use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 
 #[cfg(test)]
 const SWEEPER_INTERVAL_MS: u64 = 10;
@@ -13,10 +14,27 @@ const SWEEPER_INTERVAL_MS: u64 = 10;
 const SWEEPER_INTERVAL_MS: u64 = 2000;
 
 use super::{
-    WebRtcTransport, CONNECTION_TIMEOUT_MS, DISCONNECTED_GRACE_MS, LAST_DISCONNECT_TTL_MS,
+    Peer, WebRtcTransport, CONNECTION_TIMEOUT_MS, DATA_CHANNEL_OPEN_TIMEOUT_MS,
+    DISCONNECTED_GRACE_MS, LAST_DISCONNECT_TTL_MS,
 };
 
 impl WebRtcTransport {
+    pub(crate) fn data_channel_open_timeout() -> Duration {
+        std::env::var("MIST_WEBRTC_DC_OPEN_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(DATA_CHANNEL_OPEN_TIMEOUT_MS))
+    }
+
+    pub(crate) async fn has_required_data_channel(peer: &Peer) -> bool {
+        let channels = peer.channels.read().await;
+        channels
+            .get(&DeliveryMethod::ReliableOrdered)
+            .is_some_and(|dc| dc.ready_state() == RTCDataChannelState::Open)
+    }
+
     pub(crate) fn spawn_connection_watchdog(&self, node: NodeId, attempt_id: u32) {
         let handles = self.peer_handles();
 
@@ -37,25 +55,50 @@ impl WebRtcTransport {
                 matches!(lock.get(&node), Some(ConnectionState::Connecting))
             };
 
-            let has_open_channel = {
-                let peer_opt = {
-                    let lock = handles.peers.read().await;
-                    lock.get(&node).cloned()
-                };
-                if let Some(peer) = peer_opt {
-                    let channels = peer.channels.read().await;
-                    channels
-                        .values()
-                        .any(|dc| dc.ready_state() == RTCDataChannelState::Open)
-                } else {
-                    false
-                }
+            let peer_opt = {
+                let lock = handles.peers.read().await;
+                lock.get(&node).cloned()
+            };
+            let has_required_data_channel = if let Some(peer) = &peer_opt {
+                let channels = peer.channels.read().await;
+                channels
+                    .get(&DeliveryMethod::ReliableOrdered)
+                    .is_some_and(|dc| dc.ready_state() == RTCDataChannelState::Open)
+            } else {
+                false
             };
 
-            if still_connecting && !has_open_channel {
-                handles.cleanup_session(&node, true).await;
+            if still_connecting && !has_required_data_channel {
+                // Guard on the exact `Peer` snapshot read above (not just
+                // `node`): a fresh reconnect can already have replaced it
+                // with a new, healthy peer by the time this fires, and an
+                // unconditional-by-NodeId cleanup here would silently delete
+                // that live registration while `connection_states` (marked
+                // `Connected` by the new peer's own DC-open handler) is
+                // never touched -- a permanent "Node not found" with no
+                // close/state-change log to explain it.
+                match peer_opt {
+                    Some(peer) => {
+                        let expected = Arc::downgrade(&peer);
+                        handles
+                            .cleanup_session_if_current(
+                                &node,
+                                &expected,
+                                true,
+                                "watchdog_connect_timeout",
+                            )
+                            .await;
+                    }
+                    // No live peer to protect -- safe to clear whatever
+                    // stale bookkeeping remains for `node` unconditionally.
+                    None => {
+                        handles
+                            .cleanup_session_with_reason(&node, true, "watchdog_connect_timeout")
+                            .await;
+                    }
+                }
                 tracing::warn!(
-                    "[Watchdog] Session cleanup on timeout for {} (attempt={})",
+                    "[WebRTC DC Zombie] detected: connection timeout before ReliableOrdered data channel opened for {} (attempt={})",
                     node,
                     attempt_id
                 );
@@ -119,6 +162,10 @@ impl WebRtcTransport {
                             lock.remove(&node);
                         }
                         {
+                            let mut lock = handles.pc_connected_at.write().unwrap();
+                            lock.remove(&node);
+                        }
+                        {
                             let mut lock = handles.pending_candidates.write().await;
                             lock.remove(&node);
                         }
@@ -132,12 +179,27 @@ impl WebRtcTransport {
                             .copied()
                             .unwrap_or(ConnectionState::Disconnected)
                     };
-                    let has_open_channel = {
-                        let channels = peer.channels.read().await;
-                        channels
-                            .values()
-                            .any(|dc| dc.ready_state() == RTCDataChannelState::Open)
-                    };
+                    let has_required_data_channel = Self::has_required_data_channel(&peer).await;
+
+                    // Disarm the DC-open zombie timer the moment the required
+                    // (ReliableOrdered) data channel is confirmed open. This
+                    // normally happens via the channel's own `on_open` handler
+                    // (`peer.rs`), but that handler is one-shot in webrtc-rs
+                    // and never fires again for a data channel that survived
+                    // an ICE restart without needing to actually reopen --
+                    // yet `RTCPeerConnectionState::Connected`'s handler
+                    // re-arms `pc_connected_at` on *every* such recovery (see
+                    // `recover_connected_from_grace`'s doc comment), including
+                    // this one. Left uncleared, that stale timestamp would
+                    // sit in the map forever: the next time this same
+                    // (perfectly healthy) channel's `ready_state()` reports
+                    // anything other than `Open`, however transient, the
+                    // elapsed-time check below is already far past
+                    // `data_channel_open_timeout` and would immediately
+                    // force-close an otherwise-healthy session.
+                    if has_required_data_channel {
+                        handles.pc_connected_at.write().unwrap().remove(&node);
+                    }
 
                     let failed_or_closed = matches!(
                         pc_state,
@@ -152,17 +214,58 @@ impl WebRtcTransport {
                             .read()
                             .unwrap()
                             .get(&node)
-                            .is_some_and(|at| {
-                                at.elapsed() >= Duration::from_millis(DISCONNECTED_GRACE_MS)
+                            .is_some_and(|grace| {
+                                grace.started_at.elapsed()
+                                    >= Duration::from_millis(DISCONNECTED_GRACE_MS)
                             });
-                    let missing_channel =
-                        state_snapshot == ConnectionState::Connected && !has_open_channel;
+                    let data_channel_open_timeout = Self::data_channel_open_timeout();
+                    let missing_required_channel = !has_required_data_channel
+                        && handles
+                            .pc_connected_at
+                            .read()
+                            .unwrap()
+                            .get(&node)
+                            .is_some_and(|at| at.elapsed() >= data_channel_open_timeout);
 
-                    if failed_or_closed || disconnected_grace_expired || missing_channel {
+                    if failed_or_closed || disconnected_grace_expired || missing_required_channel {
+                        let close_reason = if missing_required_channel {
+                            "sweeper_dc_timeout"
+                        } else if disconnected_grace_expired {
+                            "sweeper_disconnected_grace_expired"
+                        } else {
+                            "sweeper_pc_failed_closed"
+                        };
                         if disconnected_grace_expired {
                             tracing::warn!("[Sweeper] disconnected grace expired for {}", node);
                         }
-                        handles.cleanup_session(&node, true).await;
+                        if missing_required_channel {
+                            tracing::warn!(
+                                "[WebRTC DC Zombie] detected: ReliableOrdered data channel did not open within {:?} after pc connected for {}",
+                                data_channel_open_timeout,
+                                node
+                            );
+                        }
+                        // Guard on the exact `peer` snapshot inspected above
+                        // (not just `node`): a fresh reconnect racing this
+                        // sweep can already have installed a new, healthy
+                        // peer under the same `NodeId` between the reads
+                        // above and this cleanup. An unconditional-by-NodeId
+                        // removal here would silently delete that live
+                        // registration from `self.peers` while
+                        // `connection_states` (already marked `Connected` by
+                        // the new peer's own DC-open handler) is left
+                        // untouched -- a permanent "Node not found" with no
+                        // close/state-change log to explain it.
+                        let expected = Arc::downgrade(&peer);
+                        handles
+                            .cleanup_session_if_current(&node, &expected, true, close_reason)
+                            .await;
+                        if missing_required_channel {
+                            tracing::warn!(
+                                "[WebRTC DC Zombie] recovered: cleaned zombie session for {}",
+                                node
+                            );
+                        }
                         tracing::warn!("[Sweeper] Force cleaned session for {}", node);
                     }
                 }

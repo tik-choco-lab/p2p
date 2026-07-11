@@ -23,6 +23,10 @@ impl DensityEncoding {
             _ => None,
         }
     }
+
+    pub fn variants() -> &'static [&'static str] {
+        &["float", "byte"]
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,6 +63,17 @@ impl SpatialPartitionType {
             "icosahedron" => Some(Self::Icosahedron),
             _ => None,
         }
+    }
+
+    pub fn variants() -> &'static [&'static str] {
+        &[
+            "fibonacci",
+            "tetrahedron",
+            "cube",
+            "octahedron",
+            "dodecahedron",
+            "icosahedron",
+        ]
     }
 
     pub fn direction_count(self, fibonacci_resolution: u32) -> u32 {
@@ -114,6 +129,19 @@ impl ConnectionMode {
             _ => None,
         }
     }
+
+    pub fn variants() -> &'static [&'static str] {
+        &[
+            "direction_density",
+            "direction_density_light",
+            "node_list_directional",
+            "node_list_aoi_guard",
+            "node_list_aoi_proximity",
+            "node_list_aoi_density",
+            "node_list_proximity",
+            "p_sense",
+        ]
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -138,5 +166,9 @@ impl NodeListExchangeMode {
             "push" => Some(Self::Push),
             _ => None,
         }
+    }
+
+    pub fn variants() -> &'static [&'static str] {
+        &["pull", "push"]
     }
 }

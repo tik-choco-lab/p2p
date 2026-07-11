@@ -66,7 +66,7 @@ impl Signaler for OverlayTransport {
             msg,
         );
         self.router.remember_outgoing(&envelope);
-        let data = bincode::serialize(&envelope)
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| crate::error::MistError::Internal(e.to_string()))?;
         let next_hop = {
             let rt = self.router.routing_table.lock().unwrap();

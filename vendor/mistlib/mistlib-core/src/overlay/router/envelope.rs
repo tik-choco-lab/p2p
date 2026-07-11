@@ -156,7 +156,7 @@ impl OverlayRouter {
         }
 
         envelope.hop_count -= 1;
-        let Ok(serialized) = bincode::serialize(&envelope) else {
+        let Ok(serialized) = crate::overlay::wire::serialize(&envelope) else {
             return Vec::new();
         };
         let data = Bytes::from(serialized);

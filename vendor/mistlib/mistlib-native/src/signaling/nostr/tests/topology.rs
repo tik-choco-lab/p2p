@@ -6,7 +6,7 @@ fn topology_rank(signaler: &NostrSignaler, room_id: &str) -> String {
         .topology_rank(room_id, &signaler.identity.public_key)
 }
 
-fn sort_by_topology_rank<'a>(room_id: &str, nodes: &mut Vec<&'a NostrSignaler>) {
+fn sort_by_topology_rank(room_id: &str, nodes: &mut Vec<&NostrSignaler>) {
     nodes.sort_by_key(|node| {
         (
             topology_rank(node, room_id),
