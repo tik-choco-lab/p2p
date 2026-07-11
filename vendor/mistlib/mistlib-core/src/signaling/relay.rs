@@ -59,7 +59,34 @@ impl Signaler for RoutedSignaler {
 
         match self.route_for(to) {
             Some(SignalingRoute::WebSocket) => self.bootstrap.send_signaling(to, msg).await,
-            Some(SignalingRoute::Overlay) | None => self.overlay.send_signaling(to, msg).await,
+            // `Some(Overlay)` means overlay signaling worked for this peer at
+            // some point in the past, not that it's live right now (we
+            // already know it isn't -- `has_signaling_route` above just
+            // returned false). That gap is routine and short-lived: the
+            // routing table's connected-node set is refreshed by a periodic
+            // tick (see `MistEngine::tick`, ~1s cadence) rather than the
+            // instant a peer's transport connection comes up, and it is
+            // briefly empty again while that same peer is mid-reconnect.
+            // `to` here is always a direct WebRTC signaling counterpart (an
+            // Offer/Answer/Candidate/Request target), never a third node
+            // being relayed through someone else, so bootstrap WebSocket is
+            // guaranteed reachable for it (every such peer was introduced via
+            // a WebSocket `Request`/`Offer` before any overlay route could
+            // ever have been recorded for it -- see `remember_route`).
+            // Falling back here turns "silently drop the exact signaling
+            // needed to recover this peer's own connection" into "briefly use
+            // the always-available bootstrap channel until the overlay route
+            // resyncs" -- self-limited to the reconnect window, not a general
+            // WebSocket fallback for live overlay routing.
+            //
+            // A peer with no recorded route at all (`None`) is different: it
+            // may be a brand-new node discovered purely through the overlay
+            // mesh (e.g. the cascade-distribution relay path) that we have
+            // never directly exchanged signaling with, so it keeps the
+            // original no-silent-fallback behavior and fails with
+            // `RouteNotFound` when overlay has no next hop.
+            Some(SignalingRoute::Overlay) => self.bootstrap.send_signaling(to, msg).await,
+            None => self.overlay.send_signaling(to, msg).await,
         }
     }
 

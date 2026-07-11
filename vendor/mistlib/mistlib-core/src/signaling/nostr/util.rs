@@ -23,7 +23,7 @@ pub(crate) fn hex_encode(data: &[u8]) -> String {
 }
 
 pub(crate) fn hex_decode(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(MistError::Signaling(
             "hex string has odd length".to_string(),
         ));

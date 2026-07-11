@@ -12,7 +12,7 @@ impl DNVE3Exchanger {
         let payload = self
             .node_store
             .lock()
-            .unwrap()
+            .expect("node_store lock poisoned")
             .nodes
             .get(&self.local_node_id)
             .and_then(|node| bincode::serialize(&node.position).ok())
@@ -28,7 +28,7 @@ impl DNVE3Exchanger {
             }),
         );
 
-        let data = bincode::serialize(&envelope)
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| {
                 tracing::warn!(
                     "[DNVE3] failed to serialize request_node_list to {}: {}",
@@ -71,7 +71,7 @@ impl DNVE3Exchanger {
             }),
         );
 
-        let data = bincode::serialize(&envelope)
+        let data = crate::overlay::wire::serialize(&envelope)
             .map_err(|e| {
                 tracing::warn!(
                     "[DNVE3] failed to serialize node_list envelope to {}: {}",

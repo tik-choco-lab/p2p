@@ -1,30 +1,24 @@
-use std::collections::HashMap;
+use crate::util::TtlCache;
 use web_time::{Duration, Instant};
 
 const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug)]
 pub struct DedupeCache {
-    ttl: Duration,
-    max_entries: usize,
-    seen: HashMap<String, Instant>,
+    seen: TtlCache<String>,
 }
 
 impl DedupeCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            ttl,
-            max_entries: DEFAULT_MAX_ENTRIES,
-            seen: HashMap::new(),
+            seen: TtlCache::new(ttl, DEFAULT_MAX_ENTRIES),
         }
     }
 
     #[cfg(test)]
     fn with_max_entries(ttl: Duration, max_entries: usize) -> Self {
         Self {
-            ttl,
-            max_entries,
-            seen: HashMap::new(),
+            seen: TtlCache::new(ttl, max_entries),
         }
     }
 
@@ -34,33 +28,17 @@ impl DedupeCache {
         if self.seen.contains_key(event_id) {
             return false;
         }
-        self.evict_oldest_until_below_limit();
+        self.seen.evict_oldest_until_below_limit();
         self.seen.insert(event_id.to_string(), now);
         true
     }
 
     pub fn sweep(&mut self, now: Instant) {
-        let ttl = self.ttl;
-        self.seen
-            .retain(|_, inserted_at| now.duration_since(*inserted_at) < ttl);
+        self.seen.sweep(now);
     }
 
     pub fn clear(&mut self) {
         self.seen.clear();
-    }
-
-    fn evict_oldest_until_below_limit(&mut self) {
-        while self.seen.len() >= self.max_entries {
-            let Some(oldest_id) = self
-                .seen
-                .iter()
-                .min_by_key(|(_, inserted_at)| **inserted_at)
-                .map(|(event_id, _)| event_id.clone())
-            else {
-                break;
-            };
-            self.seen.remove(&oldest_id);
-        }
     }
 }
 

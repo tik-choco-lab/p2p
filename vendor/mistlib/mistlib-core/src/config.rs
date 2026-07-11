@@ -5,6 +5,7 @@ mod signaling;
 #[cfg(test)]
 mod tests;
 
+use crate::error::MistError;
 pub use enums::{ConnectionMode, DensityEncoding, NodeListExchangeMode, SpatialPartitionType};
 use flat::FlatConfig;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,23 @@ pub struct LimitsConfig {
     pub hop_count: u32,
     pub reserved_connection_count: u32,
     pub force_disconnect_count: u32,
+    /// Consecutive missed PONGs (unanswered before the next PING) before a peer is
+    /// logged as a liveness suspect. `0` disables the threshold check entirely.
+    #[serde(default = "default_ping_timeout_count")]
+    pub ping_timeout_count: u32,
+    /// Upper bound (in bytes) on a single Transport::send payload (post-envelope,
+    /// pre-wire). Enforced by native/wasm transports; core only carries the value.
+    /// See SPEC-13.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: u32,
+}
+
+fn default_ping_timeout_count() -> u32 {
+    5
+}
+
+fn default_max_message_bytes() -> u32 {
+    65536
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,6 +76,15 @@ pub struct IntervalsConfig {
     pub connection_balancer: f32,
     pub heartbeat: f32,
     pub node_list: f32,
+    /// PING keepalive cadence, decoupled from `heartbeat` so it can be tuned
+    /// independently (e.g. kept fast for liveness detection while heartbeat
+    /// backs off when idle).
+    #[serde(default = "default_ping_interval")]
+    pub ping: f32,
+}
+
+fn default_ping_interval() -> f32 {
+    1.0
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -70,12 +97,46 @@ pub struct WebRtcConfig {
 #[serde(rename_all = "camelCase")]
 pub struct StorageConfig {
     pub max_capacity_mb: u64,
+    /// Protected radius `R` around each self-position: blocks tagged closer
+    /// than this are never spatially evicted/decayed. See SPEC-16.
+    #[serde(default = "default_spatial_retention_radius")]
+    pub spatial_retention_radius: f32,
+    /// Enables the periodic decay sweep (driven by native/wasm; core only
+    /// exposes `run_decay_sweep`).
+    #[serde(default = "default_spatial_decay_enabled")]
+    pub spatial_decay_enabled: bool,
+    #[serde(default = "default_spatial_decay_interval_secs")]
+    pub spatial_decay_interval_secs: u64,
+    /// Upper bound on the per-sweep deletion probability for blocks at/beyond
+    /// `4 * spatial_retention_radius`.
+    #[serde(default = "default_spatial_decay_max_probability")]
+    pub spatial_decay_max_probability: f32,
+}
+
+fn default_spatial_retention_radius() -> f32 {
+    100.0
+}
+
+fn default_spatial_decay_enabled() -> bool {
+    false
+}
+
+fn default_spatial_decay_interval_secs() -> u64 {
+    60
+}
+
+fn default_spatial_decay_max_probability() -> f32 {
+    0.2
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             max_capacity_mb: 8 * 1024,
+            spatial_retention_radius: default_spatial_retention_radius(),
+            spatial_decay_enabled: default_spatial_decay_enabled(),
+            spatial_decay_interval_secs: default_spatial_decay_interval_secs(),
+            spatial_decay_max_probability: default_spatial_decay_max_probability(),
         }
     }
 }
@@ -86,6 +147,32 @@ pub struct IceServer {
     pub urls: Vec<String>,
     pub username: Option<String>,
     pub credential: Option<String>,
+}
+
+impl IceServer {
+    /// Whether this entry can safely be handed to a PeerConnection
+    /// constructor. Both webrtc-rs (`ErrNoTurnCredentials`) and browsers
+    /// (`InvalidAccessError`, per the WebRTC spec) reject a turn/turns URL
+    /// without a non-empty username and credential *at construction time* —
+    /// so a single bad entry would permanently fail every subsequent
+    /// connection attempt in the session. Callers (native `map_ice_servers`,
+    /// wasm `build_ice_server_plans`) must drop unusable entries, with a
+    /// warning, instead of forwarding them.
+    ///
+    /// An entry with no URLs is also unusable: browsers reject an empty
+    /// `urls` array outright.
+    pub fn is_usable(&self) -> bool {
+        if self.urls.is_empty() {
+            return false;
+        }
+        let needs_credentials = self.urls.iter().any(|url| {
+            let scheme = url.trim_start().split(':').next().unwrap_or("");
+            scheme.eq_ignore_ascii_case("turn") || scheme.eq_ignore_ascii_case("turns")
+        });
+        !needs_credentials
+            || (self.username.as_deref().is_some_and(|u| !u.is_empty())
+                && self.credential.as_deref().is_some_and(|c| !c.is_empty()))
+    }
 }
 
 impl Config {
@@ -101,6 +188,8 @@ impl Config {
                 hop_count: 2,
                 reserved_connection_count: 1,
                 force_disconnect_count: 0,
+                ping_timeout_count: default_ping_timeout_count(),
+                max_message_bytes: default_max_message_bytes(),
             },
             dnve: DnveConfig {
                 density_max_range: 64.0,
@@ -117,6 +206,7 @@ impl Config {
                 connection_balancer: 2.0,
                 heartbeat: 1.0,
                 node_list: 2.0,
+                ping: default_ping_interval(),
             },
             webrtc: WebRtcConfig {
                 ice_servers: vec![IceServer {
@@ -129,26 +219,37 @@ impl Config {
         }
     }
 
-    pub fn update_from_json(&mut self, json_str: &str) -> bool {
-        if let Ok(mut new_config) = serde_json::from_str::<Config>(json_str) {
-            new_config.normalize_legacy_signaling();
-            if !new_config.validate_signaling() {
-                return false;
+    pub fn update_from_json(&mut self, json_str: &str) -> crate::error::Result<()> {
+        let full_config_err = match serde_json::from_str::<Config>(json_str) {
+            Ok(mut new_config) => {
+                new_config.normalize_legacy_signaling();
+                if !new_config.validate_signaling() {
+                    return Err(MistError::Config(
+                        "invalid signaling configuration".to_string(),
+                    ));
+                }
+                *self = new_config;
+                return Ok(());
             }
-            *self = new_config;
-            return true;
-        }
+            Err(e) => e,
+        };
 
-        if let Ok(flat) = serde_json::from_str::<FlatConfig>(json_str) {
-            let mut next = self.clone();
-            if !flat.apply_to(&mut next) || !next.validate_signaling() {
-                return false;
+        match serde_json::from_str::<FlatConfig>(json_str) {
+            Ok(flat) => {
+                let mut next = self.clone();
+                flat.apply_to(&mut next)?;
+                if !next.validate_signaling() {
+                    return Err(MistError::Config(
+                        "invalid signaling configuration".to_string(),
+                    ));
+                }
+                *self = next;
+                Ok(())
             }
-            *self = next;
-            return true;
+            Err(flat_config_err) => Err(MistError::Config(format!(
+                "failed to parse as full Config ({full_config_err}) or as flat config ({flat_config_err})"
+            ))),
         }
-
-        false
     }
 
     pub fn use_websocket_signaling_url(&mut self, signaling_url: String) {

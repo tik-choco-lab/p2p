@@ -70,7 +70,7 @@ fn nostr_signaling_config_parses_from_flat_update() {
         }"#,
     );
 
-    assert!(updated, "Nostr flat config should parse");
+    assert!(updated.is_ok(), "Nostr flat config should parse");
     assert_eq!(config.signaling.mode, SignalingMode::Nostr);
     let nostr = config
         .signaling
@@ -103,7 +103,7 @@ fn empty_relays_with_default_invite_is_accepted_for_implicit_relay_list() {
     );
 
     assert!(
-        updated,
+        updated.is_ok(),
         "empty relays (implicit relay list URL) should be accepted with default invite"
     );
     assert_eq!(config.signaling.mode, SignalingMode::Nostr);
@@ -135,7 +135,7 @@ fn empty_relays_use_default_relay_list_url_with_custom_invite() {
     );
 
     assert!(
-        updated,
+        updated.is_ok(),
         "empty relays should use the default relay list URL when invite is custom"
     );
     let nostr = config
@@ -170,7 +170,10 @@ fn default_nostr_invite_is_rejected_for_public_relays() {
         }"#,
     );
 
-    assert!(!updated, "public relays require a non-default invite");
+    assert!(
+        updated.is_err(),
+        "public relays require a non-default invite"
+    );
     let nostr = config
         .signaling
         .nostr
@@ -199,7 +202,7 @@ fn custom_nostr_invite_is_allowed_for_public_relays() {
     );
 
     assert!(
-        updated,
+        updated.is_ok(),
         "custom invite should be accepted for public relays"
     );
     let nostr = config
@@ -230,7 +233,7 @@ fn nostr_relay_list_url_parses_from_config() {
     ));
 
     assert!(
-        updated,
+        updated.is_ok(),
         "relayListUrl should allow relays to be loaded later"
     );
     let nostr = config
@@ -266,7 +269,7 @@ fn default_invite_is_rejected_for_public_relay_list_url() {
     ));
 
     assert!(
-        !updated,
+        updated.is_err(),
         "public relayListUrl requires a non-default invite"
     );
 }

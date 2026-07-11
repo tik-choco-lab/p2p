@@ -207,6 +207,48 @@ fn routed_handler_records_ingress_route_before_forwarding_message() {
     assert_eq!(inner.handled.lock().unwrap().len(), 1);
 }
 
+/// Reproduces the reconnect-flap root cause: a peer that has *previously*
+/// exchanged signaling over the overlay (its direct WebRTC connection) but
+/// whose live overlay route is currently missing -- e.g. the peer's
+/// connection just dropped and is mid-reconnect, or it was just
+/// re-established and the routing table's connected-node set hasn't been
+/// resynced by the next periodic tick yet (`MistEngine::tick`, ~1s cadence).
+/// Before the fix, this hit the same `None => overlay` arm as a genuinely
+/// unknown peer and failed with `RouteNotFound`, silently dropping the exact
+/// Offer/Answer/ICE-restart message needed to complete or recover this
+/// peer's own connection -- wedging it until a full peer teardown occurred.
+/// `to` is always a direct signaling counterpart here (never a third node
+/// being relayed through someone else), so falling back to the always-on
+/// bootstrap WebSocket is safe and self-limited to this reconnect window.
+#[test]
+fn stale_overlay_route_without_live_connection_falls_back_to_bootstrap() {
+    let handler = Arc::new(RecordingActionHandler::default());
+    let bootstrap = Arc::new(RecordingSignaler::default());
+    let (relay, router) = make_relay(handler.clone(), bootstrap.clone());
+    let peer = NodeId("peer-a".to_string());
+
+    // Simulate history: the peer was a live overlay neighbor before (so its
+    // route got remembered as Overlay), then disconnected -- `on_disconnected`
+    // clears it from `connected_nodes`, but `RoutedSignaler`'s own per-peer
+    // route memory is untouched by that (no link between the two today).
+    router
+        .routing_table
+        .lock()
+        .unwrap()
+        .on_connected(peer.clone());
+    relay.remember_route(&peer, SignalingRoute::Overlay);
+    router.routing_table.lock().unwrap().on_disconnected(&peer);
+
+    futures::executor::block_on(relay.send_signaling(&peer, signaling_msg("local", "peer-a")))
+        .expect("signaling to a known peer must not be dropped just because its overlay route is momentarily stale");
+
+    assert_eq!(bootstrap.sent.lock().unwrap().as_slice(), &[peer]);
+    assert!(
+        handler.actions.lock().unwrap().is_empty(),
+        "must not attempt to send over the (routeless) overlay path"
+    );
+}
+
 #[test]
 fn peer_without_recorded_route_defaults_to_overlay_without_bootstrap_fallback() {
     let handler = Arc::new(RecordingActionHandler::default());

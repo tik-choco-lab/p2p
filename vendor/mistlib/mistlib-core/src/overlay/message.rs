@@ -36,6 +36,10 @@ pub struct OverlayEnvelope {
     pub from: NodeId,
     pub to: NodeId,
     pub msg_id: u64,
+    /// Per-destination end-to-end sequence number for `ReliableOrdered` unicast.
+    /// `0` means "no sequencing" (broadcasts, control messages, legacy) and
+    /// bypasses the receiver's reorder buffer.
+    pub seq: u64,
     pub hop_count: u32,
     pub content: MessageContent,
 }
@@ -46,6 +50,7 @@ impl OverlayEnvelope {
             from,
             to,
             msg_id: Self::random_msg_id(),
+            seq: 0,
             hop_count,
             content,
         }
@@ -61,9 +66,16 @@ impl OverlayEnvelope {
             from,
             to,
             msg_id: 0,
+            seq: 0,
             hop_count,
             content,
         }
+    }
+
+    /// Sets the end-to-end sequence number, consuming and returning the envelope.
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = seq;
+        self
     }
 
     fn random_msg_id() -> u64 {
