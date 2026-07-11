@@ -168,6 +168,36 @@ impl ReorderBuffer {
         out
     }
 
+    /// Flushes every source whose gap has been open for at least the gap
+    /// timeout, without waiting for new traffic from that source to trigger
+    /// the lazy flush in `accept`/`accept_at`. A gapped source that goes idle
+    /// (no more messages, not even `seq == 0` control traffic) would
+    /// otherwise hold its buffered successors forever; this is the
+    /// time-only escape hatch, meant to be polled periodically (e.g. from an
+    /// engine's background tick) rather than driven by arrivals.
+    ///
+    /// Returns `(source, messages)` pairs, messages in seq order, for every
+    /// source flushed. Sources with no pending gap, or a gap that hasn't yet
+    /// reached the timeout, are left untouched.
+    pub fn flush_expired(&mut self, now: Instant) -> Vec<(NodeId, Vec<MessageContent>)> {
+        let gap_timeout = self.gap_timeout;
+        let mut flushed = Vec::new();
+        for (id, state) in self.sources.iter_mut() {
+            let Some(since) = state.gap_since else {
+                continue;
+            };
+            if now.duration_since(since) < gap_timeout {
+                continue;
+            }
+            let mut out = Vec::new();
+            state.flush(&mut out);
+            if !out.is_empty() {
+                flushed.push((id.clone(), out));
+            }
+        }
+        flushed
+    }
+
     fn evict_sources_if_needed(&mut self, incoming: &NodeId, _now: Instant) {
         if self.sources.len() < self.max_sources || self.sources.contains_key(incoming) {
             return;
@@ -380,6 +410,59 @@ mod tests {
         let d = buf.accept_at(&src, 1, raw("n1"), now);
         assert_eq!(tags(&d), ["m4", "n1"]);
         assert_eq!(tags(&buf.accept_at(&src, 2, raw("n2"), now)), ["n2"]);
+    }
+
+    #[test]
+    fn flush_expired_delivers_buffered_tail_after_timeout_with_no_new_traffic() {
+        let mut buf = ReorderBuffer::default();
+        let src = node("peer-a");
+        let now = Instant::now();
+
+        // 1 delivers, then 3 arrives with 2 missing: a gap that never fills
+        // because the source goes silent (no further traffic at all, not
+        // even seq == 0 control messages).
+        assert_eq!(tags(&buf.accept_at(&src, 1, raw("m1"), now)), ["m1"]);
+        assert!(buf.accept_at(&src, 3, raw("m3"), now).is_empty());
+
+        let flushed = buf.flush_expired(now + Duration::from_secs(2));
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].0, src);
+        assert_eq!(tags(&flushed[0].1), ["m3"]);
+
+        // The gap is cleared: a fresh in-order arrival delivers immediately
+        // rather than being held for a stale gap that no longer exists.
+        assert_eq!(tags(&buf.accept_at(&src, 4, raw("m4"), now)), ["m4"]);
+    }
+
+    #[test]
+    fn flush_expired_delivers_nothing_before_timeout() {
+        let mut buf = ReorderBuffer::default();
+        let src = node("peer-a");
+        let now = Instant::now();
+
+        assert_eq!(tags(&buf.accept_at(&src, 1, raw("m1"), now)), ["m1"]);
+        assert!(buf.accept_at(&src, 3, raw("m3"), now).is_empty());
+
+        // Still within the gap timeout: nothing is flushed yet.
+        let flushed = buf.flush_expired(now + Duration::from_millis(500));
+        assert!(flushed.is_empty());
+
+        // The buffered message is still there once the real timeout arrives.
+        let flushed = buf.flush_expired(now + Duration::from_secs(2));
+        assert_eq!(tags(&flushed[0].1), ["m3"]);
+    }
+
+    #[test]
+    fn flush_expired_ignores_sources_with_no_pending_gap() {
+        let mut buf = ReorderBuffer::default();
+        let src = node("peer-a");
+        let now = Instant::now();
+
+        // In-order traffic only: no gap ever opens.
+        assert_eq!(tags(&buf.accept_at(&src, 1, raw("m1"), now)), ["m1"]);
+        assert_eq!(tags(&buf.accept_at(&src, 2, raw("m2"), now)), ["m2"]);
+
+        assert!(buf.flush_expired(now + Duration::from_secs(2)).is_empty());
     }
 
     #[test]
