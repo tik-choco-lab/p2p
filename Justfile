@@ -13,10 +13,39 @@ vendor-mistlib:
 vendor-mistlib:
     sh ./scripts/vendor-mistlib.sh
 
+# Checks whether the vendored mistlib copy is up to date; exits 1 on drift.
+[windows]
+vendor-mistlib-check:
+    & .\scripts\check-mistlib-drift.ps1
+
+[unix]
+vendor-mistlib-check:
+    sh ./scripts/check-mistlib-drift.sh
+
+# Detects drift, re-vendors, and auto-commits the result in one shot.
+[windows]
+vendor-mistlib-update:
+    & .\scripts\update-mistlib.ps1
+
+[unix]
+vendor-mistlib-update:
+    sh ./scripts/update-mistlib.sh
+
+# Best-effort freshness gate: updates vendored mistlib when configured and
+# stale; skips when unconfigured, warns and continues when upstream is
+# unreachable.
+[windows]
+ensure-mistlib:
+    & .\scripts\ensure-mistlib.ps1
+
+[unix]
+ensure-mistlib:
+    sh ./scripts/ensure-mistlib.sh
+
 build:
     cargo build
 
-release:
+release: ensure-mistlib
     cargo build --release
 
 test:

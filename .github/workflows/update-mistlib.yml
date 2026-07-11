@@ -1,0 +1,105 @@
+# Daily drift check against upstream mistlib (tik-choco-lab/mistlib-dev,
+# develop branch). If vendor/mistlib is behind, re-vendors it via
+# scripts/vendor-mistlib.sh and opens a PR with the refreshed tree so a human
+# can review and merge.
+#
+# Requires one repository secret:
+#   MISTLIB_DEV_TOKEN - fine-grained PAT with Contents: Read on
+#                       tik-choco-lab/mistlib-dev (private repo), same token
+#                       used by release.yml in the mistl repo.
+#
+# Manual run: Actions tab -> update-mistlib -> Run workflow (workflow_dispatch),
+# or `gh workflow run update-mistlib.yml`.
+
+name: update-mistlib
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-mistlib
+  cancel-in-progress: false
+
+env:
+  MISTLIB_REF: develop
+
+jobs:
+  update-mistlib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for upstream drift
+        id: drift
+        env:
+          MISTLIB_REPO: https://x-access-token:${{ secrets.MISTLIB_DEV_TOKEN }}@github.com/tik-choco-lab/mistlib-dev.git
+        run: |
+          set +e
+          sh scripts/check-mistlib-drift.sh
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "drift=false" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "drift=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "check-mistlib-drift.sh failed (exit $code)" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Record currently vendored commit
+        if: steps.drift.outputs.drift == 'true'
+        id: before
+        run: |
+          sha=$(grep -oE '^commit:[[:space:]]*[0-9a-fA-F]+' vendor/mistlib/VENDORED_FROM | grep -oE '[0-9a-fA-F]+$' || true)
+          echo "sha=${sha:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Re-vendor mistlib
+        if: steps.drift.outputs.drift == 'true'
+        env:
+          MISTLIB_REPO: https://x-access-token:${{ secrets.MISTLIB_DEV_TOKEN }}@github.com/tik-choco-lab/mistlib-dev.git
+        run: sh scripts/vendor-mistlib.sh
+
+      - name: Record newly vendored commit
+        if: steps.drift.outputs.drift == 'true'
+        id: after
+        run: |
+          sha=$(grep -oE '^commit:[[:space:]]*[0-9a-fA-F]+' vendor/mistlib/VENDORED_FROM | grep -oE '[0-9a-fA-F]+$' || true)
+          if [ -z "$sha" ]; then
+            echo "could not parse 'commit:' line from vendor/mistlib/VENDORED_FROM" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.drift.outputs.drift == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/update-mistlib
+          base: main
+          delete-branch: true
+          commit-message: "chore: vendor mistlib ${{ env.MISTLIB_REF }} @ ${{ steps.after.outputs.short_sha }}"
+          title: "chore: vendor mistlib ${{ env.MISTLIB_REF }} @ ${{ steps.after.outputs.short_sha }}"
+          body: |
+            Automated update of `vendor/mistlib` from upstream
+            `tik-choco-lab/mistlib-dev` (ref: `${{ env.MISTLIB_REF }}`),
+            produced by `scripts/vendor-mistlib.sh`.
+
+            - ref: `${{ env.MISTLIB_REF }}`
+            - previous commit: `${{ steps.before.outputs.sha }}`
+            - new commit: `${{ steps.after.outputs.sha }}`
+
+            This PR was generated automatically by the `update-mistlib` workflow.
+            Please review the vendored diff before merging.

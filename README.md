@@ -28,7 +28,7 @@ The binary will be located at `target/release/p2p`.
 
 ### mistlib dependency
 
-The `mistlib` (mistlib-native) source tree is **vendored** into `vendor/mistlib/` and referenced as a path dependency, so the project builds without access to the private mistlib repository. The vendored ref and commit are recorded in `vendor/mistlib/VENDORED_FROM`.
+The `mistlib` (mistlib-native) source tree is **vendored** into `vendor/mistlib/` and referenced as a path dependency, so the project builds without access to the private mistlib repository. The vendored ref and commit are recorded in `vendor/mistlib/VENDORED_FROM`. Tests, examples, and benches are pruned during vendoring, so only the sources needed to build the project are included.
 
 To update the vendored copy (requires access to the mistlib repository): copy `.env.example` to `.env`, set
 
@@ -36,6 +36,17 @@ To update the vendored copy (requires access to the mistlib repository): copy `.
 - `MISTLIB_REF` — branch name, or a full 40-char commit hash to pin a revision (defaults to `develop`)
 
 then run `just vendor-mistlib` and commit the resulting diff.
+
+`MISTLIB_REPO` and `MISTLIB_REF` may also be set as environment variables, which take precedence over `.env`.
+
+Two additional helpers automate this process:
+
+- `just vendor-mistlib-check` — detects drift between the vendored copy and upstream; exits 0 if up to date, 1 if upstream has moved on.
+- `just vendor-mistlib-update` — a one-shot that detects drift, re-vendors, and auto-commits the result if any is found.
+
+`just release` runs this update automatically before building when `MISTLIB_REPO` is configured; without configuration (or when upstream is unreachable) it builds with the existing vendored copy.
+
+CI runs `.github/workflows/update-mistlib.yml` daily to check for drift and open an update PR automatically; it requires a `MISTLIB_DEV_TOKEN` repository secret (a fine-grained PAT with read access to mistlib-dev).
 
 ## Usage
 
