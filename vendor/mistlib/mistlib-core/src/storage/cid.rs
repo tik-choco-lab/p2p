@@ -120,9 +120,9 @@ mod tests {
             "b..",
             "b/nested",
             "b.hidden",
-            "bABC",              // uppercase is outside base32-lower
-            "bfoo=bar",          // padding / query chars
-            "afoo",              // wrong multibase prefix
+            "bABC",     // uppercase is outside base32-lower
+            "bfoo=bar", // padding / query chars
+            "afoo",     // wrong multibase prefix
         ] {
             assert!(!is_valid_cid(bad), "should reject {bad:?}");
         }
