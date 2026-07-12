@@ -102,6 +102,19 @@ impl ForwardNegotiator {
         self.inner.lock().await.outgoing.insert(req_id, outgoing);
     }
 
+    /// Lists requests the local node has sent and is still waiting on a
+    /// response for, ordered by req id.
+    pub async fn list_outgoing(&self) -> Vec<OutgoingForward> {
+        self.inner.lock().await.outgoing.values().cloned().collect()
+    }
+
+    /// Removes and returns the outgoing request with the given req id.
+    /// Used to roll back `record_outgoing` when the send that was supposed
+    /// to follow it fails.
+    pub async fn remove_outgoing(&self, req_id: &str) -> Option<OutgoingForward> {
+        self.inner.lock().await.outgoing.remove(req_id)
+    }
+
     /// Matches a received response to a pending outgoing request and queues the
     /// outcome for the TUI loop. Unknown req ids are ignored. A response whose
     /// sender doesn't match the peer the request was actually sent to
@@ -223,6 +236,21 @@ mod tests {
         // Drained once only; a second response for the same id no longer matches.
         neg.record_response("r1", "peer-1", true).await;
         assert!(neg.drain_outcomes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outgoing_requests_are_listed_and_removed() {
+        let neg = ForwardNegotiator::new();
+        neg.record_outgoing("r1".into(), sample_outgoing()).await;
+
+        let listed = neg.list_outgoing().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].target, "tcp:127.0.0.1:80");
+
+        let removed = neg.remove_outgoing("r1").await.unwrap();
+        assert_eq!(removed.peer_id, "peer-1");
+        assert!(neg.list_outgoing().await.is_empty());
+        assert!(neg.remove_outgoing("r1").await.is_none());
     }
 
     #[tokio::test]

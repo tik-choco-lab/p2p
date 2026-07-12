@@ -71,6 +71,9 @@ pub(crate) struct Snapshot {
     pub(crate) forwards: Vec<ForwardStatus>,
     pub(crate) pending_auth: Vec<PendingAuthorization>,
     pub(crate) pending_forwards: Vec<IncomingForward>,
+    /// Forward requests this node has sent and is still waiting on a peer
+    /// response for.
+    pub(crate) pending_outgoing: Vec<OutgoingForward>,
     pub(crate) trust: Vec<TrustEntry>,
     pub(crate) events: Vec<AuthEvent>,
 }
@@ -175,6 +178,7 @@ impl SessionContext {
             forwards: self.controller.list_forwards().await,
             pending_auth: self.pending_auth.list().await,
             pending_forwards: self.negotiator.list_incoming().await,
+            pending_outgoing: self.negotiator.list_outgoing().await,
             trust: self.trust_store.list().await,
             events,
         }
@@ -201,10 +205,15 @@ impl SessionContext {
         };
 
         if !allow {
-            let _ = self
-                .manager
+            self.manager
                 .send_forward_response(&req.peer_id, forward_response(&req, false))
-                .await;
+                .await
+                .map_err(|e| {
+                    SessionError::Invalid(format!(
+                        "denied locally, but failed to notify peer: {}",
+                        e
+                    ))
+                })?;
             return Ok(format!("denied forward {}", req.target));
         }
 
@@ -233,16 +242,33 @@ impl SessionContext {
                 TrustDecision::Allow,
             )
             .await;
-        let _ = self
-            .manager
+        // The local forward/trust bookkeeping above already succeeded and is
+        // intentionally not rolled back here: if notifying the peer fails,
+        // the forward still works locally, and the caller learns via the
+        // returned error that the requester wasn't told.
+        self.manager
             .send_forward_response(&req.peer_id, forward_response(&req, true))
-            .await;
+            .await
+            .map_err(|e| {
+                SessionError::Invalid(format!(
+                    "accepted locally, but failed to notify peer: {}",
+                    e
+                ))
+            })?;
         Ok(format!("accepted forward {}", req.target))
     }
 
     /// Sends an outgoing forward request to a peer and records it so the
     /// matching response can be matched up later. Mirrors the TUI's
     /// original `send_request`.
+    ///
+    /// Records the outgoing request *before* sending it, not after: if the
+    /// peer's response raced in ahead of a post-send `record_outgoing`, it
+    /// would arrive as an unknown req id and be silently dropped by
+    /// `ForwardNegotiator::record_response`, leaving the requester waiting
+    /// forever for an answer that already came back. Recording first closes
+    /// that window; if the send itself then fails, the just-recorded entry
+    /// is rolled back with `remove_outgoing`.
     pub(crate) async fn send_outgoing_forward(
         &self,
         draft: OutgoingForward,
@@ -254,12 +280,15 @@ impl SessionContext {
             remote_addr: draft.remote_addr.clone(),
             target: draft.target.clone(),
         };
+        self.negotiator
+            .record_outgoing(req_id.clone(), draft.clone())
+            .await;
         match self.manager.send_forward_request(&draft.peer_id, ev).await {
-            Ok(()) => {
-                self.negotiator.record_outgoing(req_id, draft.clone()).await;
-                Ok(format!("request sent: {}", draft.target))
+            Ok(()) => Ok(format!("request sent: {}", draft.target)),
+            Err(e) => {
+                self.negotiator.remove_outgoing(&req_id).await;
+                Err(SessionError::Invalid(format!("send failed: {}", e)))
             }
-            Err(e) => Err(SessionError::Invalid(format!("send failed: {}", e))),
         }
     }
 

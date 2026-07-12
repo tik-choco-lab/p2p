@@ -31,6 +31,7 @@
     pendingCount: document.getElementById("pending-count"),
     pendingAuthList: document.getElementById("pending-auth-list"),
     pendingForwardList: document.getElementById("pending-forward-list"),
+    pendingOutgoingList: document.getElementById("pending-outgoing-list"),
 
     forwardsTbody: document.getElementById("forwards-tbody"),
     forwardsEmpty: document.getElementById("forwards-empty"),
@@ -124,10 +125,14 @@
 
   function statusClass(status) {
     var s = (status || "").toLowerCase();
-    if (["active", "connected", "up", "open", "ok", "ready"].indexOf(s) !== -1) {
+    if (["active", "connected", "up", "open", "ok", "ready", "listening"].indexOf(s) !== -1) {
       return "status-good";
     }
-    if (["error", "failed", "disconnected", "closed", "down"].indexOf(s) !== -1) {
+    // Real error states arrive as "error: <detail>", so match by prefix.
+    if (
+      s.indexOf("error") === 0 ||
+      ["failed", "disconnected", "closed", "down", "stopped"].indexOf(s) !== -1
+    ) {
       return "status-bad";
     }
     if (["pending", "connecting", "starting", "waiting"].indexOf(s) !== -1) {
@@ -336,7 +341,7 @@
   function handleState(data) {
     latestState = data;
     renderHeader(data);
-    renderPending(data.pending_auth || [], data.pending_forwards || []);
+    renderPending(data.pending_auth || [], data.pending_forwards || [], data.pending_outgoing || []);
     renderForwardsTable(data.forwards || []);
     renderPeerSelect(data.peers || []);
     renderPeersSection(data.peers || []);
@@ -370,12 +375,15 @@
     if (latestState && latestState.node_id) copyToClipboard(latestState.node_id);
   });
 
-  function renderPending(auths, forwards) {
-    if (unchanged("pending", { auths: auths, forwards: forwards })) return;
+  function renderPending(auths, forwards, outgoing) {
+    if (unchanged("pending", { auths: auths, forwards: forwards, outgoing: outgoing })) return;
 
-    var total = auths.length + forwards.length;
+    // Badge count and title "(!)" stay actionable-only (auths+forwards);
+    // outgoing entries are a waiting display, not something the user acts on.
+    var actionableTotal = auths.length + forwards.length;
+    var total = actionableTotal + outgoing.length;
     el.pendingSection.classList.toggle("hidden", total === 0);
-    el.pendingCount.textContent = total > 0 ? String(total) : "";
+    el.pendingCount.textContent = actionableTotal > 0 ? String(actionableTotal) : "";
 
     clearChildren(el.pendingAuthList);
     auths.forEach(function (item) {
@@ -385,6 +393,11 @@
     clearChildren(el.pendingForwardList);
     forwards.forEach(function (item) {
       el.pendingForwardList.appendChild(renderPendingForwardCard(item));
+    });
+
+    clearChildren(el.pendingOutgoingList);
+    outgoing.forEach(function (item) {
+      el.pendingOutgoingList.appendChild(renderPendingOutgoingCard(item));
     });
   }
 
@@ -462,6 +475,17 @@
 
     var actions = mkEl("div", { className: "actions" }, [acceptBtn, rejectBtn]);
     return mkEl("div", { className: "pending-card" }, [info, actions]);
+  }
+
+  function renderPendingOutgoingCard(item) {
+    var info = mkEl("div", { className: "info" }, [
+      mkEl("div", { text: shortId(item.peer_id) + "  ·  " + item.proto, title: item.peer_id }),
+      mkEl("div", { className: "sub", text: "local: " + item.local }),
+      mkEl("div", { className: "sub", text: "remote: " + item.remote }),
+      mkEl("div", { className: "sub waiting-note", text: "waiting for peer approval…" }),
+    ]);
+
+    return mkEl("div", { className: "pending-card waiting" }, [info]);
   }
 
   function renderForwardsTable(forwards) {

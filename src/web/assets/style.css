@@ -298,6 +298,14 @@ section { min-width: 0; }
   flex-wrap: wrap;
 }
 
+.pending-card.waiting { border-style: dashed; }
+
+.waiting-note {
+  color: var(--text-faint);
+  font-style: italic;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
 /* ---------- buttons ---------- */
 .btn {
   border: 1px solid var(--border-strong);
