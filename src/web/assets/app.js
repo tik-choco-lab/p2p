@@ -626,14 +626,18 @@
 
   /* ------------------------------- theme --------------------------------- */
 
-  el.themeToggle.addEventListener("click", function () {
-    var current = document.documentElement.dataset.theme;
-    var next = current === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    try {
-      localStorage.setItem("p2p-theme", next);
-    } catch (e) {}
-  });
+  // Guard: a stale cached index.html may not have the toggle button yet;
+  // never let its absence prevent the boot section below from running.
+  if (el.themeToggle) {
+    el.themeToggle.addEventListener("click", function () {
+      var current = document.documentElement.dataset.theme;
+      var next = current === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = next;
+      try {
+        localStorage.setItem("p2p-theme", next);
+      } catch (e) {}
+    });
+  }
 
   /* --------------------------------- boot --------------------------------- */
 
