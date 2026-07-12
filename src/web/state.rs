@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use crate::app::session::SessionContext;
 use crate::auth::{AuthDecision, AuthEventSource, PendingAuthorization, TrustDecision, TrustEntry};
 use crate::controller::{Direction, ForwardSpec, ForwardState, ForwardStatus};
-use crate::negotiation::IncomingForward;
+use crate::negotiation::{IncomingForward, OutgoingForward};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct PeerDto {
@@ -45,6 +45,15 @@ pub(crate) struct PendingForwardDto {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct PendingOutgoingDto {
+    pub(crate) peer_id: String,
+    pub(crate) proto: String,
+    pub(crate) local: String,
+    pub(crate) remote: String,
+    pub(crate) target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct TrustDto {
     pub(crate) peer_id: String,
     pub(crate) forward_key: String,
@@ -70,6 +79,7 @@ pub(crate) struct StateDto {
     pub(crate) forwards: Vec<ForwardDto>,
     pub(crate) pending_auth: Vec<PendingAuthDto>,
     pub(crate) pending_forwards: Vec<PendingForwardDto>,
+    pub(crate) pending_outgoing: Vec<PendingOutgoingDto>,
     pub(crate) trust: Vec<TrustDto>,
     pub(crate) events: Vec<EventDto>,
 }
@@ -157,6 +167,11 @@ pub(crate) async fn build_state_dto(ctx: &SessionContext) -> StateDto {
             .iter()
             .map(pending_forward_dto)
             .collect(),
+        pending_outgoing: snap
+            .pending_outgoing
+            .iter()
+            .map(pending_outgoing_dto)
+            .collect(),
         trust: snap.trust.iter().map(trust_dto).collect(),
         events: snap.events.iter().map(event_dto).collect(),
     }
@@ -212,6 +227,16 @@ fn pending_forward_dto(item: &IncomingForward) -> PendingForwardDto {
         peer_id: item.peer_id.clone(),
         proto: item.proto.clone(),
         remote_addr: item.remote_addr.clone(),
+        target: item.target.clone(),
+    }
+}
+
+fn pending_outgoing_dto(item: &OutgoingForward) -> PendingOutgoingDto {
+    PendingOutgoingDto {
+        peer_id: item.peer_id.clone(),
+        proto: item.proto.clone(),
+        local: item.local_addr.clone(),
+        remote: item.remote_addr.clone(),
         target: item.target.clone(),
     }
 }
@@ -318,6 +343,13 @@ mod tests {
                 remote_addr: "127.0.0.1:80".into(),
                 target: "tcp:127.0.0.1:80".into(),
             }],
+            pending_outgoing: vec![PendingOutgoingDto {
+                peer_id: "peer-1".into(),
+                proto: "tcp".into(),
+                local: "127.0.0.1:8080".into(),
+                remote: "10.0.0.5:80".into(),
+                target: "tcp:10.0.0.5:80".into(),
+            }],
             trust: vec![TrustDto {
                 peer_id: "peer-1".into(),
                 forward_key: "tcp:127.0.0.1:80".into(),
@@ -340,6 +372,8 @@ mod tests {
         assert_eq!(json["forwards"][0]["direction"], "serve");
         assert_eq!(json["pending_auth"][0]["id"], 1);
         assert_eq!(json["pending_forwards"][0]["id"], 2);
+        assert_eq!(json["pending_outgoing"][0]["local"], "127.0.0.1:8080");
+        assert_eq!(json["pending_outgoing"][0]["remote"], "10.0.0.5:80");
         assert_eq!(json["trust"][0]["decision"], "allow");
         assert_eq!(json["events"][0]["source"], "policy");
 
@@ -356,6 +390,7 @@ mod tests {
                 "peers",
                 "pending_auth",
                 "pending_forwards",
+                "pending_outgoing",
                 "room_id",
                 "trust",
             ]
