@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use super::super::event::handle_payload;
+use super::super::event::{handle_join, handle_leave, handle_payload};
 use super::super::payload::P2pPayload;
 use super::super::state::PeerRole;
 use super::{encode, test_manager};
@@ -217,6 +217,69 @@ async fn removed_tunnel_handler_no_longer_receives_targeted_messages() {
     .await;
 
     assert!(received.lock().unwrap().is_empty());
+}
+
+/// Coverage for (B)/(4) in the manager-layer audit: capabilities survive a
+/// leave (so a transient session recovery doesn't permanently blind
+/// routing), routing itself excludes a departed peer regardless, and a
+/// rejoin resets the retained capabilities so a subsequent fresh
+/// Capabilities broadcast is what repopulates them.
+#[tokio::test]
+async fn leave_retains_capabilities_but_routing_excludes_departed_peer_until_rejoin_repopulates() {
+    let manager = test_manager("self", PeerRole::Client);
+
+    handle_join(manager.inner.clone(), "peer-1".to_string()).await;
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        manager.get_server_peers_for("tcp:80").await,
+        vec!["peer-1".to_string()]
+    );
+
+    handle_leave(manager.inner.clone(), "peer-1".to_string()).await;
+
+    // Capabilities are still cached...
+    assert!(manager
+        .inner
+        .peer_forward_keys
+        .read()
+        .await
+        .get("peer-1")
+        .is_some_and(|keys| keys.contains("tcp:80")));
+    // ...but routing only considers currently-present peers.
+    assert!(manager.get_server_peers_for("tcp:80").await.is_empty());
+
+    // A fresh JOIN resets the stale capabilities rather than trusting them
+    // for a new session.
+    handle_join(manager.inner.clone(), "peer-1".to_string()).await;
+    assert!(manager
+        .inner
+        .peer_forward_keys
+        .read()
+        .await
+        .get("peer-1")
+        .is_none());
+    assert!(manager.get_server_peers_for("tcp:80").await.is_empty());
+
+    // The peer's new Capabilities broadcast repopulates routing.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(
+        manager.get_server_peers_for("tcp:80").await,
+        vec!["peer-1".to_string()]
+    );
 }
 
 #[tokio::test]

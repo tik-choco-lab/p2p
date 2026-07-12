@@ -21,6 +21,7 @@ hex = "0.4"
 anyhow = "1"
 ratatui = "0.29"
 base64 = "0.22"
+axum = { version = "0.8", features = ["ws"] }
 
 [dev-dependencies]
 temp-env = "0.3"

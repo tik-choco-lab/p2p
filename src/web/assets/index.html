@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("p2p-theme"); } catch (e) {}
+  if (t !== "dark" && t !== "light") {
+    t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+<title>p2p</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="toast-container" aria-live="polite"></div>
+
+<header id="app-header">
+  <div class="header-left">
+    <span class="app-name">p2p</span>
+    <button type="button" id="room-id-btn" class="id-chip" title="Click to copy room id">
+      <span class="id-label">room</span>
+      <span class="id-value" id="room-id-value">—</span>
+    </button>
+    <button type="button" id="node-id-btn" class="id-chip" title="Click to copy node id">
+      <span class="id-label">node</span>
+      <span class="id-value" id="node-id-value">—</span>
+    </button>
+  </div>
+  <div class="header-right">
+    <span class="peer-count" id="peer-count" title="Connected peers">0 peers</span>
+    <span class="conn-indicator" id="conn-indicator">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span class="conn-text" id="conn-text">connecting…</span>
+    </span>
+    <button type="button" id="theme-toggle" class="theme-toggle" title="Toggle theme" aria-label="Toggle theme">◐</button>
+  </div>
+</header>
+
+<main id="app-main">
+
+  <section id="pending-section" class="pending-section card hidden" aria-label="Pending requests">
+    <h2 class="section-title">Pending <span id="pending-count" class="badge-count"></span></h2>
+    <div id="pending-auth-list" class="pending-list"></div>
+    <div id="pending-forward-list" class="pending-list"></div>
+  </section>
+
+  <section id="forwards-section" class="card" aria-label="Forwards">
+    <h2 class="section-title">Forwards</h2>
+    <div class="table-wrap">
+      <table id="forwards-table" class="data-table">
+        <thead>
+          <tr>
+            <th>Proto</th>
+            <th>Direction</th>
+            <th>Local</th>
+            <th>Target</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="forwards-tbody"></tbody>
+      </table>
+      <div id="forwards-empty" class="empty-state">No forwards yet — add one below.</div>
+    </div>
+
+    <form id="add-forward-form" class="add-forward-form">
+      <select id="af-proto" name="proto" title="Protocol">
+        <option value="tcp">tcp</option>
+        <option value="udp">udp</option>
+      </select>
+      <input id="af-local" name="local" type="text" placeholder="127.0.0.1:8080" autocomplete="off" required>
+      <span class="arrow">→</span>
+      <input id="af-remote" name="remote" type="text" placeholder="remote host:port" autocomplete="off" required>
+      <select id="af-peer" name="peer_id" title="Peer">
+        <option value="">— select peer —</option>
+      </select>
+      <button type="submit" class="btn btn-primary">Add forward</button>
+    </form>
+  </section>
+
+  <section id="peers-section" class="card" aria-label="Peers">
+    <h2 class="section-title">Peers</h2>
+    <ul id="peers-list" class="peers-list"></ul>
+    <div id="peers-empty" class="empty-state">No peers yet — share the room id.</div>
+  </section>
+
+  <section id="trust-section" class="card" aria-label="Trusted peers">
+    <h2 class="section-title">Trust</h2>
+    <div class="table-wrap">
+      <table id="trust-table" class="data-table">
+        <thead>
+          <tr>
+            <th>Peer</th>
+            <th>Forward key</th>
+            <th>Decision</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="trust-tbody"></tbody>
+      </table>
+      <div id="trust-empty" class="empty-state">No trusted peers yet.</div>
+    </div>
+  </section>
+
+  <section id="events-section" class="card" aria-label="Event log">
+    <h2 class="section-title">Events</h2>
+    <div id="events-log" class="events-log"></div>
+    <div id="events-empty" class="empty-state">No events yet.</div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

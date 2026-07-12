@@ -1,11 +1,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::auth::{
-    AuthDecision, AuthEvent, PendingAuthorization, TrustDecision, TrustEntry, TrustKey,
-};
+use crate::auth::{AuthDecision, AuthEvent, PendingAuthorization, TrustEntry};
 use crate::controller::{Direction, ForwardSpec, ForwardStatus, Proto};
 use crate::negotiation::{IncomingForward, OutgoingForward};
-use crate::rtc::ForwardRequestEvent;
 
 use super::TuiContext;
 
@@ -79,6 +76,9 @@ pub(super) struct App {
     pub(super) expanded: bool,
     pub(super) message: Option<String>,
     pub(super) should_quit: bool,
+    /// URL of the in-process Web UI once started via the `w` key; also the
+    /// "already running" latch so repeated presses reuse the same server.
+    web_url: Option<String>,
 }
 
 impl App {
@@ -98,6 +98,7 @@ impl App {
             expanded: false,
             message: None,
             should_quit: false,
+            web_url: None,
         }
     }
 
@@ -176,8 +177,39 @@ impl App {
             KeyCode::Char('N') if self.focus == Focus::Pending => {
                 self.resolve_pending(AuthDecision::DenyAlways).await
             }
+            KeyCode::Char('w') => self.open_web_ui().await,
             _ => {}
         }
+    }
+
+    /// Starts the in-process Web UI on first use (sharing this session's
+    /// context), then opens a browser and copies the URL — both
+    /// best-effort; the URL is always shown in the footer as a fallback.
+    async fn open_web_ui(&mut self) {
+        let url = match &self.web_url {
+            Some(url) => url.clone(),
+            None => match crate::web::start_in_process(self.ctx.clone(), crate::web::DEFAULT_PORT)
+                .await
+            {
+                Ok(url) => {
+                    self.web_url = Some(url.clone());
+                    url
+                }
+                Err(e) => {
+                    self.message = Some(format!("web ui failed to start: {}", e));
+                    return;
+                }
+            },
+        };
+        let opened = crate::web::best_effort_open(&url);
+        let copied = crate::web::best_effort_copy_clipboard(&url);
+        let note = match (opened, copied) {
+            (true, true) => "browser opened, url copied",
+            (true, false) => "browser opened",
+            (false, true) => "url copied - open it manually",
+            (false, false) => "open it manually",
+        };
+        self.message = Some(format!("web ui: {} ({})", url, note));
     }
 
     fn move_sel(&mut self, delta: i32) {
@@ -198,13 +230,10 @@ impl App {
             return;
         };
         let key = status.key.clone();
-        match self.ctx.controller.remove_forward(&key).await {
-            Ok(()) => {
-                let _ = self.ctx.forward_store.remove(&key).await;
-                self.message = Some(format!("removed {}", key));
-            }
-            Err(e) => self.message = Some(format!("remove failed: {}", e)),
-        }
+        self.message = Some(match self.ctx.remove_forward(&key).await {
+            Ok(()) => format!("removed {}", key),
+            Err(e) => e.to_string(),
+        });
     }
 
     async fn resolve_pending(&mut self, decision: AuthDecision) {
@@ -215,7 +244,7 @@ impl App {
         match row {
             PendingRow::Conn(item) => {
                 let id = item.id;
-                if self.ctx.pending_auth.resolve(id, decision).await {
+                if self.ctx.resolve_pending_auth(id, decision).await {
                     self.message = Some(format!("resolved #{}", id));
                 } else {
                     self.message = Some(format!("pending #{} no longer exists", id));
@@ -229,68 +258,32 @@ impl App {
         }
     }
 
-    /// Approves or denies an incoming forward proposal: on approval, creates a
-    /// matching serve forward, remembers trust, persists, and answers the peer.
+    /// Approves or denies an incoming forward proposal. The side-effect
+    /// chain (creating the serve forward, remembering trust, persisting,
+    /// answering the peer) lives in `SessionContext::resolve_forward`,
+    /// shared with the Web UI.
     async fn resolve_forward(&mut self, id: u64, allow: bool) {
-        let Some(req) = self.ctx.negotiator.take_incoming(id).await else {
-            self.message = Some("forward request no longer exists".into());
-            return;
-        };
-
-        if !allow {
-            let _ = self
-                .ctx
-                .manager
-                .send_forward_response(&req.peer_id, response(&req, false))
-                .await;
-            self.message = Some(format!("denied forward {}", req.target));
-            return;
-        }
-
-        let proto = match Proto::from_name(&req.proto) {
-            Ok(p) => p,
-            Err(e) => {
-                self.message = Some(format!("invalid proto: {}", e));
-                return;
-            }
-        };
-        let spec = ForwardSpec {
-            direction: Direction::Serve,
-            proto,
-            addr: req.remote_addr.clone(),
-            listen_port: -1,
-            target: req.target.clone(),
-        };
-        if let Err(e) = self.ctx.controller.add_forward(spec.clone()).await {
-            self.message = Some(format!("add failed: {}", e));
-            return;
-        }
-        let _ = self.ctx.forward_store.add(&spec).await;
-        // Approving the forward also trusts subsequent connections for it.
-        let _ = self
-            .ctx
-            .trust_store
-            .remember(
-                TrustKey {
-                    peer_id: req.peer_id.clone(),
-                    forward_key: req.target.clone(),
-                },
-                TrustDecision::Allow,
-            )
-            .await;
-        let _ = self
-            .ctx
-            .manager
-            .send_forward_response(&req.peer_id, response(&req, true))
-            .await;
-        self.message = Some(format!("accepted forward {}", req.target));
+        self.message = Some(match self.ctx.resolve_forward(id, allow).await {
+            Ok(msg) => msg,
+            Err(e) => e.to_string(),
+        });
     }
 
     /// Requester-side handling of a peer's answer to our forward request.
+    /// Deliberately kept as its own copy rather than delegating to
+    /// `SessionContext::apply_forward_outcome` (used by the Web UI's
+    /// background loop): that shared version surfaces an "invalid proto"
+    /// message on the `Err(_) => return` branch below, which would be an
+    /// observable TUI behavior change. TODO: reconcile once that's judged
+    /// intentional.
     async fn apply_outcome(&mut self, outcome: crate::negotiation::ForwardOutcome) {
+        let reason = outcome.reason.clone();
         let out = outcome.outgoing;
         if !outcome.accepted {
-            self.message = Some(format!("peer denied {}", out.target));
+            self.message = Some(match reason {
+                Some(reason) => format!("forward {} failed: {}", out.target, reason),
+                None => format!("peer denied {}", out.target),
+            });
             return;
         }
         let proto = match Proto::from_name(&out.proto) {
@@ -418,28 +411,10 @@ impl App {
     }
 
     async fn send_request(&mut self, draft: OutgoingForward) {
-        let req_id = uuid::Uuid::new_v4().to_string();
-        let ev = ForwardRequestEvent {
-            req_id: req_id.clone(),
-            proto: draft.proto.clone(),
-            remote_addr: draft.remote_addr.clone(),
-            target: draft.target.clone(),
-        };
-        match self
-            .ctx
-            .manager
-            .send_forward_request(&draft.peer_id, ev)
-            .await
-        {
-            Ok(()) => {
-                self.ctx
-                    .negotiator
-                    .record_outgoing(req_id, draft.clone())
-                    .await;
-                self.message = Some(format!("request sent: {}", draft.target));
-            }
-            Err(e) => self.message = Some(format!("send failed: {}", e)),
-        }
+        self.message = Some(match self.ctx.send_outgoing_forward(draft).await {
+            Ok(msg) => msg,
+            Err(e) => e.to_string(),
+        });
     }
 
     async fn handle_trust_key(&mut self, key: KeyEvent, mut sel: usize) {
@@ -454,14 +429,14 @@ impl App {
             }
             KeyCode::Char('x') | KeyCode::Delete if len > 0 => {
                 if let Some(entry) = self.trust.get(sel) {
-                    let tk = TrustKey {
-                        peer_id: entry.key.peer_id.clone(),
-                        forward_key: entry.key.forward_key.clone(),
-                    };
-                    match self.ctx.trust_store.remove(&tk).await {
+                    match self
+                        .ctx
+                        .remove_trust(&entry.key.peer_id, &entry.key.forward_key)
+                        .await
+                    {
                         Ok(true) => self.message = Some("trust entry removed".into()),
                         Ok(false) => self.message = Some("trust entry not found".into()),
-                        Err(e) => self.message = Some(format!("remove failed: {}", e)),
+                        Err(e) => self.message = Some(e.to_string()),
                     }
                 }
                 if sel > 0 {
@@ -471,14 +446,6 @@ impl App {
             _ => {}
         }
         self.popup = Popup::Trust(sel);
-    }
-}
-
-fn response(req: &IncomingForward, accepted: bool) -> crate::rtc::ForwardResponseEvent {
-    crate::rtc::ForwardResponseEvent {
-        req_id: req.req_id.clone(),
-        target: req.target.clone(),
-        accepted,
     }
 }
 
@@ -498,7 +465,8 @@ fn prev_field(f: AddField) -> AddField {
     }
 }
 
-/// Parses the port from an `ip:port` string.
+/// Parses the port from an `ip:port` string. Delegates to the shared
+/// session helper (also used by the Web API's `POST /api/forwards`).
 fn parse_port(addr: &str) -> Option<i32> {
-    addr.rsplit(':').next()?.parse::<i32>().ok()
+    crate::app::session::parse_addr_port(addr)
 }

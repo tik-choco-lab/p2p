@@ -5,6 +5,7 @@ use super::payload::P2pPayload;
 use super::state::{PeerRole, RTCManagerInner};
 use super::{mistlib_config, RTCManagerHandle};
 
+mod membership;
 mod ordering;
 mod routing;
 
@@ -236,7 +237,7 @@ async fn invalid_and_self_payloads_are_ignored() {
 }
 
 #[tokio::test]
-async fn leave_removes_peer_state_and_notifies_close_handlers() {
+async fn leave_removes_presence_but_retains_roles_and_notifies_close_handlers() {
     let manager = test_manager("self", PeerRole::Client);
     let tunnel_closed = Arc::new(Mutex::new(Vec::new()));
     let stdio_closed = Arc::new(Mutex::new(Vec::new()));
@@ -273,14 +274,15 @@ async fn leave_removes_peer_state_and_notifies_close_handlers() {
 
     handle_leave(manager.inner.clone(), "peer-1".to_string()).await;
 
+    // Presence is cleared...
     assert!(!manager.inner.peers.read().await.contains("peer-1"));
-    assert!(manager
-        .inner
-        .peer_roles
-        .read()
-        .await
-        .get("peer-1")
-        .is_none());
+    // ...but roles/capabilities are retained across a leave (see (B) in the
+    // manager-layer audit): a transient mistlib session recovery shouldn't
+    // permanently blind routing to a peer that never really left.
+    assert_eq!(
+        manager.inner.peer_roles.read().await.get("peer-1"),
+        Some(&PeerRole::Server)
+    );
     assert_eq!(*tunnel_closed.lock().unwrap(), vec!["peer-1".to_string()]);
     assert_eq!(*stdio_closed.lock().unwrap(), vec!["peer-1".to_string()]);
 }

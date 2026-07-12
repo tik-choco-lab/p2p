@@ -5,10 +5,12 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
 use crate::auth::AuthRequest;
+use crate::forward_runtime::ForwardPeerRuntime;
 use crate::rtc::TunnelMessage;
 
 use super::{
-    log_tcp_io_error, TcpManager, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_PING,
+    log_tcp_io_error, ConnState, TcpManager, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT, MSG_TYPE_DATA,
+    MSG_TYPE_PING, PENDING_DATA_BUFFER_MAX_BYTES, PENDING_DATA_BUFFER_MAX_MSGS,
 };
 
 impl TcpManager {
@@ -33,50 +35,102 @@ impl TcpManager {
         }
     }
 
+    /// Handles an inbound `connect`. Deliberately does *not* await
+    /// authorization inline (that used to be able to block forever on a
+    /// human answering a TUI prompt, stalling this forward's single
+    /// message-processing loop -- and with it every peer's connect/data/
+    /// close traffic for this target -- Finding (A)): it tracks a `Pending`
+    /// placeholder synchronously and hands authorization off to a spawned
+    /// task, so this returns immediately either way.
     async fn handle_remote_connect(&self, peer_id: &str, tm: &TunnelMessage) {
+        // Finding (B): `connect` is sent via `send_to_with_retry` and can be
+        // delivered twice (a retry whose original send in fact succeeded).
+        // A conn_id already tracked -- whether still `Pending` or already
+        // `Active` -- means this is a duplicate delivery: ignore it rather
+        // than re-authorizing, opening a second `TcpStream`, or clobbering
+        // the existing entry.
+        if self.conns.read().await.contains_key(&tm.conn_id) {
+            debug!(
+                "ignoring duplicate tunnel connect for already-tracked conn {} from {}",
+                tm.conn_id, peer_id
+            );
+            return;
+        }
+
+        self.track_pending_conn(&tm.conn_id, peer_id).await;
+
+        let mgr = Arc::new(self.clone_inner());
+        let conn_id = tm.conn_id.clone();
+        let pid = peer_id.to_string();
+        tokio::spawn(async move { mgr.authorize_and_activate(conn_id, pid).await });
+    }
+
+    /// Resolves authorization for a `Pending` conn (spawned by
+    /// `handle_remote_connect`) and, if allowed, opens the backend
+    /// `TcpStream` and promotes the conn to `Active`. Runs independently of
+    /// -- and concurrently with -- this forward's message-processing loop,
+    /// so `data`/`close` for `conn_id` are handled the whole time this is in
+    /// flight (see `TcpManager::handle_remote_data` and `ConnState::Pending`
+    /// for how `data` is buffered until this resolves).
+    async fn authorize_and_activate(self: Arc<Self>, conn_id: String, peer_id: String) {
         let req = AuthRequest {
-            peer_id: peer_id.to_string(),
+            peer_id: peer_id.clone(),
             forward_key: self.target.clone(),
             target_addr: self.remote_addr.clone(),
             proto: "tcp".to_string(),
         };
         let decision = self.authorizer.authorize(&req).await;
+
+        // The whole forward may have been torn down while authorization was
+        // in flight (e.g. the user removed it) -- don't touch sockets/state
+        // that shutdown may already be unwinding.
+        if self.runtime.is_cancelled() {
+            return;
+        }
+
+        // The conn may already be gone by the time authorization resolves:
+        // closed by the peer, or denied outright after its pending buffer
+        // overflowed. Either way there's nothing left to promote.
+        if !self.conns.read().await.contains_key(&conn_id) {
+            debug!(
+                "conn {} no longer tracked once authorization resolved for {}; dropping decision",
+                conn_id, peer_id
+            );
+            return;
+        }
+
         if !decision.is_allowed() {
             debug!(
                 "denied tcp tunnel connection from {} to {}",
                 peer_id, self.target
             );
-            self.send_close(peer_id, &tm.conn_id).await;
+            self.close_conn(&conn_id, true).await;
             return;
         }
 
         let addr = &self.remote_addr;
         match TcpStream::connect(addr).await {
             Ok(stream) => {
+                if self.runtime.is_cancelled() {
+                    return;
+                }
                 let (read_half, write_half) = stream.into_split();
-                self.track_conn(&tm.conn_id, write_half, peer_id, true)
-                    .await;
-                let mgr = Arc::new(self.clone_inner());
-                let cid = tm.conn_id.clone();
-                let pid = peer_id.to_string();
+                if !self.promote_pending_conn(&conn_id, write_half).await {
+                    // Denied/closed/overflowed while the backend TcpStream
+                    // was connecting -- let the fresh stream drop rather
+                    // than leak it onto an already-gone conn.
+                    return;
+                }
+                let mgr = self.clone();
+                let cid = conn_id.clone();
+                let pid = peer_id.clone();
                 tokio::spawn(async move { mgr.forward_tcp_to_dc(cid, pid, read_half).await });
             }
             Err(e) => {
                 error!("failed to connect to remote ({}): {}", addr, e);
-                self.send_close(peer_id, &tm.conn_id).await;
+                self.close_conn(&conn_id, true).await;
             }
         }
-    }
-
-    async fn send_close(&self, peer_id: &str, conn_id: &str) {
-        let close_msg = TunnelMessage {
-            msg_type: MSG_TYPE_CLOSE.into(),
-            conn_id: conn_id.to_string(),
-            target: self.target.clone(),
-            payload: None,
-            seq: None,
-        };
-        let _ = self.send_to(peer_id, &close_msg).await;
     }
 
     async fn handle_remote_data(&self, tm: &TunnelMessage) {
@@ -95,55 +149,117 @@ impl TcpManager {
             return;
         };
 
-        let (writer, metrics, decision) = {
+        // While the conn is still `Pending` (authorization in flight -- see
+        // `authorize_and_activate`), there's no backend `TcpStream` to write
+        // to yet: buffer the payload instead. `recv_seq.observe` still runs
+        // right here, in arrival order, so gap/duplicate detection is
+        // identical to the `Active` case -- only the actual write is
+        // deferred, to `promote_pending_conn`'s replay.
+        let outcome = {
             let mut tc = tc.write().await;
             let decision = tc.recv_seq.observe(tm.seq);
-            (tc.writer.clone(), tc.metrics.clone(), decision)
+            match decision {
+                SeqDecision::Duplicate { received } => DataOutcome::Duplicate { received },
+                SeqDecision::Gap { expected, received } => DataOutcome::Gap { expected, received },
+                SeqDecision::Inconsistent => DataOutcome::Inconsistent,
+                SeqDecision::Accept => match &mut tc.state {
+                    ConnState::Active { writer } => DataOutcome::Write {
+                        writer: writer.clone(),
+                        metrics: tc.metrics.clone(),
+                    },
+                    ConnState::Pending {
+                        buffered,
+                        buffered_bytes,
+                    } => {
+                        let payload = tm.payload.clone().unwrap_or_default();
+                        if buffered.len() >= PENDING_DATA_BUFFER_MAX_MSGS
+                            || *buffered_bytes + payload.len() > PENDING_DATA_BUFFER_MAX_BYTES
+                        {
+                            DataOutcome::PendingBufferOverflow
+                        } else {
+                            *buffered_bytes += payload.len();
+                            buffered.push(payload);
+                            DataOutcome::Buffered
+                        }
+                    }
+                },
+            }
         };
 
-        match decision {
-            SeqDecision::Duplicate { received } => {
+        match outcome {
+            DataOutcome::Duplicate { received } => {
                 debug!(
                     "dropping duplicate tunnel data for conn {} (seq {})",
                     tm.conn_id, received
                 );
-                return;
             }
-            SeqDecision::Gap { expected, received } => {
+            DataOutcome::Gap { expected, received } => {
                 warn!(
                     "tunnel data gap for conn {}: expected seq {} but got {}; \
                      closing conn to avoid corrupting the downstream stream",
                     tm.conn_id, expected, received
                 );
                 self.close_conn(&tm.conn_id, true).await;
-                return;
             }
-            SeqDecision::Inconsistent => {
+            DataOutcome::Inconsistent => {
                 warn!(
                     "tunnel data for conn {} switched from sequenced to unsequenced \
                      mid-stream; closing conn",
                     tm.conn_id
                 );
                 self.close_conn(&tm.conn_id, true).await;
-                return;
             }
-            SeqDecision::Accept => {}
-        }
-
-        let payload = match &tm.payload {
-            Some(p) if !p.is_empty() => p,
-            _ => return,
-        };
-
-        let mut writer = writer.lock().await;
-        if let Err(e) = writer.write_all(payload).await {
-            log_tcp_io_error("failed to write to tcp", &e);
-            drop(writer);
-            self.close_conn(&tm.conn_id, true).await;
-        } else {
-            metrics.record_bytes_out(payload.len());
+            DataOutcome::Buffered => {}
+            DataOutcome::PendingBufferOverflow => {
+                warn!(
+                    "pending-authorization data buffer for conn {} exceeded {} messages / {} \
+                     bytes while authorization was still in flight; denying and closing",
+                    tm.conn_id, PENDING_DATA_BUFFER_MAX_MSGS, PENDING_DATA_BUFFER_MAX_BYTES
+                );
+                self.close_conn(&tm.conn_id, true).await;
+            }
+            DataOutcome::Write { writer, metrics } => {
+                let payload = match &tm.payload {
+                    Some(p) if !p.is_empty() => p,
+                    _ => return,
+                };
+                let mut writer = writer.lock().await;
+                if let Err(e) = writer.write_all(payload).await {
+                    log_tcp_io_error("failed to write to tcp", &e);
+                    drop(writer);
+                    self.close_conn(&tm.conn_id, true).await;
+                } else {
+                    metrics.record_bytes_out(payload.len());
+                }
+            }
         }
     }
+}
+
+/// What to do next for one inbound `data` message, decided while holding the
+/// conn's lock (so the decision sees a consistent `recv_seq`/`state`) and
+/// then acted on after releasing it -- same lock-then-release split
+/// `handle_remote_data` already used for [`SeqDecision`], extended to also
+/// cover which `ConnState` the conn was in.
+enum DataOutcome {
+    /// Already-seen seq (see [`SeqDecision::Duplicate`]): drop it.
+    Duplicate { received: u64 },
+    /// A seq was skipped (see [`SeqDecision::Gap`]): close the conn.
+    Gap { expected: u64, received: u64 },
+    /// Sequenced/unsequenced mid-stream switch (see
+    /// [`SeqDecision::Inconsistent`]): close the conn.
+    Inconsistent,
+    /// The conn is `Active`: write straight through, same as before
+    /// `ConnState::Pending` existed.
+    Write {
+        writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        metrics: ForwardPeerRuntime,
+    },
+    /// The conn is `Pending` and the payload was appended to its buffer.
+    Buffered,
+    /// The conn is `Pending` and buffering this payload would exceed
+    /// `PENDING_DATA_BUFFER_MAX_MSGS`/`_BYTES`: deny and close the conn.
+    PendingBufferOverflow,
 }
 
 /// Per-conn tracking of the receive-side `data` sequence number, used to

@@ -12,6 +12,7 @@ mod stdio;
 mod tcp;
 mod tui;
 mod udp;
+mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -56,6 +57,22 @@ enum Commands {
     Chat {
         room_id: Option<String>,
     },
+
+    /// Runs the same P2P session as the TUI but exposes an HTTP + WebSocket
+    /// control API (and the embedded frontend) on 127.0.0.1 instead of a
+    /// terminal UI.
+    Web {
+        room_id: Option<String>,
+
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+
+        /// Best-effort: opens the UI in the default browser once the server
+        /// is listening. Failures (e.g. no browser available) are logged
+        /// and otherwise ignored.
+        #[arg(long)]
+        open: bool,
+    },
 }
 
 fn init_tracing(verbose: u8) {
@@ -86,6 +103,11 @@ async fn main() -> Result<()> {
             command,
         }) => app::run_serve(&args, &command, auto_accept, &allow_peer).await,
         Some(Commands::Chat { room_id }) => app::run_chat(room_id.as_deref()).await,
+        Some(Commands::Web {
+            room_id,
+            port,
+            open,
+        }) => web::run(room_id.as_deref(), port, open).await,
         None => app::run_tui(cli.room_id.as_deref()).await,
     }
 }

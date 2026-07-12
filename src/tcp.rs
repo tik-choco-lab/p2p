@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -43,6 +44,14 @@ const PEER_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(10)
 /// when the tunneled application (e.g. an idle SSH session) sends nothing.
 const TUNNEL_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Caps on how much inbound `data` a `Pending` (not-yet-authorized) conn will
+/// buffer -- see [`ConnState::Pending`]. Authorization can block
+/// indefinitely (e.g. on a human answering a TUI prompt), so an unbounded
+/// buffer would let a single unauthorized conn exhaust memory. Whichever
+/// limit is hit first denies and closes the conn (see `handle_remote_data`).
+const PENDING_DATA_BUFFER_MAX_MSGS: usize = 256;
+const PENDING_DATA_BUFFER_MAX_BYTES: usize = 1024 * 1024;
+
 /// Tunnel message-type discriminants (the `type` field of [`TunnelMessage`]).
 /// Unknown/unrecognized types (e.g. from a newer or older peer) are ignored
 /// gracefully by `on_tunnel_message` -- do not add a type here without
@@ -55,7 +64,7 @@ pub(super) const MSG_TYPE_CLOSE: &str = "close";
 pub(super) const MSG_TYPE_PING: &str = "ping";
 
 struct TunnelConn {
-    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    state: ConnState,
     peer_id: String,
     metrics: ForwardPeerRuntime,
     notify_remote: bool,
@@ -63,6 +72,37 @@ struct TunnelConn {
     /// for this conn, to detect the gaps/duplicates described on
     /// [`TunnelMessage::seq`]. See [`tunnel::SeqState`].
     recv_seq: tunnel::SeqState,
+}
+
+/// A conn's lifecycle state, in between being tracked (on receiving a
+/// `connect`, or opening one locally) and untracked (on `close`).
+///
+/// Remote-initiated conns start `Pending` -- see `handle_remote_connect` --
+/// so that awaiting (possibly human-gated, unbounded) authorization never
+/// blocks this forward's single message-processing loop for every peer
+/// sharing the target (Finding (A)). Locally-initiated conns (see
+/// `handle_local_connection`) go straight to `Active`, since there's no
+/// authorization step on that side.
+enum ConnState {
+    /// `connect` has been accepted for tracking (so a duplicate delivery of
+    /// the same `connect` is recognized and ignored -- Finding (B)) but no
+    /// backend `TcpStream` exists yet: authorization is in flight on a
+    /// spawned task (see `tunnel::authorize_and_activate`). Inbound `data`
+    /// for this conn is buffered here, in arrival order, instead of being
+    /// dropped or blocking the caller; `handle_remote_data` still runs it
+    /// through `recv_seq` at buffer time, so gap/duplicate detection sees
+    /// every message exactly once, whether or not the conn ever activates.
+    /// Replayed verbatim (no second seq check) once/if promoted to
+    /// `Active`. Bounded by `PENDING_DATA_BUFFER_MAX_MSGS`/`_BYTES`; a conn
+    /// that overflows the buffer is denied and closed.
+    Pending {
+        buffered: Vec<Vec<u8>>,
+        buffered_bytes: usize,
+    },
+    /// A backend `TcpStream` is open and `writer` is its write half.
+    Active {
+        writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    },
 }
 
 pub struct TcpManager {
@@ -248,7 +288,9 @@ impl TcpManager {
     ) {
         let metrics = self.runtime.peer(peer_id);
         let tc = TunnelConn {
-            writer: Arc::new(tokio::sync::Mutex::new(write_half)),
+            state: ConnState::Active {
+                writer: Arc::new(tokio::sync::Mutex::new(write_half)),
+            },
             peer_id: peer_id.to_string(),
             metrics: metrics.clone(),
             notify_remote,
@@ -265,11 +307,115 @@ impl TcpManager {
         self.ensure_keepalive_task().await;
     }
 
+    /// Tracks a freshly arrived remote `connect` as `Pending`, ahead of --
+    /// and without waiting for -- authorization. The caller (see
+    /// `tunnel::handle_remote_connect`) is expected to spawn
+    /// `tunnel::authorize_and_activate` immediately after this returns.
+    /// Deliberately does not call `ensure_keepalive_task`: a pending conn
+    /// isn't a live backend connection yet, so there's nothing to keep warm
+    /// until `promote_pending_conn` runs.
+    async fn track_pending_conn(&self, conn_id: &str, peer_id: &str) {
+        let metrics = self.runtime.peer(peer_id);
+        let tc = TunnelConn {
+            state: ConnState::Pending {
+                buffered: Vec::new(),
+                buffered_bytes: 0,
+            },
+            peer_id: peer_id.to_string(),
+            metrics,
+            notify_remote: true,
+            recv_seq: tunnel::SeqState::new(),
+        };
+        self.conns
+            .write()
+            .await
+            .insert(conn_id.to_string(), Arc::new(RwLock::new(tc)));
+    }
+
+    /// Promotes a tracked `Pending` conn to `Active` once authorization has
+    /// allowed it and its backend `TcpStream` is open, replaying any `data`
+    /// buffered while authorization was in flight (in arrival order; their
+    /// seq numbers were already validated at buffer time by
+    /// `handle_remote_data`, so this is a plain write, not a second pass
+    /// through `recv_seq`).
+    ///
+    /// Holds this conn's own lock for the whole replay so that a `data`
+    /// message arriving concurrently (which also needs this lock, see
+    /// `handle_remote_data`) can't race a still-buffered write and land on
+    /// the socket out of order -- it simply waits for the replay to finish,
+    /// then proceeds as a normal `Active`-conn write. Note this only
+    /// serializes traffic for *this* conn; other conns/targets are
+    /// unaffected.
+    ///
+    /// Returns `false` (leaving `write_half` to be dropped, closing the
+    /// fresh backend socket) if `conn_id` is no longer tracked, or is no
+    /// longer `Pending`, by the time this runs -- e.g. it was denied,
+    /// overflowed, or closed by the peer while the backend `TcpStream` was
+    /// connecting.
+    async fn promote_pending_conn(
+        &self,
+        conn_id: &str,
+        write_half: tokio::net::tcp::OwnedWriteHalf,
+    ) -> bool {
+        let tc = {
+            let conns = self.conns.read().await;
+            conns.get(conn_id).cloned()
+        };
+        let Some(tc) = tc else {
+            return false;
+        };
+
+        let mut guard = tc.write().await;
+        if matches!(guard.state, ConnState::Active { .. }) {
+            return false;
+        }
+        let ConnState::Pending { buffered, .. } = std::mem::replace(
+            &mut guard.state,
+            ConnState::Active {
+                writer: Arc::new(tokio::sync::Mutex::new(write_half)),
+            },
+        ) else {
+            unreachable!("just checked for Pending above");
+        };
+        guard.metrics.record_conn_open();
+        let writer = match &guard.state {
+            ConnState::Active { writer } => writer.clone(),
+            ConnState::Pending { .. } => unreachable!("just promoted to Active above"),
+        };
+        let metrics = guard.metrics.clone();
+        self.ensure_keepalive_task().await;
+
+        for payload in buffered {
+            if payload.is_empty() {
+                continue;
+            }
+            let mut w = writer.lock().await;
+            if let Err(e) = w.write_all(&payload).await {
+                log_tcp_io_error("failed to write buffered tunnel data to tcp", &e);
+                drop(w);
+                drop(guard);
+                self.close_conn(conn_id, true).await;
+                return true;
+            }
+            metrics.record_bytes_out(payload.len());
+        }
+        true
+    }
+
     async fn close_conn(&self, conn_id: &str, notify_remote: bool) {
         let tc = self.conns.write().await.remove(conn_id);
         if let Some(tc) = tc {
             let tc = tc.read().await;
-            tc.metrics.record_conn_close();
+            // Only a promoted (`Active`) conn was ever counted as open --
+            // see `promote_pending_conn` -- so only decrement for those.
+            // Closing a still-`Pending` conn (denied/overflowed/peer-closed
+            // before authorization resolved) must not touch the counter, or
+            // it would spuriously decrement some *other*, still-open conn's
+            // share of it (the counter is shared per forward/peer, not
+            // per-conn).
+            if matches!(tc.state, ConnState::Active { .. }) {
+                tc.metrics.record_conn_close();
+            }
             if notify_remote && tc.notify_remote {
                 let close_msg = TunnelMessage {
                     msg_type: MSG_TYPE_CLOSE.into(),
@@ -302,25 +448,28 @@ impl TcpManager {
         retry_with_backoff(|| self.send_to(peer_id, msg), shutdown).await
     }
 
+    /// Closes every conn currently tracked for `peer_id`. Unlike a
+    /// `try_read`-based filter (which would silently -- and permanently,
+    /// since nothing ever retries it -- skip a conn whose lock happens to be
+    /// held at the moment this runs, e.g. mid-write in `handle_remote_data`
+    /// or `promote_pending_conn`, leaking it forever against a departed
+    /// peer; Finding (C)), this snapshots the candidate conns first and then
+    /// properly awaits each one's own lock, so a momentarily-contended conn
+    /// still gets closed once that other access finishes. Safe to block on
+    /// briefly here: this only ever runs from the leave-grace timer
+    /// callback (see `schedule_close_all_for_peer`), not a hot path.
     async fn close_all_for_peer(&self, peer_id: &str) {
-        let mut conns = self.conns.write().await;
-        let to_remove: Vec<(String, ForwardPeerRuntime)> = conns
+        let candidates: Vec<(String, Arc<RwLock<TunnelConn>>)> = self
+            .conns
+            .read()
+            .await
             .iter()
-            .filter_map(|(id, tc)| {
-                if let Ok(tc) = tc.try_read() {
-                    if tc.peer_id == peer_id {
-                        Some((id.clone(), tc.metrics.clone()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
+            .map(|(id, tc)| (id.clone(), tc.clone()))
             .collect();
-        for (id, metrics) in to_remove {
-            if conns.remove(&id).is_some() {
-                metrics.record_conn_close();
+
+        for (id, tc) in candidates {
+            if tc.read().await.peer_id == peer_id {
+                self.close_conn(&id, false).await;
             }
         }
     }

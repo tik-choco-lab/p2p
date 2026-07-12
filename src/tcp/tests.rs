@@ -3,8 +3,11 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
-use crate::auth::allow_all;
+use crate::auth::{
+    allow_all, AuthDecision, AuthFuture, AuthRequest, ConnectionAuthorizer, SharedAuthorizer,
+};
 use crate::forward_runtime::ForwardRuntime;
 use crate::rtc::RTCManager;
 
@@ -435,4 +438,318 @@ async fn ping_and_unknown_message_types_are_ignored_gracefully() {
     // Neither message type is recognized as a close/data/connect, so the
     // existing conn must be untouched.
     assert!(mgr.conns.read().await.contains_key("conn-1"));
+}
+
+// --- pending-authorization connect handling (Findings A/B/C) ---------------
+
+/// Like `test_manager`, but with a caller-chosen `remote_addr` and
+/// `authorizer` -- needed to exercise `handle_remote_connect`'s real
+/// `TcpStream::connect`/authorization flow instead of the local-conn-only
+/// bookkeeping the tests above cover via `track_conn`.
+fn test_manager_with(remote_addr: String, authorizer: SharedAuthorizer) -> Arc<TcpManager> {
+    Arc::new(TcpManager {
+        rtc_manager: RTCManager::for_test("self-node"),
+        conns: Arc::new(RwLock::new(HashMap::new())),
+        remote_addr,
+        target: "tcp:22".to_string(),
+        runtime: ForwardRuntime::new(),
+        authorizer,
+        peer_close_epoch: Arc::new(RwLock::new(HashMap::new())),
+        keepalive_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    })
+}
+
+/// A bound loopback listener plus its address string, suitable for
+/// `TcpManager::remote_addr` so an allowed `connect`'s `TcpStream::connect`
+/// has something real to connect to.
+async fn spawn_backend_listener() -> (String, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    (addr, listener)
+}
+
+fn connect_msg(conn_id: &str, target: &str) -> TunnelMessage {
+    TunnelMessage {
+        msg_type: MSG_TYPE_CONNECT.into(),
+        conn_id: conn_id.to_string(),
+        target: target.to_string(),
+        payload: None,
+        seq: None,
+    }
+}
+
+/// Test double whose `authorize` doesn't resolve until the paired
+/// `oneshot::Sender` (held by the test) sends a decision -- lets a test
+/// deterministically control exactly when a `Pending` conn's authorization
+/// resolves, instead of racing a real (instant) authorizer.
+struct GatedAuthorizer {
+    rx: tokio::sync::Mutex<Option<oneshot::Receiver<AuthDecision>>>,
+}
+
+impl GatedAuthorizer {
+    fn new(rx: oneshot::Receiver<AuthDecision>) -> Self {
+        Self {
+            rx: tokio::sync::Mutex::new(Some(rx)),
+        }
+    }
+}
+
+impl ConnectionAuthorizer for GatedAuthorizer {
+    fn authorize<'a>(&'a self, _req: &'a AuthRequest) -> AuthFuture<'a> {
+        Box::pin(async move {
+            let rx = self
+                .rx
+                .lock()
+                .await
+                .take()
+                .expect("GatedAuthorizer.authorize called more than once in this test");
+            rx.await.unwrap_or(AuthDecision::Deny)
+        })
+    }
+}
+
+/// Test double that never resolves for `blocked_peer` (simulating a human
+/// never answering a TUI authorization prompt) and immediately allows
+/// everyone else -- used to prove that one peer's stuck authorization
+/// doesn't stall another peer's traffic on the same target/forward.
+struct SelectiveBlockAuthorizer {
+    blocked_peer: String,
+}
+
+impl ConnectionAuthorizer for SelectiveBlockAuthorizer {
+    fn authorize<'a>(&'a self, req: &'a AuthRequest) -> AuthFuture<'a> {
+        Box::pin(async move {
+            if req.peer_id == self.blocked_peer {
+                std::future::pending::<()>().await;
+                unreachable!("a pending future never resolves");
+            }
+            AuthDecision::Allow
+        })
+    }
+}
+
+#[tokio::test]
+async fn duplicate_connect_for_already_tracked_conn_is_a_no_op() {
+    let (addr, listener) = spawn_backend_listener().await;
+    let mgr = test_manager_with(addr, allow_all());
+
+    let connect = connect_msg("conn-1", &mgr.target);
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&connect).unwrap())
+        .await;
+
+    // The (single) backend connection the first connect should open.
+    let (server, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("timed out waiting for the backend connection")
+        .unwrap();
+    let (mut server_read, _server_write) = server.into_split();
+    yield_many().await;
+    assert!(mgr.conns.read().await.contains_key("conn-1"));
+
+    // Advance recv_seq so a reset would be observable below.
+    let msg1 = data_msg("conn-1", &mgr.target, &[1], Some(1));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg1).unwrap())
+        .await;
+    let mut first = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(1), server_read.read_exact(&mut first))
+        .await
+        .expect("timed out waiting for seq-1 data")
+        .unwrap();
+    assert_eq!(first, [1]);
+
+    // A redelivered connect for the same conn_id must be ignored outright:
+    // no re-authorization, no second TcpStream, no clobbering the tracked
+    // conn (Finding (B)).
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&connect).unwrap())
+        .await;
+    yield_many().await;
+
+    let second_accept = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+    assert!(
+        second_accept.is_err(),
+        "duplicate connect must not open a second TcpStream"
+    );
+
+    // seq state must be undisturbed by the duplicate: if `track_conn` had
+    // been called again (as the old code did), `recv_seq` would have been
+    // replaced with a fresh `SeqState` expecting seq 1 again, and this seq-2
+    // message would be misjudged as a gap and close the conn.
+    let msg2 = data_msg("conn-1", &mgr.target, &[2], Some(2));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg2).unwrap())
+        .await;
+    let mut second = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(1), server_read.read_exact(&mut second))
+        .await
+        .expect("timed out waiting for seq-2 data -- recv_seq may have been reset")
+        .unwrap();
+    assert_eq!(second, [2]);
+    assert!(mgr.conns.read().await.contains_key("conn-1"));
+}
+
+#[tokio::test]
+async fn data_while_authorization_pending_is_buffered_and_replayed_in_order_on_allow() {
+    let (tx, rx) = oneshot::channel();
+    let (addr, listener) = spawn_backend_listener().await;
+    let mgr = test_manager_with(addr, Arc::new(GatedAuthorizer::new(rx)));
+
+    let connect = connect_msg("conn-1", &mgr.target);
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&connect).unwrap())
+        .await;
+    // `connect` returns immediately even though authorization hasn't
+    // resolved -- the conn is tracked (Pending) right away.
+    assert!(mgr.conns.read().await.contains_key("conn-1"));
+
+    for (seq, byte) in [(1u64, 1u8), (2, 2), (3, 3)] {
+        let msg = data_msg("conn-1", &mgr.target, &[byte], Some(seq));
+        mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg).unwrap())
+            .await;
+    }
+
+    // Nothing should have reached a backend yet -- still pending.
+    let early_accept = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+    assert!(
+        early_accept.is_err(),
+        "no backend connection should exist before authorization resolves"
+    );
+
+    tx.send(AuthDecision::Allow).unwrap();
+
+    let (server, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("timed out waiting for the backend connection after Allow")
+        .unwrap();
+    let (mut server_read, _server_write) = server.into_split();
+    let mut buf = [0u8; 3];
+    tokio::time::timeout(Duration::from_secs(1), server_read.read_exact(&mut buf))
+        .await
+        .expect("timed out waiting for the replayed buffered data")
+        .unwrap();
+    assert_eq!(buf, [1, 2, 3], "buffered data must replay in arrival order");
+}
+
+#[tokio::test]
+async fn data_while_authorization_pending_is_dropped_with_close_on_deny() {
+    let (tx, rx) = oneshot::channel();
+    let mgr = test_manager_with(String::new(), Arc::new(GatedAuthorizer::new(rx)));
+
+    let connect = connect_msg("conn-1", &mgr.target);
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&connect).unwrap())
+        .await;
+    assert!(mgr.conns.read().await.contains_key("conn-1"));
+
+    let msg = data_msg("conn-1", &mgr.target, &[1], Some(1));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg).unwrap())
+        .await;
+    assert!(
+        mgr.conns.read().await.contains_key("conn-1"),
+        "data must be buffered, not dropped, while still pending"
+    );
+
+    tx.send(AuthDecision::Deny).unwrap();
+    yield_many().await;
+
+    assert!(
+        !mgr.conns.read().await.contains_key("conn-1"),
+        "a denied conn (and its buffered data) must be untracked"
+    );
+}
+
+#[tokio::test]
+async fn pending_buffer_overflow_denies_and_closes_the_conn() {
+    // Never resolved -- keeps the conn Pending for the whole test, so the
+    // overflow is triggered purely by buffering too many messages, not by a
+    // race with authorization resolving.
+    let (_tx, rx) = oneshot::channel();
+    let mgr = test_manager_with(String::new(), Arc::new(GatedAuthorizer::new(rx)));
+
+    let connect = connect_msg("conn-1", &mgr.target);
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&connect).unwrap())
+        .await;
+    assert!(mgr.conns.read().await.contains_key("conn-1"));
+
+    for seq in 1..=(PENDING_DATA_BUFFER_MAX_MSGS as u64 + 1) {
+        let msg = data_msg("conn-1", &mgr.target, &[0], Some(seq));
+        mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg).unwrap())
+            .await;
+    }
+
+    assert!(
+        !mgr.conns.read().await.contains_key("conn-1"),
+        "conn should be denied and closed once its pending data buffer overflows"
+    );
+}
+
+#[tokio::test]
+async fn pending_authorization_for_one_peer_does_not_block_another_peers_traffic() {
+    let authorizer: SharedAuthorizer = Arc::new(SelectiveBlockAuthorizer {
+        blocked_peer: "peer-a".to_string(),
+    });
+    let (addr, listener) = spawn_backend_listener().await;
+    let mgr = test_manager_with(addr, authorizer);
+
+    // Peer A's connect: authorization for it never resolves. Before the
+    // Finding (A) fix this awaited `authorize()` inline and would hang here
+    // forever; the timeout below is what actually proves the fix.
+    let connect_a = connect_msg("conn-a", &mgr.target);
+    let connect_a_result = tokio::time::timeout(
+        Duration::from_millis(500),
+        mgr.on_tunnel_message("peer-a", &serde_json::to_vec(&connect_a).unwrap()),
+    )
+    .await;
+    assert!(
+        connect_a_result.is_ok(),
+        "handle_remote_connect must return promptly even though peer-a's \
+         authorization never resolves"
+    );
+    assert!(mgr.conns.read().await.contains_key("conn-a"));
+
+    // Peer B's connect arrives on the same target/manager afterward (as it
+    // would from the shared per-target message loop) and must be processed
+    // -- and fully authorized/connected -- without waiting on peer A's
+    // still-pending authorization.
+    let connect_b = connect_msg("conn-b", &mgr.target);
+    let connect_b_result = tokio::time::timeout(
+        Duration::from_millis(500),
+        mgr.on_tunnel_message("peer-b", &serde_json::to_vec(&connect_b).unwrap()),
+    )
+    .await;
+    assert!(connect_b_result.is_ok());
+
+    let accepted = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+    assert!(
+        accepted.is_ok(),
+        "peer B's connection should complete despite peer A's pending authorization"
+    );
+
+    // Peer A's conn is still tracked (Pending) throughout -- its
+    // authorization really is still in flight, not silently dropped.
+    assert!(mgr.conns.read().await.contains_key("conn-a"));
+}
+
+#[tokio::test]
+async fn close_all_for_peer_removes_a_conn_even_when_briefly_lock_contended() {
+    let mgr = test_manager();
+    mgr.track_conn("conn-1", dummy_write_half().await, "peer-1", true)
+        .await;
+
+    let tc = mgr.conns.read().await.get("conn-1").unwrap().clone();
+    let held = tokio::spawn(async move {
+        let _guard = tc.write().await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // `_guard` dropped here, releasing the lock.
+    });
+
+    // Give the spawned task a chance to acquire the lock before we race it.
+    yield_many().await;
+
+    // While the lock is (briefly) held elsewhere, `close_all_for_peer` must
+    // still end up closing the conn instead of silently skipping it the way
+    // the old `try_read`-based filter did (Finding (C)).
+    mgr.close_all_for_peer("peer-1").await;
+
+    held.await.unwrap();
+    assert!(
+        !mgr.conns.read().await.contains_key("conn-1"),
+        "conn should be closed once its briefly-contended lock is released"
+    );
 }

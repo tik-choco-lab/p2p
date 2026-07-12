@@ -6,6 +6,9 @@ use tokio::sync::RwLock;
 
 type ChatHandler = Arc<dyn Fn(String, String) + Send + Sync>;
 type PeerHandler = Arc<dyn Fn(String) + Send + Sync>;
+/// A peer join/leave hook: `(peer_id, session epoch)`. See
+/// `RTCManagerInner::peer_epochs`.
+pub(super) type PeerEpochHandler = Arc<dyn Fn(String, u64) + Send + Sync>;
 pub(super) type FwdReqHandler = Arc<dyn Fn(String, super::ForwardRequestEvent) + Send + Sync>;
 pub(super) type FwdRespHandler = Arc<dyn Fn(String, super::ForwardResponseEvent) + Send + Sync>;
 
@@ -45,6 +48,11 @@ pub(super) struct RTCManagerInner {
     pub(super) peers: RwLock<HashSet<String>>,
     pub(super) peer_roles: RwLock<HashMap<String, PeerRole>>,
     pub(super) peer_forward_keys: RwLock<HashMap<String, HashSet<String>>>,
+    /// Per-peer session epoch, incremented on each `EVENT_JOIN` for that
+    /// `peer_id`. Lets later layers (e.g. auth/negotiation purge) tell a
+    /// fresh session for a peer apart from one that never disconnected.
+    /// `0` means the peer has never joined.
+    pub(super) peer_epochs: RwLock<HashMap<String, u64>>,
     pub(super) self_forward_keys: RwLock<HashSet<String>>,
     pub(super) default_tunnel_target: RwLock<Option<String>>,
     /// Round-robin cursor per target key, used to load-balance connect-side
@@ -60,6 +68,8 @@ pub(super) struct RTCManagerInner {
     pub(super) tunnel_close_handlers: RwLock<Vec<PeerHandler>>,
     pub(super) stdio_close_handlers: RwLock<Vec<PeerHandler>>,
     pub(super) peer_conn_handlers: RwLock<Vec<PeerHandler>>,
+    pub(super) peer_join_handlers: RwLock<Vec<PeerEpochHandler>>,
+    pub(super) peer_leave_handlers: RwLock<Vec<PeerEpochHandler>>,
     pub(super) forward_request_handlers: RwLock<Vec<FwdReqHandler>>,
     pub(super) forward_response_handlers: RwLock<Vec<FwdRespHandler>>,
 }
@@ -72,6 +82,7 @@ impl RTCManagerInner {
             peers: RwLock::new(HashSet::new()),
             peer_roles: RwLock::new(HashMap::new()),
             peer_forward_keys: RwLock::new(HashMap::new()),
+            peer_epochs: RwLock::new(HashMap::new()),
             self_forward_keys: RwLock::new(HashSet::new()),
             default_tunnel_target: RwLock::new(None),
             peer_rr_cursor: RwLock::new(HashMap::new()),
@@ -84,6 +95,8 @@ impl RTCManagerInner {
             tunnel_close_handlers: RwLock::new(Vec::new()),
             stdio_close_handlers: RwLock::new(Vec::new()),
             peer_conn_handlers: RwLock::new(Vec::new()),
+            peer_join_handlers: RwLock::new(Vec::new()),
+            peer_leave_handlers: RwLock::new(Vec::new()),
             forward_request_handlers: RwLock::new(Vec::new()),
             forward_response_handlers: RwLock::new(Vec::new()),
         }
