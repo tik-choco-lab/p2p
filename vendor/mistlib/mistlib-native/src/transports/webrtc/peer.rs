@@ -7,8 +7,9 @@ use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -25,6 +26,29 @@ use webrtc::track::track_remote::TrackRemote;
 const ISOLATION_RECOVERY_DELAY_MS: u64 = 10;
 #[cfg(not(test))]
 const ISOLATION_RECOVERY_DELAY_MS: u64 = 3000;
+
+/// Upper bound on not-yet-sent messages buffered per peer in its
+/// [`Peer::spawn_send_queue`] drainer -- both while waiting for an in-order
+/// slot behind earlier queued sends, and while the target DataChannel isn't
+/// `Open` yet (e.g. mid ICE-restart, within `DISCONNECTED_GRACE_MS`). Sized
+/// well above what a typical application send rate produces during one grace
+/// period (5s in production) so a brief outage doesn't lose messages
+/// outright, while still bounding memory for a peer that never recovers --
+/// that case is reaped by the sweeper (`sweeper::decide_grace_expiry`), which
+/// tears down the whole `Peer` (and this queue with it) via `close_all`.
+pub(crate) const PEER_SEND_QUEUE_CAPACITY: usize = 256;
+
+/// Poll interval [`Peer::spawn_send_queue`]'s drainer uses while waiting for
+/// a queued message's target DataChannel to become `Open`. There is no
+/// cheap async "wait until open" signal exposed by `webrtc-rs`'s
+/// `RTCDataChannel` (only the `on_open` callback, which is already spoken
+/// for by `setup_dc_open_handler`), so this mirrors the existing
+/// `ready_state()`-polling idiom used elsewhere in this module (e.g. the
+/// sweeper).
+#[cfg(test)]
+const SEND_QUEUE_POLL_INTERVAL_MS: u64 = 5;
+#[cfg(not(test))]
+const SEND_QUEUE_POLL_INTERVAL_MS: u64 = 20;
 
 /// Attempts for [`send_signaling_with_retry`]'s bounded retry of a
 /// fire-and-forget signaling send (ICE candidates today; see its call site in
@@ -185,6 +209,16 @@ pub struct Peer {
     /// its turn and re-observe the *actual* current state instead of acting
     /// on a stale snapshot.
     pub negotiating: tokio::sync::Mutex<()>,
+    /// Sends a message into this peer's ordered send queue -- see
+    /// `spawn_send_queue`'s doc comment for why this exists.
+    /// `WebRtcTransport::send` (`transports/webrtc.rs`) is the only producer.
+    pub(crate) send_tx: mpsc::Sender<QueuedSend>,
+}
+
+/// One not-yet-sent message waiting in a [`Peer`]'s send queue.
+pub(crate) struct QueuedSend {
+    pub data: Bytes,
+    pub method: DeliveryMethod,
 }
 
 /// Shared transport-level state passed into peer handler setup functions.
@@ -674,6 +708,115 @@ async fn remove_peer_if_current(
 }
 
 impl Peer {
+    /// Spawns this peer's ordered send-queue drainer and returns the sender
+    /// half, which becomes `Peer::send_tx`.
+    ///
+    /// Before this existed, `WebRtcTransport::send` called `dc.send()`
+    /// directly, and `MistEngine::handle_action_for` (`engine/action.rs`)
+    /// invoked it from an independent fire-and-forget `tokio::spawn` per
+    /// outbound message. Overlay sequence numbers are stamped synchronously
+    /// and in call order (`OverlayRouter::wrap_data`/`next_seq`) before any
+    /// of those tasks are spawned, but the spawned tasks then raced each
+    /// other for the actual `dc.send()` call -- so the DataChannel write
+    /// order (and therefore the order bytes actually left the wire in)
+    /// could differ from the seq order, feeding the receiver's
+    /// `ReorderBuffer` with self-inflicted reordering purely from this
+    /// send-side race, not from the network. Routing every send for a peer
+    /// through this single-consumer queue instead makes the DataChannel
+    /// write order match the call order that produced the seq numbers,
+    /// while sends to *different* peers remain fully concurrent (each
+    /// `Peer` has its own queue and drainer task).
+    ///
+    /// As a side effect this also stops real message loss during a brief
+    /// `Open` -> not-`Open` blip (e.g. an ICE restart): a message enqueued
+    /// while its target DataChannel isn't `Open` yet waits in the queue
+    /// instead of being dropped immediately, and is sent as soon as the
+    /// channel (re)opens -- typically well within the peer's disconnect
+    /// grace period (`DISCONNECTED_GRACE_MS`), since a peer that never
+    /// recovers is reaped by the sweeper, which cancels `cancel_token` and
+    /// so tears this drainer down along with the rest of the peer.
+    pub(crate) fn spawn_send_queue(
+        node: NodeId,
+        channels: Arc<RwLock<HashMap<DeliveryMethod, Arc<RTCDataChannel>>>>,
+        cancel_token: CancellationToken,
+    ) -> mpsc::Sender<QueuedSend> {
+        let (tx, mut rx) = mpsc::channel::<QueuedSend>(PEER_SEND_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                let queued = tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    queued = rx.recv() => match queued {
+                        Some(queued) => queued,
+                        None => break,
+                    },
+                };
+
+                // Wait for this message's channel to be `Open`, buffering it
+                // (and everything queued behind it) rather than dropping it
+                // -- see the doc comment above. Bounded by `cancel_token`:
+                // once the peer is torn down (grace period expired, explicit
+                // disconnect, ...) this returns `None` and the message below
+                // is dropped with the rest of the queue.
+                let dc = loop {
+                    let candidate = {
+                        let channels = channels.read().await;
+                        channels.get(&queued.method).cloned()
+                    };
+                    match candidate {
+                        Some(dc) if dc.ready_state() == RTCDataChannelState::Open => {
+                            break Some(dc)
+                        }
+                        Some(_) => {
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => break None,
+                                _ = tokio::time::sleep(Duration::from_millis(SEND_QUEUE_POLL_INTERVAL_MS)) => {}
+                            }
+                        }
+                        None => break None,
+                    }
+                };
+
+                let Some(dc) = dc else {
+                    tracing::warn!(
+                        "[SendQueue] dropping queued {:?} message to {} (channel never became \
+                         available before the peer was torn down)",
+                        queued.method,
+                        node
+                    );
+                    continue;
+                };
+
+                if let Err(err) = dc.send(&queued.data).await {
+                    tracing::warn!(
+                        "[SendQueue] failed to send queued {:?} message to {}: {:?}",
+                        queued.method,
+                        node,
+                        err
+                    );
+                    continue;
+                }
+                STATS.add_send_frame(&queued.data);
+            }
+
+            // The peer was torn down (cancelled) or `send_tx` was dropped
+            // with messages still buffered -- drop them explicitly and warn
+            // once with the count, instead of silently discarding when `rx`
+            // itself is dropped at the end of this task.
+            let mut dropped = 0usize;
+            while rx.try_recv().is_ok() {
+                dropped += 1;
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    "[SendQueue] dropped {} queued message(s) to {} on peer teardown",
+                    dropped,
+                    node
+                );
+            }
+        });
+        tx
+    }
+
     pub async fn close_all(&self) {
         self.cancel_token.cancel();
         self.detach_peer_handlers();

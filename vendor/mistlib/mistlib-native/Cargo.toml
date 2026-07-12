@@ -34,3 +34,6 @@ rand = "0.8"
 web-time = "1.1.0"
 mimalloc = "0.1"
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

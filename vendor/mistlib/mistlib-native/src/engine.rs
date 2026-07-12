@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::RwLock as StdRwLock;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -92,7 +93,17 @@ pub struct MistEngine {
     /// what the roomless legacy FFI surface (send_message/update_position/
     /// on_connected/...) falls back to when it isn't scoped to a room -- see
     /// `primary_session`/`resolve_unicast_session` below and SPEC-15 rules 5-7.
-    pub(crate) sessions: RwLock<Vec<(String, Arc<SessionCtx>)>>,
+    /// `std::sync::RwLock`, not `tokio::sync::RwLock`: `handle_action_in_room`
+    /// (`engine/action.rs`) needs a synchronous, non-`.await` read of this
+    /// registry so an `OverlayAction::SendMessage` can be enqueued into its
+    /// target peer's ordered send queue inline, in the exact call order
+    /// overlay seq numbers were stamped in -- see that function's doc comment.
+    /// Every access here is a brief, uncontended read/write with no other
+    /// `.await` inside the critical section (verified across every method
+    /// below), so a blocking std lock is safe to take from async code, the
+    /// same pattern already used for `SessionCtx::node_store`/`aoi_nodes` and
+    /// most of `WebRtcTransport`'s own per-connection state.
+    pub(crate) sessions: StdRwLock<Vec<(String, Arc<SessionCtx>)>>,
     pub(crate) config: StdMutex<Config>,
     pub(crate) runtime: Runtime,
     pub(crate) self_id: StdMutex<NodeId>,
@@ -128,7 +139,7 @@ impl MistEngine {
             rust_event_callback,
             event_dispatch_tx,
             log_callback: StdMutex::new(None),
-            sessions: RwLock::new(Vec::new()),
+            sessions: StdRwLock::new(Vec::new()),
             config: StdMutex::new(Config::new_default()),
             runtime: Runtime::new().expect("Failed to create Tokio runtime"),
             self_id: StdMutex::new(NodeId("local".to_string())),
@@ -138,13 +149,24 @@ impl MistEngine {
     }
 
     pub async fn sessions_snapshot(&self) -> Vec<(String, Arc<SessionCtx>)> {
-        self.sessions.read().await.clone()
+        self.sessions.read().unwrap().clone()
     }
 
     pub async fn get_session(&self, room_id: &str) -> Option<Arc<SessionCtx>> {
+        self.get_session_sync(room_id)
+    }
+
+    /// Synchronous equivalent of [`get_session`](Self::get_session) -- see
+    /// `MistEngine::sessions`'s doc comment for why this needs to exist at
+    /// all: `handle_action_in_room` (`engine/action.rs`) must resolve a
+    /// session without an `.await`, so an `OverlayAction::SendMessage` can be
+    /// enqueued inline, in the exact order it was handed to `handle_action`,
+    /// instead of via a `tokio::spawn` whose execution order vs. other
+    /// spawned lookups is not guaranteed.
+    pub(crate) fn get_session_sync(&self, room_id: &str) -> Option<Arc<SessionCtx>> {
         self.sessions
             .read()
-            .await
+            .unwrap()
             .iter()
             .find(|(id, _)| id == room_id)
             .map(|(_, ctx)| ctx.clone())
@@ -153,7 +175,7 @@ impl MistEngine {
     pub async fn has_session(&self, room_id: &str) -> bool {
         self.sessions
             .read()
-            .await
+            .unwrap()
             .iter()
             .any(|(id, _)| id == room_id)
     }
@@ -163,7 +185,7 @@ impl MistEngine {
     pub async fn primary_session(&self) -> Option<Arc<SessionCtx>> {
         self.sessions
             .read()
-            .await
+            .unwrap()
             .first()
             .map(|(_, ctx)| ctx.clone())
     }
@@ -174,7 +196,7 @@ impl MistEngine {
     /// `join_room` call for the same room; either way, the caller must not
     /// start (`ENGINE.run`) the session it just built.
     pub async fn insert_session(&self, room_id: String, ctx: Arc<SessionCtx>) -> bool {
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.sessions.write().unwrap();
         if sessions.iter().any(|(id, _)| *id == room_id) {
             return false;
         }
@@ -183,13 +205,13 @@ impl MistEngine {
     }
 
     pub async fn remove_session(&self, room_id: &str) -> Option<Arc<SessionCtx>> {
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.sessions.write().unwrap();
         let index = sessions.iter().position(|(id, _)| id == room_id)?;
         Some(sessions.remove(index).1)
     }
 
     pub async fn remove_all_sessions(&self) -> Vec<(String, Arc<SessionCtx>)> {
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.sessions.write().unwrap();
         std::mem::take(&mut *sessions)
     }
 

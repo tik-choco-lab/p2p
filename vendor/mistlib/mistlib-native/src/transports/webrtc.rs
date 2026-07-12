@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use mistlib_core::signaling::{MessageContent, Signaler, SignalingData, SignalingType};
-use mistlib_core::stats::STATS;
 use mistlib_core::transport::{NetworkEventHandler, Transport};
 use mistlib_core::types::{ConnectionState, DeliveryMethod, NodeId};
 use std::collections::HashMap;
@@ -14,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
 use webrtc::api::API;
-use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
@@ -613,6 +611,76 @@ impl WebRtcTransport {
         self.last_disconnect_at.write().unwrap().clear();
         self.disconnected_since.write().unwrap().clear();
     }
+
+    /// Pushes `data` onto `peer`'s ordered send queue (`Peer::send_tx`,
+    /// drained by `Peer::spawn_send_queue`). Shared by the async
+    /// `Transport::send` (which resolves `peer` via an awaited read of
+    /// `self.peers`) and `try_enqueue_send` (which resolves it synchronously)
+    /// -- both ultimately just need to hand the message to the same
+    /// single-writer-per-peer queue.
+    fn enqueue_on_peer(
+        node: &NodeId,
+        peer: &Peer,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        peer.send_tx
+            .try_send(peer::QueuedSend { data, method })
+            .map_err(|_| {
+                mistlib_core::error::MistError::Internal(format!(
+                    "Send queue full for {:?} method {:?} (peer not keeping up or stuck disconnected)",
+                    node, method
+                ))
+            })
+    }
+
+    /// Fully synchronous version of `Transport::send` -- no `.await`
+    /// anywhere, so it can be called inline from `MistEngine::handle_action_for`
+    /// (`engine/action.rs`) without spawning a task for it. This is what
+    /// makes the fix in `Peer::spawn_send_queue` actually hold end to end:
+    /// that queue only preserves the order messages are *enqueued* in, so
+    /// the enqueue call itself must happen synchronously, in the exact order
+    /// `OverlayAction::SendMessage` actions were produced (overlay seq
+    /// numbers are stamped synchronously too, in `OverlayRouter::wrap_data`)
+    /// -- if this were spawned instead, N concurrently spawned enqueue calls
+    /// could still run in a different order than they were spawned in
+    /// (tokio's scheduler makes no such guarantee), which would silently
+    /// reintroduce the exact reordering bug this queue exists to fix.
+    ///
+    /// Uses `try_read()` (never blocks) rather than `.await` on `self.peers`:
+    /// that lock is only ever write-locked for brief, non-blocking swaps
+    /// (`replace_peer_and_close_old`, `cleanup_session_impl`, ...), so a
+    /// `try_read()` failure here is an exceedingly rare, transient race --
+    /// treated the same as any other momentarily-undeliverable case (message
+    /// dropped, caller logs the error), not worse than the loss this whole
+    /// fix is meant to reduce.
+    pub(crate) fn try_enqueue_send(
+        &self,
+        node: &NodeId,
+        data: Bytes,
+        method: DeliveryMethod,
+    ) -> mistlib_core::error::Result<()> {
+        self.check_message_size(data.len())?;
+
+        let peers = self.peers.try_read().map_err(|_| {
+            mistlib_core::error::MistError::Internal(format!(
+                "peers map momentarily locked while enqueueing send to {:?}",
+                node
+            ))
+        })?;
+        let peer = peers.get(node).ok_or_else(|| {
+            mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
+        })?;
+        Self::enqueue_on_peer(node, peer, data, method)
+    }
+
+    /// Synchronous broadcast built on `try_enqueue_send` -- see its doc
+    /// comment. Best-effort per target, exactly like the async `broadcast`.
+    pub(crate) fn try_enqueue_broadcast(&self, data: Bytes, method: DeliveryMethod) {
+        for target in self.get_connected_nodes() {
+            let _ = self.try_enqueue_send(&target, data.clone(), method);
+        }
+    }
 }
 
 impl WebRtcTransport {
@@ -663,26 +731,7 @@ impl Transport for WebRtcTransport {
             mistlib_core::error::MistError::Internal(format!("Node not found: {:?}", node))
         })?;
 
-        let dc = {
-            let dc_lock = peer.channels.read().await;
-            dc_lock.get(&method).cloned()
-        }
-        .ok_or_else(|| {
-            mistlib_core::error::MistError::Internal(format!("No DC for method {:?}", method))
-        })?;
-
-        if dc.ready_state() == RTCDataChannelState::Open {
-            dc.send(&data)
-                .await
-                .map_err(|e| mistlib_core::error::MistError::Internal(e.to_string()))?;
-            STATS.add_send_frame(&data);
-            return Ok(());
-        }
-        Err(mistlib_core::error::MistError::Internal(format!(
-            "Channel for {:?} is not open (state: {:?})",
-            method,
-            dc.ready_state()
-        )))
+        Self::enqueue_on_peer(node, &peer, data, method)
     }
 
     async fn broadcast(
@@ -829,4 +878,4 @@ impl WebRtcTransport {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
