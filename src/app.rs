@@ -1,6 +1,7 @@
 mod chat;
 mod connect;
 mod serve;
+pub(crate) mod session;
 mod shell;
 
 use std::path::{Path, PathBuf};
@@ -13,13 +14,13 @@ pub(crate) use serve::run_serve;
 #[allow(unused_imports)]
 pub(crate) use shell::{run_control_shell, run_tui};
 
-fn generate_room_id() -> String {
+pub(crate) fn generate_room_id() -> String {
     let mut buf = [0u8; 4];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
     hex::encode(buf)
 }
 
-async fn load_or_create_node_id() -> Result<String> {
+pub(crate) async fn load_or_create_node_id() -> Result<String> {
     let path = default_node_id_path();
     match tokio::fs::read_to_string(&path).await {
         Ok(text) => {

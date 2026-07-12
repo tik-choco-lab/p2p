@@ -200,7 +200,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = if let Some(msg) = &app.message {
         format!(" {} ", msg)
     } else {
-        " [a]dd forward  [d]elete  [Enter]expand  [Tab]focus  [t]rust  [y/n]approve  [q]uit "
+        " [a]dd forward  [d]elete  [Enter]expand  [Tab]focus  [t]rust  [y/n]approve  [w]eb ui  [q]uit "
             .to_string()
     };
     let p = Paragraph::new(hint).style(Style::default().add_modifier(Modifier::DIM));

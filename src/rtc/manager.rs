@@ -65,15 +65,15 @@ impl RTCManagerHandle {
 
         let weak = Arc::downgrade(&handle.inner);
         let runtime = tokio::runtime::Handle::current();
-        // Single FIFO worker for EVENT_RAW/EVENT_OVERLAY: mistlib delivers
-        // events to `dispatch_event` in strict order from one dispatch
-        // thread, and this worker processes each to completion before the
-        // next, preserving that order end to end (see `event::dispatch_event`
-        // and `event::run_payload_worker`).
+        // Single FIFO worker for EVENT_JOIN/EVENT_LEAVE/EVENT_RAW/EVENT_OVERLAY:
+        // mistlib delivers events to `dispatch_event` in strict order from
+        // one dispatch thread, and this worker processes each to completion
+        // before the next, preserving that order end to end (see
+        // `event::dispatch_event` and `event::run_payload_worker`).
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         runtime.spawn(event::run_payload_worker(weak.clone(), rx));
         mistlib::register_raw_handler(move |message_type, from, data| {
-            dispatch_event(&runtime, &weak, &tx, message_type, from, data);
+            dispatch_event(&weak, &tx, message_type, from, data);
         });
         let config = mistlib_config();
         let initialized = tokio::task::spawn_blocking(move || match config {
@@ -102,13 +102,20 @@ impl RTCManagerHandle {
         self.get_server_peers_for("").await
     }
 
+    /// Roles and forward keys are retained across a peer's leave (see
+    /// `event::handle_leave`) so a transient disconnect doesn't lose routing
+    /// information, so this filters both branches down to peers currently
+    /// present in `peers` -- otherwise a departed peer whose capabilities we
+    /// still remember would keep being routed to.
     pub async fn get_server_peers_for(&self, target: &str) -> Vec<String> {
+        let live = self.inner.peers.read().await;
+
         if !target.is_empty() {
             let keys = self.inner.peer_forward_keys.read().await;
             let matched = keys
                 .iter()
                 .filter_map(|(id, keys)| {
-                    if keys.contains(target) {
+                    if keys.contains(target) && live.contains(id) {
                         Some(id.clone())
                     } else {
                         None
@@ -124,7 +131,7 @@ impl RTCManagerHandle {
         roles
             .iter()
             .filter_map(|(id, role)| {
-                if *role == PeerRole::Server {
+                if *role == PeerRole::Server && live.contains(id) {
                     Some(id.clone())
                 } else {
                     None
@@ -150,6 +157,20 @@ impl RTCManagerHandle {
         let idx = *cursor % peers.len();
         *cursor = cursor.wrapping_add(1);
         Some(peers[idx].clone())
+    }
+
+    /// The peer's current session epoch: incremented on each `EVENT_JOIN`
+    /// for `peer_id`, `0` if the peer has never joined. Lets callers detect
+    /// a fresh session for a peer_id (e.g. to purge state scoped to the
+    /// prior session) versus a peer that never disconnected.
+    pub async fn peer_epoch(&self, peer_id: &str) -> u64 {
+        self.inner
+            .peer_epochs
+            .read()
+            .await
+            .get(peer_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub async fn connected_peers(&self) -> Vec<String> {

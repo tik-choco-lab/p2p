@@ -11,12 +11,6 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::prelude::*;
 
-use crate::auth::{AuthAuditLog, PendingAuthorizations, TrustStore};
-use crate::controller::ForwardController;
-use crate::forward_store::ForwardStore;
-use crate::negotiation::ForwardNegotiator;
-use crate::rtc::RTCManager;
-
 mod app;
 mod format;
 mod ui;
@@ -26,16 +20,9 @@ use app::App;
 const TICK: Duration = Duration::from_millis(120);
 const EVENT_POLL: Duration = Duration::from_millis(100);
 
-pub(crate) struct TuiContext {
-    pub(crate) room: String,
-    pub(crate) manager: RTCManager,
-    pub(crate) controller: ForwardController,
-    pub(crate) trust_store: TrustStore,
-    pub(crate) audit_log: AuthAuditLog,
-    pub(crate) pending_auth: PendingAuthorizations,
-    pub(crate) negotiator: ForwardNegotiator,
-    pub(crate) forward_store: ForwardStore,
-}
+/// The TUI drives the same shared session core as the Web UI; see
+/// `crate::app::session::SessionContext`.
+pub(crate) type TuiContext = crate::app::session::SessionContext;
 
 pub(crate) async fn run(ctx: TuiContext) -> Result<()> {
     enable_raw_mode()?;

@@ -71,7 +71,30 @@ impl PendingAuthorizations {
         }
     }
 
-    async fn enqueue(&self, request: AuthRequest) -> oneshot::Receiver<AuthDecision> {
+    /// Denies and removes every pending entry whose request came from
+    /// `peer_id`. Sending `Deny` into each oneshot unblocks the tcp layer's
+    /// waiting `authorize()` call for that entry, which then cleans up its
+    /// own pending conn. Does not persist anything to the trust store --
+    /// same as any other plain `Deny`, only an explicit `DenyAlways` does
+    /// that (see `PendingAuthorizer::decide`). Returns the number purged.
+    pub async fn purge_peer(&self, peer_id: &str) -> usize {
+        let mut inner = self.inner.lock().await;
+        let stale: Vec<u64> = inner
+            .pending
+            .iter()
+            .filter(|(_, item)| item.request.peer_id == peer_id)
+            .map(|(id, _)| *id)
+            .collect();
+        let count = stale.len();
+        for id in stale {
+            if let Some(item) = inner.pending.remove(&id) {
+                let _ = item.responder.send(AuthDecision::Deny);
+            }
+        }
+        count
+    }
+
+    async fn enqueue(&self, request: AuthRequest) -> (u64, oneshot::Receiver<AuthDecision>) {
         let (sender, receiver) = oneshot::channel();
         let mut inner = self.inner.lock().await;
         let id = inner.next_id;
@@ -83,7 +106,14 @@ impl PendingAuthorizations {
                 responder: sender,
             },
         );
-        receiver
+        (id, receiver)
+    }
+
+    /// Removes a pending entry without resolving it -- used when
+    /// `PendingAuthorizer::decide`'s wait times out with no responder ever
+    /// having claimed it, so no ghost row lingers in `list()`.
+    async fn remove_unresolved(&self, id: u64) {
+        self.inner.lock().await.pending.remove(&id);
     }
 
     #[cfg(test)]
@@ -91,9 +121,18 @@ impl PendingAuthorizations {
         &self,
         request: AuthRequest,
     ) -> oneshot::Receiver<AuthDecision> {
-        self.enqueue(request).await
+        self.enqueue(request).await.1
     }
 }
+
+/// How long a queued authorization request waits for a human decision
+/// (TUI/web/control-shell approve/deny) before it's treated as denied and
+/// dropped from the pending list. Bounds how long a peer can pin a
+/// connection open by simply never being answered (the operator stepped
+/// away, the UI was closed, etc); `purge_peer` handles the "peer itself
+/// disconnected" case separately and sooner. `pub(crate)` so tests can
+/// drive the clock past it deterministically.
+pub(crate) const DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[derive(Debug, Clone)]
 pub struct PendingAuthorizer {
@@ -152,8 +191,16 @@ impl PendingAuthorizer {
             return decision;
         }
 
-        let receiver = self.pending.enqueue(req.clone()).await;
-        let decision = receiver.await.unwrap_or(AuthDecision::Deny);
+        let (id, receiver) = self.pending.enqueue(req.clone()).await;
+        let decision = match tokio::time::timeout(DECISION_TIMEOUT, receiver).await {
+            Ok(result) => result.unwrap_or(AuthDecision::Deny),
+            Err(_elapsed) => {
+                // No decision within the timeout: drop the ghost entry so it
+                // doesn't linger in `list()` forever, and deny.
+                self.pending.remove_unresolved(id).await;
+                AuthDecision::Deny
+            }
+        };
         if let Some(trust) = trust_decision(decision) {
             let _ = self.store.remember(key, trust).await;
         }

@@ -50,7 +50,6 @@ async fn burst_of_raw_events_is_processed_in_order() {
     }
 
     let weak = Arc::downgrade(&manager.inner);
-    let runtime = tokio::runtime::Handle::current();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_payload_worker(weak.clone(), rx));
 
@@ -60,7 +59,6 @@ async fn burst_of_raw_events_is_processed_in_order() {
             data: seq.to_string().into_bytes(),
         });
         dispatch_event(
-            &runtime,
             &weak,
             &tx,
             mistlib::EVENT_RAW,
@@ -75,4 +73,65 @@ async fn burst_of_raw_events_is_processed_in_order() {
 
     let expected: Vec<String> = (0..N).map(|n| n.to_string()).collect();
     assert_eq!(*order.lock().unwrap(), expected);
+}
+
+/// Regression test for (A) in the manager-layer audit: `EVENT_JOIN`/
+/// `EVENT_LEAVE` used to be dispatched via independent `tokio::spawn` calls,
+/// so a rapid leave->rejoin for the same peer_id could have its join task
+/// finish before its leave task, leaving a live peer absent from `peers`.
+/// Now that join/leave share the same FIFO worker as payloads, arrival order
+/// (leave, then join) is guaranteed to be preserved, so the peer must always
+/// end up present. Runs many peer_id's worth of leave->join pairs on a
+/// multi-thread runtime to give a reordering bug every opportunity to show
+/// up if the fix regressed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rapid_leave_then_join_always_ends_with_peer_present() {
+    let manager = test_manager("self", PeerRole::Client);
+    let weak = Arc::downgrade(&manager.inner);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_payload_worker(weak.clone(), rx));
+
+    const ITERATIONS: u32 = 200;
+    for i in 0..ITERATIONS {
+        let peer_id = format!("peer-{i}");
+        dispatch_event(
+            &weak,
+            &tx,
+            mistlib::EVENT_LEAVE,
+            peer_id.clone(),
+            Vec::new(),
+        );
+        dispatch_event(&weak, &tx, mistlib::EVENT_JOIN, peer_id, Vec::new());
+    }
+
+    // Wait for every enqueued leave/join pair to actually be processed by
+    // registering a sentinel tunnel handler and dispatching one last event
+    // behind all of them, instead of guessing a sleep duration.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+    manager
+        .on_tunnel_message(move |_peer, _data| {
+            if let Some(done_tx) = done_tx.lock().unwrap().take() {
+                let _ = done_tx.send(());
+            }
+        })
+        .await;
+    let sentinel = encode(P2pPayload::Tunnel { data: vec![0] });
+    dispatch_event(
+        &weak,
+        &tx,
+        mistlib::EVENT_RAW,
+        "sentinel".to_string(),
+        sentinel,
+    );
+    done_rx.await.unwrap();
+
+    let connected = manager.connected_peers().await;
+    for i in 0..ITERATIONS {
+        let peer_id = format!("peer-{i}");
+        assert!(
+            connected.contains(&peer_id),
+            "{peer_id} missing after leave->join: reordering regressed"
+        );
+    }
 }
