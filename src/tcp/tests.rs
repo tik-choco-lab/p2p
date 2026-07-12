@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::auth::allow_all;
@@ -43,6 +44,217 @@ async fn yield_many() {
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
+}
+
+/// A real (loopback) TCP pair whose write half can be handed to `track_conn`
+/// (as the "downstream" socket `handle_remote_data` writes into) while the
+/// paired read half lets a test observe exactly what was written -- unlike
+/// `dummy_write_half`, which drops the peer side.
+async fn connected_write_and_readback() -> (
+    tokio::net::tcp::OwnedWriteHalf,
+    tokio::net::tcp::OwnedReadHalf,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let client = client.unwrap();
+    let (server, _) = accepted.unwrap();
+    let (_client_read, client_write) = client.into_split();
+    let (server_read, _server_write) = server.into_split();
+    (client_write, server_read)
+}
+
+fn data_msg(conn_id: &str, target: &str, payload: &[u8], seq: Option<u64>) -> TunnelMessage {
+    TunnelMessage {
+        msg_type: MSG_TYPE_DATA.into(),
+        conn_id: conn_id.to_string(),
+        target: target.to_string(),
+        payload: Some(payload.to_vec()),
+        seq,
+    }
+}
+
+// --- data seq gap/duplicate handling (end-to-end via on_tunnel_message) ----
+
+#[tokio::test]
+async fn in_order_seq_data_is_all_delivered() {
+    let mgr = test_manager();
+    let (write_half, mut read_half) = connected_write_and_readback().await;
+    mgr.track_conn("conn-1", write_half, "peer-1", true).await;
+
+    for (i, byte) in [1u8, 2, 3].into_iter().enumerate() {
+        let msg = data_msg("conn-1", &mgr.target, &[byte], Some((i + 1) as u64));
+        mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg).unwrap())
+            .await;
+    }
+
+    let mut buf = [0u8; 3];
+    tokio::time::timeout(Duration::from_secs(1), read_half.read_exact(&mut buf))
+        .await
+        .expect("timed out waiting for data")
+        .unwrap();
+    assert_eq!(buf, [1, 2, 3]);
+}
+
+#[tokio::test]
+async fn duplicate_seq_is_written_only_once() {
+    let mgr = test_manager();
+    let (write_half, mut read_half) = connected_write_and_readback().await;
+    mgr.track_conn("conn-1", write_half, "peer-1", true).await;
+
+    // seq 2 is redelivered (as `send_to_with_retry` can do when a send that
+    // actually succeeded looked like a failure to the sender).
+    for (seq, byte) in [(1u64, 1u8), (2, 2), (2, 2), (3, 3)] {
+        let msg = data_msg("conn-1", &mgr.target, &[byte], Some(seq));
+        mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg).unwrap())
+            .await;
+    }
+
+    let mut buf = [0u8; 3];
+    tokio::time::timeout(Duration::from_secs(1), read_half.read_exact(&mut buf))
+        .await
+        .expect("timed out waiting for data")
+        .unwrap();
+    assert_eq!(buf, [1, 2, 3], "duplicate seq 2 must not be written twice");
+
+    // Nothing else should ever arrive -- if the duplicate had been written,
+    // the extra byte `2` would be waiting here.
+    let mut extra = [0u8; 1];
+    let res = tokio::time::timeout(Duration::from_millis(100), read_half.read(&mut extra)).await;
+    assert!(
+        res.is_err(),
+        "no further bytes expected after the 3 deduped ones"
+    );
+}
+
+#[tokio::test]
+async fn seq_gap_closes_the_conn() {
+    let mgr = test_manager();
+    let (write_half, _read_half) = connected_write_and_readback().await;
+    mgr.track_conn("conn-1", write_half, "peer-1", true).await;
+
+    let msg1 = data_msg("conn-1", &mgr.target, &[1], Some(1));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg1).unwrap())
+        .await;
+    assert!(mgr.conns.read().await.contains_key("conn-1"));
+
+    // seq 2 never arrives (dropped by mistlib's ReorderBuffer) -- seq 3
+    // shows up next.
+    let msg3 = data_msg("conn-1", &mgr.target, &[3], Some(3));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg3).unwrap())
+        .await;
+
+    assert!(
+        !mgr.conns.read().await.contains_key("conn-1"),
+        "conn should be closed once a seq gap is detected"
+    );
+}
+
+#[tokio::test]
+async fn late_data_after_gap_close_is_dropped_safely() {
+    let mgr = test_manager();
+    let (write_half, mut read_half) = connected_write_and_readback().await;
+    mgr.track_conn("conn-1", write_half, "peer-1", true).await;
+
+    let msg1 = data_msg("conn-1", &mgr.target, &[1], Some(1));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg1).unwrap())
+        .await;
+
+    // seq 1 is accepted and legitimately written -- drain that expected
+    // byte before checking for any further (unexpected) writes below.
+    let mut first = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(1), read_half.read_exact(&mut first))
+        .await
+        .expect("timed out waiting for seq-1 data")
+        .unwrap();
+    assert_eq!(first, [1]);
+
+    // seq 2 never arrives -- seq 3 triggers a gap close.
+    let msg3 = data_msg("conn-1", &mgr.target, &[3], Some(3));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg3).unwrap())
+        .await;
+    assert!(!mgr.conns.read().await.contains_key("conn-1"));
+
+    // The "missing" seq 2 finally shows up late (e.g. mistlib's
+    // ReorderBuffer flushing a stale entry after the fact). The conn is
+    // already gone, so this must be a safe, silent no-op -- no panic, no
+    // resurrecting the conn, and nothing further written anywhere.
+    let msg2_late = data_msg("conn-1", &mgr.target, &[2], Some(2));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg2_late).unwrap())
+        .await;
+
+    assert!(!mgr.conns.read().await.contains_key("conn-1"));
+
+    // Nothing further must ever be written: either the read times out (the
+    // socket is still open but idle) or it sees a clean EOF (the closed
+    // conn's `TunnelConn`, and with it its `OwnedWriteHalf`, was dropped) --
+    // but never an actual byte from the dropped late message.
+    let mut extra = [0u8; 1];
+    match tokio::time::timeout(Duration::from_millis(100), read_half.read(&mut extra)).await {
+        Err(_) => {}    // timed out waiting -- nothing arrived
+        Ok(Ok(0)) => {} // EOF from the write half being dropped on close
+        Ok(Ok(n)) => panic!("unexpected {n} byte(s) written for the dropped late seq-2 message"),
+        Ok(Err(e)) => panic!("unexpected read error: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_payload_with_seq_still_consumes_the_seq_number() {
+    let mgr = test_manager();
+    let (write_half, mut read_half) = connected_write_and_readback().await;
+    mgr.track_conn("conn-1", write_half, "peer-1", true).await;
+
+    // seq 1 carries no payload (e.g. forwarded from a zero-byte TCP read) --
+    // it must still advance `next_expected`. Before the fix, the early
+    // return on an empty/missing payload in `handle_remote_data` bypassed
+    // `recv_seq.observe` entirely, so this seq would never be consumed and
+    // the next (non-empty) message below would be misjudged as a gap.
+    let empty_msg = TunnelMessage {
+        msg_type: MSG_TYPE_DATA.into(),
+        conn_id: "conn-1".into(),
+        target: mgr.target.clone(),
+        payload: None,
+        seq: Some(1),
+    };
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&empty_msg).unwrap())
+        .await;
+
+    let msg2 = data_msg("conn-1", &mgr.target, &[9], Some(2));
+    mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg2).unwrap())
+        .await;
+
+    assert!(
+        mgr.conns.read().await.contains_key("conn-1"),
+        "conn should still be open: the empty seq-1 message must have been \
+         consumed rather than treated as a gap"
+    );
+
+    let mut buf = [0u8; 1];
+    tokio::time::timeout(Duration::from_millis(500), read_half.read_exact(&mut buf))
+        .await
+        .expect("timed out waiting for data")
+        .unwrap();
+    assert_eq!(buf, [9]);
+}
+
+#[tokio::test]
+async fn legacy_sender_without_seq_still_delivers_data() {
+    let mgr = test_manager();
+    let (write_half, mut read_half) = connected_write_and_readback().await;
+    mgr.track_conn("conn-1", write_half, "peer-1", true).await;
+
+    for byte in [1u8, 2, 3] {
+        let msg = data_msg("conn-1", &mgr.target, &[byte], None);
+        mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&msg).unwrap())
+            .await;
+    }
+
+    let mut buf = [0u8; 3];
+    tokio::time::timeout(Duration::from_secs(1), read_half.read_exact(&mut buf))
+        .await
+        .expect("timed out waiting for data")
+        .unwrap();
+    assert_eq!(buf, [1, 2, 3]);
 }
 
 // --- Finding 2: peer-leave grace window / resume ---------------------------
@@ -205,6 +417,7 @@ async fn ping_and_unknown_message_types_are_ignored_gracefully() {
         conn_id: String::new(),
         target: mgr.target.clone(),
         payload: None,
+        seq: None,
     };
     mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&ping).unwrap())
         .await;
@@ -214,6 +427,7 @@ async fn ping_and_unknown_message_types_are_ignored_gracefully() {
         conn_id: "conn-1".into(),
         target: mgr.target.clone(),
         payload: None,
+        seq: None,
     };
     mgr.on_tunnel_message("peer-1", &serde_json::to_vec(&unknown).unwrap())
         .await;

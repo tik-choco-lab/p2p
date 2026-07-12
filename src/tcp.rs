@@ -59,6 +59,10 @@ struct TunnelConn {
     peer_id: String,
     metrics: ForwardPeerRuntime,
     notify_remote: bool,
+    /// Tracks the expected next `data` sequence number from the remote peer
+    /// for this conn, to detect the gaps/duplicates described on
+    /// [`TunnelMessage::seq`]. See [`tunnel::SeqState`].
+    recv_seq: tunnel::SeqState,
 }
 
 pub struct TcpManager {
@@ -248,6 +252,7 @@ impl TcpManager {
             peer_id: peer_id.to_string(),
             metrics: metrics.clone(),
             notify_remote,
+            recv_seq: tunnel::SeqState::new(),
         };
         let old = self
             .conns
@@ -271,6 +276,7 @@ impl TcpManager {
                     conn_id: conn_id.to_string(),
                     target: self.target.clone(),
                     payload: None,
+                    seq: None,
                 };
                 let _ = self.send_to(&tc.peer_id, &close_msg).await;
             }
@@ -427,6 +433,7 @@ impl TcpManager {
                 conn_id: String::new(),
                 target: self.target.clone(),
                 payload: None,
+                seq: None,
             };
             if let Err(e) = self.send_to(peer_id, &ping).await {
                 debug!("keepalive ping to {} failed: {}", peer_id, e);
