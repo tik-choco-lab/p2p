@@ -1,5 +1,5 @@
 repo: <configured by MISTLIB_REPO>
 ref: develop
-commit: f86cb01b3c0d7f2953b7fe341fde8a97d3f1e037
-vendored-at: 2026-07-11T09:42:24Z
+commit: 5d90b517c7bdb9d05668dfafed1225927c2074f3
+vendored-at: 2026-07-12T03:25:33Z
 contents: mistlib-core, mistlib-native (tests, examples, and benches pruned), LICENSE

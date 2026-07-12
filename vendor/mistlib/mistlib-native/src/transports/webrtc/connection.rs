@@ -23,12 +23,18 @@ impl WebRtcTransport {
 
         let cancel_token = CancellationToken::new();
         let pc = Arc::new(self.api.new_peer_connection(config).await?);
+        let channels: Arc<
+            tokio::sync::RwLock<HashMap<DeliveryMethod, Arc<webrtc::data_channel::RTCDataChannel>>>,
+        > = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let send_tx =
+            Peer::spawn_send_queue(remote_id.clone(), channels.clone(), cancel_token.clone());
         let peer = Arc::new(Peer {
             pc: pc.clone(),
-            channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            channels,
             cancel_token: cancel_token.clone(),
             local_offer_unsent: std::sync::atomic::AtomicBool::new(false),
             negotiating: tokio::sync::Mutex::new(()),
+            send_tx,
         });
 
         let event_tx = self.spawn_event_forwarder(cancel_token.clone());

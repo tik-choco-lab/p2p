@@ -1,4 +1,5 @@
 pub mod fs;
+pub mod meta;
 pub mod resolver;
 
 use crate::engine::SessionCtx;
@@ -95,6 +96,12 @@ pub async fn init_storage(storage_config: &StorageConfig, cache_dir: Option<std:
     }
 
     let base_dir = cache_dir.unwrap_or_else(|| std::env::temp_dir().join("mistlib_blocks"));
+    // Meta lives in a subdirectory of the block dir; a directory name can
+    // never collide with a CID block file, and `NativeBlockStore` refuses
+    // non-CID names anyway.
+    let meta = crate::storage::meta::NativeMetaStore::new(base_dir.join("meta"))
+        .await
+        .expect("Failed to init meta store");
     let store = NativeBlockStore::new(base_dir)
         .await
         .expect("Failed to init block store");
@@ -111,7 +118,8 @@ pub async fn init_storage(storage_config: &StorageConfig, cache_dir: Option<std:
         max_capacity_bytes,
         Some(Arc::new(EngineSessionPositions) as Arc<dyn SelfPositionSource>),
         SpatialPolicy::from(storage_config),
-    );
+    )
+    .with_meta_store(Arc::new(meta));
 
     // Two concurrent joins can both reach this point (the `.await` above is
     // the race window); the second `set` losing is harmless now that both

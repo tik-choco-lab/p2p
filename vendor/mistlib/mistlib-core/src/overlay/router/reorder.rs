@@ -8,7 +8,14 @@ pub const REORDER_MAX_PER_SOURCE: usize = 256;
 /// Maximum number of distinct sources tracked before the oldest is evicted.
 pub const REORDER_MAX_SOURCES: usize = 1024;
 /// How long a gap may persist before buffered successors are flushed in seq order.
-pub const REORDER_GAP_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// Must comfortably outlive transport-level reconnection: mistlib-native's ICE
+/// restart grace period (`DISCONNECTED_GRACE_MS`, mistlib-native/src/transports/webrtc.rs)
+/// is 5s, so a transient network blip can delay in-flight messages by close to
+/// that long without them being lost for good. 8s leaves headroom above that
+/// 5s grace period so a reconnecting peer's delayed message has a chance to
+/// fill the gap before it's force-flushed and the late arrival is dropped.
+pub const REORDER_GAP_TIMEOUT: Duration = Duration::from_secs(8);
 
 struct SourceState {
     next_expected: u64,
@@ -33,7 +40,20 @@ impl SourceState {
     }
 
     /// Delivers all buffered messages in seq order and advances past them.
-    fn flush(&mut self, out: &mut Vec<MessageContent>) {
+    ///
+    /// Returns the skipped seq range as `Some((next_expected, first_buffered))`
+    /// when there was a gap between what was expected and the earliest
+    /// buffered message (i.e. the half-open range `next_expected..first_buffered`
+    /// was never delivered), or `None` if the flush was contiguous. Callers
+    /// use this purely for observability (logging); behavior is unchanged.
+    fn flush(&mut self, out: &mut Vec<MessageContent>) -> Option<(u64, u64)> {
+        let skipped = self.buffered.keys().next().and_then(|&first| {
+            if first > self.next_expected {
+                Some((self.next_expected, first))
+            } else {
+                None
+            }
+        });
         if let Some((&max_seq, _)) = self.buffered.iter().next_back() {
             for (_, content) in std::mem::take(&mut self.buffered) {
                 out.push(content);
@@ -41,6 +61,7 @@ impl SourceState {
             self.next_expected = max_seq + 1;
         }
         self.gap_since = None;
+        skipped
     }
 }
 
@@ -97,7 +118,16 @@ impl ReorderBuffer {
                 let mut out = Vec::new();
                 if let Some(since) = state.gap_since {
                     if now.duration_since(since) >= self.gap_timeout {
-                        state.flush(&mut out);
+                        let buffered_count = state.buffered.len();
+                        if let Some((skip_from, skip_to)) = state.flush(&mut out) {
+                            tracing::warn!(
+                                "[Reorder] gap timeout (unreliable/broadcast arrival): forced flush from {} skipped seq {}..={} ({} buffered)",
+                                from,
+                                skip_from,
+                                skip_to - 1,
+                                buffered_count
+                            );
+                        }
                     }
                 }
                 out.push(content);
@@ -121,7 +151,16 @@ impl ReorderBuffer {
         // Lazily flush a stale gap before processing the new arrival.
         if let Some(since) = state.gap_since {
             if now.duration_since(since) >= gap_timeout {
-                state.flush(&mut out);
+                let buffered_count = state.buffered.len();
+                if let Some((skip_from, skip_to)) = state.flush(&mut out) {
+                    tracing::warn!(
+                        "[Reorder] gap timeout: forced flush from {} skipped seq {}..={} ({} buffered)",
+                        from,
+                        skip_from,
+                        skip_to - 1,
+                        buffered_count
+                    );
+                }
             }
         }
 
@@ -131,7 +170,16 @@ impl ReorderBuffer {
             // restarted stream would look "late" and be dropped forever. Flush any
             // leftovers from the old stream, deliver, and re-baseline. True
             // duplicates of seq 1 are caught earlier by the (from, msg_id) dedup.
-            state.flush(&mut out);
+            let buffered_count = state.buffered.len();
+            if let Some((skip_from, skip_to)) = state.flush(&mut out) {
+                tracing::warn!(
+                    "[Reorder] sender counter restart: re-baselining {} to seq 1, discarding leftover buffered seq {}..={} from the old stream ({} buffered)",
+                    from,
+                    skip_from,
+                    skip_to - 1,
+                    buffered_count
+                );
+            }
             out.push(content);
             state.next_expected = 2;
             return out;
@@ -139,6 +187,12 @@ impl ReorderBuffer {
 
         if seq < state.next_expected {
             // Duplicate or late (dedup normally catches this); drop.
+            tracing::warn!(
+                "[Reorder] dropping late/duplicate message from {}: seq={} already past next_expected={}",
+                from,
+                seq,
+                state.next_expected
+            );
             return out;
         }
 
@@ -160,8 +214,18 @@ impl ReorderBuffer {
             if state.gap_since.is_none() {
                 state.gap_since = Some(now);
             }
-            if state.buffered.len() > max_per_source {
-                state.flush(&mut out);
+            let buffered_count = state.buffered.len();
+            if buffered_count > max_per_source {
+                if let Some((skip_from, skip_to)) = state.flush(&mut out) {
+                    tracing::warn!(
+                        "[Reorder] buffer cap exceeded ({} > {}): forced flush from {} skipped seq {}..={}",
+                        buffered_count,
+                        max_per_source,
+                        from,
+                        skip_from,
+                        skip_to - 1
+                    );
+                }
             }
         }
 
@@ -189,8 +253,17 @@ impl ReorderBuffer {
             if now.duration_since(since) < gap_timeout {
                 continue;
             }
+            let buffered_count = state.buffered.len();
             let mut out = Vec::new();
-            state.flush(&mut out);
+            if let Some((skip_from, skip_to)) = state.flush(&mut out) {
+                tracing::warn!(
+                    "[Reorder] gap timeout (idle flush): forced flush from {} skipped seq {}..={} ({} buffered)",
+                    id,
+                    skip_from,
+                    skip_to - 1,
+                    buffered_count
+                );
+            }
             if !out.is_empty() {
                 flushed.push((id.clone(), out));
             }
@@ -236,6 +309,12 @@ mod tests {
         MessageContent::Raw(Bytes::copy_from_slice(tag.as_bytes()))
     }
 
+    /// Gap timeout used by tests that need a concrete, short threshold to
+    /// straddle with simulated `now` offsets (e.g. 500ms early / 2s late).
+    /// Deliberately independent of `REORDER_GAP_TIMEOUT` (the production
+    /// default, 8s) so these tests don't have to track that value.
+    const TEST_GAP_TIMEOUT: Duration = Duration::from_secs(1);
+
     fn tags(contents: &[MessageContent]) -> Vec<String> {
         contents
             .iter()
@@ -278,7 +357,11 @@ mod tests {
 
     #[test]
     fn zero_seq_flushes_stale_gap_for_known_source() {
-        let mut buf = ReorderBuffer::default();
+        let mut buf = ReorderBuffer::new(
+            REORDER_MAX_PER_SOURCE,
+            REORDER_MAX_SOURCES,
+            TEST_GAP_TIMEOUT,
+        );
         let src = node("peer-a");
         let now = Instant::now();
 
@@ -308,7 +391,11 @@ mod tests {
 
     #[test]
     fn zero_seq_within_stale_window_does_not_flush_early() {
-        let mut buf = ReorderBuffer::default();
+        let mut buf = ReorderBuffer::new(
+            REORDER_MAX_PER_SOURCE,
+            REORDER_MAX_SOURCES,
+            TEST_GAP_TIMEOUT,
+        );
         let src = node("peer-a");
         let now = Instant::now();
 
@@ -344,7 +431,11 @@ mod tests {
 
     #[test]
     fn gap_flushes_after_timeout() {
-        let mut buf = ReorderBuffer::default();
+        let mut buf = ReorderBuffer::new(
+            REORDER_MAX_PER_SOURCE,
+            REORDER_MAX_SOURCES,
+            TEST_GAP_TIMEOUT,
+        );
         let src = node("peer-a");
         let now = Instant::now();
 
@@ -414,7 +505,11 @@ mod tests {
 
     #[test]
     fn flush_expired_delivers_buffered_tail_after_timeout_with_no_new_traffic() {
-        let mut buf = ReorderBuffer::default();
+        let mut buf = ReorderBuffer::new(
+            REORDER_MAX_PER_SOURCE,
+            REORDER_MAX_SOURCES,
+            TEST_GAP_TIMEOUT,
+        );
         let src = node("peer-a");
         let now = Instant::now();
 
@@ -436,7 +531,11 @@ mod tests {
 
     #[test]
     fn flush_expired_delivers_nothing_before_timeout() {
-        let mut buf = ReorderBuffer::default();
+        let mut buf = ReorderBuffer::new(
+            REORDER_MAX_PER_SOURCE,
+            REORDER_MAX_SOURCES,
+            TEST_GAP_TIMEOUT,
+        );
         let src = node("peer-a");
         let now = Instant::now();
 

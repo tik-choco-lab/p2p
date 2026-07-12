@@ -2,7 +2,7 @@ use crate::types::Vector3;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 pub const CHUNK_SIZE: usize = 1024 * 1024;
@@ -20,6 +20,12 @@ pub struct StorageManager {
     blocks_meta: HashMap<String, BlockMeta>,
     lru_index: BTreeMap<u64, String>,
     clock: u64,
+    // Pin protection set (SPEC-18): CIDs excluded from all three eviction
+    // paths below. Populated by `StorageEngine` from its `PinRegistry`, not
+    // mutated here directly -- this struct only enforces the filter.
+    // Pinned blocks still count toward `current_usage` (they occupy real
+    // space); they just never appear as victims.
+    pinned: HashSet<String>,
 }
 
 struct BlockMeta {
@@ -86,7 +92,16 @@ impl StorageManager {
             blocks_meta: HashMap::new(),
             lru_index: BTreeMap::new(),
             clock: 0,
+            pinned: HashSet::new(),
         }
+    }
+
+    /// Replaces the pin protection set wholesale (SPEC-18). Called by
+    /// `StorageEngine` whenever its `PinRegistry` changes (pin/unpin, or the
+    /// initial lazy load), rather than incrementally, since the registry is
+    /// the source of truth and recomputing its full CID union is cheap.
+    pub fn set_pinned(&mut self, pinned: HashSet<String>) {
+        self.pinned = pinned;
     }
 
     pub fn track_block(&mut self, cid: &str, size: u64, position: Option<Vector3>) -> bool {
@@ -142,6 +157,12 @@ impl StorageManager {
         let mut victims = Vec::new();
 
         for (_, cid) in self.lru_index.iter() {
+            // Pinned blocks (SPEC-18) are never victims; skip past them
+            // rather than breaking, so a pinned entry doesn't block older
+            // unpinned entries behind it in LRU order from being considered.
+            if self.pinned.contains(cid) {
+                continue;
+            }
             if let Some(meta) = self.blocks_meta.get(cid) {
                 victims.push(cid.clone());
                 remaining = remaining.saturating_sub(meta.size);
@@ -182,6 +203,11 @@ impl StorageManager {
         let scored: Vec<ScoredBlock> = self
             .blocks_meta
             .iter()
+            // Pinned blocks (SPEC-18) are excluded from scoring entirely,
+            // not just skipped when popped -- they must never occupy a slot
+            // in the victim heap regardless of how "evictable" their score
+            // would otherwise look.
+            .filter(|(cid, _)| !self.pinned.contains(*cid))
             .map(|(cid, meta)| {
                 let age = (self.clock - meta.last_accessed + 1) as f64;
                 let coeff = match meta.position {
@@ -236,6 +262,10 @@ impl StorageManager {
 
         let mut victims = Vec::new();
         for (cid, meta) in self.blocks_meta.iter() {
+            // Pinned blocks (SPEC-18) are never decay-eligible, tagged or not.
+            if self.pinned.contains(cid) {
+                continue;
+            }
             let Some(position) = meta.position else {
                 continue;
             };
@@ -514,5 +544,46 @@ mod tests {
             "spatial_eviction_candidates too slow: avg {:.3}ms",
             avg_ms
         );
+    }
+
+    #[test]
+    fn test_set_pinned_excludes_block_from_lru_eviction_candidates() {
+        let mut mgr = StorageManager::new(100);
+        mgr.track_block("a", 60, None);
+        mgr.track_block("b", 60, None);
+        mgr.set_pinned(HashSet::from(["a".to_string()]));
+
+        // Without pinning, "a" (older) would be the sole LRU victim (see
+        // test_lru_eviction); pinning it must skip straight to "b" instead
+        // of leaving the over-capacity condition unresolved.
+        let victims = mgr.eviction_candidates();
+        assert_eq!(victims, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn test_set_pinned_excludes_block_from_spatial_eviction_candidates() {
+        let mut mgr = StorageManager::new(100);
+        // "far" would normally be the clear spatial victim (see
+        // test_spatial_eviction_prefers_farther_block_at_same_age); pinning
+        // it must divert eviction to "near" instead.
+        mgr.track_block("near", 60, Some(Vector3::new(1.0, 0.0, 0.0)));
+        mgr.track_block("far", 60, Some(Vector3::new(1000.0, 0.0, 0.0)));
+        mgr.set_pinned(HashSet::from(["far".to_string()]));
+
+        let victims = mgr.spatial_eviction_candidates(&[Vector3::new(0.0, 0.0, 0.0)], 100.0);
+        assert_eq!(victims, vec!["near".to_string()]);
+    }
+
+    #[test]
+    fn test_set_pinned_excludes_block_from_decay_candidates() {
+        let mut mgr = StorageManager::new(100);
+        // Same setup as test_decay_probability_reaches_max_at_4r (guaranteed
+        // decay for an unpinned block at d == 4R with max_probability 1.0),
+        // but pinned this time.
+        mgr.track_block("edge", 10, Some(Vector3::new(400.0, 0.0, 0.0)));
+        mgr.set_pinned(HashSet::from(["edge".to_string()]));
+
+        let victims = mgr.decay_candidates(&[Vector3::new(0.0, 0.0, 0.0)], 100.0, 1.0, 42);
+        assert!(victims.is_empty(), "pinned blocks must never decay");
     }
 }
