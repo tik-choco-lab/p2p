@@ -156,6 +156,11 @@ impl UdpManager {
                                 conn_id: conn_id.clone(),
                                 target: target.clone(),
                                 payload: Some(buf[..n].to_vec()),
+                                // UDP tunnel traffic is unordered/unreliable
+                                // already; sequencing is only wired up for
+                                // the TCP tunnel path (see
+                                // `TunnelMessage::seq`).
+                                seq: None,
                             };
                             let data = match serde_json::to_vec(&msg) {
                                 Ok(d) => d,

@@ -12,6 +12,7 @@ fn encode_tunnel(target: &str, conn_id: &str) -> Vec<u8> {
         conn_id: conn_id.to_string(),
         target: target.to_string(),
         payload: Some(vec![42]),
+        seq: None,
     })
     .unwrap()
 }

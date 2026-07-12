@@ -87,6 +87,10 @@ impl UdpManager {
             conn_id,
             target: self.target.clone(),
             payload: Some(payload.to_vec()),
+            // UDP tunnel traffic is unordered/unreliable already; sequencing
+            // is only wired up for the TCP tunnel path (see
+            // `TunnelMessage::seq`).
+            seq: None,
         };
         if let Err(e) = self.send_to(&peer_id, &msg).await {
             error!("Failed to send UDP data: {}", e);

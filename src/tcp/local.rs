@@ -32,6 +32,7 @@ impl TcpManager {
             conn_id: conn_id.clone(),
             target: self.target.clone(),
             payload: None,
+            seq: None,
         };
         let mut shutdown = self.runtime.subscribe();
         if let Err(e) = self
@@ -75,6 +76,12 @@ impl TcpManager {
         let mut buf = vec![0u8; TCP_BUFFER_SIZE];
         let mut shutdown = self.runtime.subscribe();
         let metrics = self.runtime.peer(&peer_id);
+        // Per-conn, monotonically increasing sequence number for outbound
+        // `data` messages (see `TunnelMessage::seq`). Starts at 1; a retried
+        // send (`send_to_with_retry`) reuses the same `msg` (and thus the
+        // same seq) rather than bumping it, so the receiver can dedupe a
+        // redelivered payload instead of treating it as new data.
+        let mut next_seq: u64 = 1;
         loop {
             tokio::select! {
                 read = read_half.read(&mut buf) => {
@@ -84,11 +91,14 @@ impl TcpManager {
                             return;
                         }
                         Ok(n) => {
+                            let seq = next_seq;
+                            next_seq += 1;
                             let msg = TunnelMessage {
                                 msg_type: MSG_TYPE_DATA.into(),
                                 conn_id: conn_id.clone(),
                                 target: self.target.clone(),
                                 payload: Some(buf[..n].to_vec()),
+                                seq: Some(seq),
                             };
                             // Sequential await: the next chunk isn't read
                             // until this send (including any retries) has
