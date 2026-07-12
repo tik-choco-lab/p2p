@@ -5,6 +5,7 @@ use super::payload::P2pPayload;
 use super::state::{PeerRole, RTCManagerInner};
 use super::{mistlib_config, RTCManagerHandle};
 
+mod ordering;
 mod routing;
 
 fn test_manager(self_id: &str, self_role: PeerRole) -> RTCManagerHandle {
