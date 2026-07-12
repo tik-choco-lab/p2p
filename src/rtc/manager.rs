@@ -65,8 +65,15 @@ impl RTCManagerHandle {
 
         let weak = Arc::downgrade(&handle.inner);
         let runtime = tokio::runtime::Handle::current();
+        // Single FIFO worker for EVENT_RAW/EVENT_OVERLAY: mistlib delivers
+        // events to `dispatch_event` in strict order from one dispatch
+        // thread, and this worker processes each to completion before the
+        // next, preserving that order end to end (see `event::dispatch_event`
+        // and `event::run_payload_worker`).
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(event::run_payload_worker(weak.clone(), rx));
         mistlib::register_raw_handler(move |message_type, from, data| {
-            dispatch_event(&runtime, &weak, message_type, from, data);
+            dispatch_event(&runtime, &weak, &tx, message_type, from, data);
         });
         let config = mistlib_config();
         let initialized = tokio::task::spawn_blocking(move || match config {
