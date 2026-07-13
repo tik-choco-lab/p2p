@@ -18,6 +18,49 @@ This project is a functional port of the original Go implementation [webrtc-p2p-
 
 ## Installation
 
+### Download prebuilt binaries
+
+Prebuilt binaries are published on the [Releases page](https://github.com/tik-choco-lab/p2p/releases) for every push to `main`:
+
+- **Stable releases** are tagged `vX.Y.Z` (matching the version in `Cargo.toml`) and marked as the GitHub "Latest" release.
+- A rolling **`latest`** prerelease (tag `latest`) is refreshed on every push that lands between version bumps, so there is always a downloadable build with the newest changes.
+
+| Platform | Target | Asset |
+|---|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `p2p-<tag>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` | `p2p-<tag>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS x86_64 | `x86_64-apple-darwin` | `p2p-<tag>-x86_64-apple-darwin.tar.gz` |
+| macOS arm64 (Apple Silicon) | `aarch64-apple-darwin` | `p2p-<tag>-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `p2p-<tag>-x86_64-pc-windows-msvc.zip` |
+
+Each release also includes a `SHA256SUMS` file — download it alongside your archive and verify the checksum before running the binary.
+
+Linux / macOS:
+
+```bash
+tag=latest   # or a stable tag such as v1.2.3
+target=x86_64-unknown-linux-gnu   # pick your platform from the table above
+curl -LO "https://github.com/tik-choco-lab/p2p/releases/download/$tag/p2p-$tag-$target.tar.gz"
+curl -LO "https://github.com/tik-choco-lab/p2p/releases/download/$tag/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar xzf "p2p-$tag-$target.tar.gz"
+sudo mv "p2p-$tag-$target/p2p" /usr/local/bin/   # or any other directory on your PATH
+```
+
+Windows (PowerShell):
+
+```powershell
+$tag = "latest"   # or a stable tag such as v1.2.3
+$target = "x86_64-pc-windows-msvc"
+Invoke-WebRequest "https://github.com/tik-choco-lab/p2p/releases/download/$tag/p2p-$tag-$target.zip" -OutFile p2p.zip
+Invoke-WebRequest "https://github.com/tik-choco-lab/p2p/releases/download/$tag/SHA256SUMS" -OutFile SHA256SUMS
+# Verify the extracted p2p.exe's SHA-256 against the matching entry in SHA256SUMS
+Expand-Archive p2p.zip -DestinationPath .
+# Move p2p.exe to a directory on your PATH
+```
+
+### Build from source
+
 Ensure you have the Rust toolchain installed.
 
 ```bash
