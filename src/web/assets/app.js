@@ -161,15 +161,33 @@
     return String(v);
   }
 
+  // Splits a node-scoped target into its base target and the pinned node
+  // id, mirroring the Rust `split_node_scope` helper: split on the *last*
+  // '@' so a base containing one still round-trips, and treat an empty
+  // base or empty scope as "not actually scoped".
+  // `"tcp:127.0.0.1:22@node-a"` -> `["tcp:127.0.0.1:22", "node-a"]`
+  // `"tcp:127.0.0.1:22"` -> `["tcp:127.0.0.1:22", null]`
+  function splitNodeScope(target) {
+    if (typeof target !== "string") return [target, null];
+    var idx = target.lastIndexOf("@");
+    if (idx <= 0 || idx === target.length - 1) return [target, null];
+    return [target.slice(0, idx), target.slice(idx + 1)];
+  }
+
   // Displayed targets omit the redundant "proto:" prefix the backend keeps
   // in the raw target string (the proto is already shown in its own
-  // column/label). Display-only: callers must keep using the untouched
-  // value for API payloads and the `fwd.id` for the delete action.
+  // column/label), and render a trailing node scope (see `splitNodeScope`)
+  // as a readable " @ node" suffix. Display-only: callers must keep using
+  // the untouched value for API payloads and the `fwd.id` for the delete
+  // action.
   function displayTarget(target, proto) {
     if (typeof target !== "string" || !proto) return target;
+    var parts = splitNodeScope(target);
+    var base = parts[0];
+    var scope = parts[1];
     var prefix = proto + ":";
-    if (target.indexOf(prefix) === 0) return target.slice(prefix.length);
-    return target;
+    var shown = base.indexOf(prefix) === 0 ? base.slice(prefix.length) : base;
+    return scope ? shown + " @ " + scope : shown;
   }
 
   function formatTimeValue(v) {

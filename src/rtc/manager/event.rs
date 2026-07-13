@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 
 use super::payload::P2pPayload;
 use super::state::{PeerRole, RTCManagerInner};
+use crate::forward_args::split_node_scope;
 use crate::rtc::TunnelMessage;
 
 /// A membership or data-plane event, queued for in-order processing by
@@ -188,6 +189,8 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
                     entry.target.as_deref(),
                     tunnel_msg.as_ref(),
                     &default_target,
+                    &inner.self_id,
+                    &peer_id,
                 ) {
                     continue;
                 }
@@ -235,15 +238,35 @@ pub(super) async fn handle_payload(inner: Arc<RTCManagerInner>, peer_id: String,
     }
 }
 
+/// Matches an inbound `msg` (sent by `from`) against a handler registered
+/// for `handler_target` (`None` means "all targets"). Beyond the exact
+/// string match, a node-scoped target (see
+/// [`crate::forward_args::split_node_scope`]) matches its unscoped
+/// counterpart on the node it's pinned to, in either direction:
+/// - a message pinned to us (`msg.target == "{handler_target}@{self_id}"`)
+///   reaches a handler registered under the plain base target -- a pinned
+///   client talking to this serve node;
+/// - a message using the plain base target reaches a handler registered
+///   under the scoped variant naming the sender
+///   (`handler_target == "{msg.target}@{from}"`) -- a serve node replying
+///   with its base target to a client that registered under the scoped
+///   target it pinned to that node.
+///
+/// The empty-`msg.target` -> `default_target` rule is unrelated to scoping
+/// and is preserved as-is.
 fn tunnel_handler_matches(
     handler_target: Option<&str>,
     msg: Option<&TunnelMessage>,
     default_target: &Option<String>,
+    self_id: &str,
+    from: &str,
 ) -> bool {
     match handler_target {
         None => true,
         Some(target) => msg.is_some_and(|msg| {
             msg.target == target
+                || split_node_scope(&msg.target) == (target, Some(self_id))
+                || split_node_scope(target) == (msg.target.as_str(), Some(from))
                 || (msg.target.is_empty() && default_target.as_deref() == Some(target))
         }),
     }

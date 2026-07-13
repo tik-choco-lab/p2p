@@ -18,7 +18,13 @@ pub(crate) fn parse_forward(f: &str) -> (&str, &str, i32) {
     (proto, addr, port)
 }
 
+/// Parses a connect-side forward argument, e.g. `"10022:22"`, `"udp://19000:9000"`,
+/// or `"8080"`. The argument may carry an optional `@node` suffix (see
+/// [`split_node_scope`]) that pins the forward to a specific peer node, e.g.
+/// `"10022:22@node-a"`; the scope is reapplied to the returned target so the
+/// listen/remote-port parsing below is unaffected by its presence.
 pub(crate) fn parse_connect_forward(f: &str) -> (&str, i32, String) {
+    let (f, scope) = split_node_scope(f);
     let (proto, addr, fallback_port) = parse_forward(f);
     let addr = addr.trim_start_matches(':');
 
@@ -30,7 +36,13 @@ pub(crate) fn parse_connect_forward(f: &str) -> (&str, i32, String) {
         (fallback_port, fallback_port)
     };
 
-    (proto, listen_port, format!("{}:{}", proto, remote_port))
+    let target = format!("{}:{}", proto, remote_port);
+    let target = match scope {
+        Some(peer_id) => node_scoped_target(&target, peer_id),
+        None => target,
+    };
+
+    (proto, listen_port, target)
 }
 
 pub(crate) fn split_serve_args(args: &[String]) -> (Option<String>, Vec<String>) {
@@ -48,6 +60,26 @@ pub(crate) fn split_serve_args(args: &[String]) -> (Option<String>, Vec<String>)
             args.iter().skip(1).cloned().collect::<Vec<_>>(),
         )
     }
+}
+
+/// Splits a node-scoped target into its base target and the pinned node id:
+/// `"tcp:127.0.0.1:22@node-a"` -> `("tcp:127.0.0.1:22", Some("node-a"))`.
+/// A target without a scope comes back unchanged with `None`. The split is
+/// on the *last* `'@'` so a base containing one (e.g. a user@host-ish addr)
+/// still round-trips as long as the scope itself has none.
+pub(crate) fn split_node_scope(target: &str) -> (&str, Option<&str>) {
+    match target.rsplit_once('@') {
+        Some((base, scope)) if !scope.is_empty() && !base.is_empty() => (base, Some(scope)),
+        _ => (target, None),
+    }
+}
+
+/// Builds a node-scoped target: `("tcp:127.0.0.1:22", "node-a")` ->
+/// `"tcp:127.0.0.1:22@node-a"`. Scoping an already-scoped target replaces
+/// the existing scope rather than stacking a second one.
+pub(crate) fn node_scoped_target(base: &str, peer_id: &str) -> String {
+    let (base, _) = split_node_scope(base);
+    format!("{}@{}", base, peer_id)
 }
 
 pub(crate) fn forward_key(proto: &str, addr: &str) -> String {

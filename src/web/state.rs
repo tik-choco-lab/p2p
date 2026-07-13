@@ -337,6 +337,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller::Proto;
 
     #[test]
     fn state_dto_round_trips_through_json() {
@@ -351,7 +352,10 @@ mod tests {
                 proto: "tcp".into(),
                 direction: "serve".into(),
                 local: "127.0.0.1:80".into(),
-                target: "tcp:127.0.0.1:80".into(),
+                // A node-scoped target (see `split_node_scope`) must survive
+                // JSON serialization untouched: callers key forward removal
+                // on the full scoped string.
+                target: "tcp:127.0.0.1:80@node-a".into(),
                 status: "listening".into(),
             }],
             pending_auth: vec![PendingAuthDto {
@@ -400,6 +404,7 @@ mod tests {
         assert_eq!(json["peers"][0]["id"], "peer-1");
         assert_eq!(json["forwards"][0]["proto"], "tcp");
         assert_eq!(json["forwards"][0]["direction"], "serve");
+        assert_eq!(json["forwards"][0]["target"], "tcp:127.0.0.1:80@node-a");
         assert_eq!(json["pending_auth"][0]["id"], 1);
         assert_eq!(json["pending_forwards"][0]["id"], 2);
         assert_eq!(json["pending_outgoing"][0]["local"], "127.0.0.1:8080");
@@ -473,5 +478,72 @@ mod tests {
             Some(AuthDecision::DenyAlways)
         );
         assert_eq!(parse_auth_decision("nope"), None);
+    }
+
+    // Node-scoped targets (`"tcp:127.0.0.1:80@node-a"`, see
+    // `crate::forward_args::split_node_scope`) must flow through the DTO
+    // mappers untouched: the frontend keys forward removal on the full
+    // string, so trimming the scope here would break `DELETE
+    // /api/forwards/{id}`.
+
+    fn scoped_forward_status(target: &str) -> ForwardStatus {
+        ForwardStatus {
+            key: "tcp:127.0.0.1:80".into(),
+            spec: ForwardSpec {
+                direction: Direction::Connect,
+                proto: Proto::Tcp,
+                addr: "127.0.0.1:9000".into(),
+                listen_port: 9000,
+                target: target.into(),
+            },
+            active_conns: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            state: ForwardState::Listening,
+            peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn forward_dto_keeps_full_scoped_target() {
+        let dto = forward_dto(&scoped_forward_status("tcp:127.0.0.1:80@node-a"));
+        assert_eq!(dto.target, "tcp:127.0.0.1:80@node-a");
+        // local_endpoint reads `spec.addr`/`spec.listen_port`, not `target`,
+        // so it's unaffected by scoping either way.
+        assert_eq!(dto.local, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn forward_dto_leaves_unscoped_target_unchanged() {
+        let dto = forward_dto(&scoped_forward_status("tcp:127.0.0.1:80"));
+        assert_eq!(dto.target, "tcp:127.0.0.1:80");
+    }
+
+    #[test]
+    fn pending_forward_dto_keeps_full_scoped_target() {
+        let item = IncomingForward {
+            id: 2,
+            req_id: "req-1".into(),
+            peer_id: "peer-1".into(),
+            proto: "tcp".into(),
+            remote_addr: "127.0.0.1:80".into(),
+            target: "tcp:127.0.0.1:80@node-a".into(),
+        };
+        let dto = pending_forward_dto(&item);
+        assert_eq!(dto.target, "tcp:127.0.0.1:80@node-a");
+    }
+
+    #[test]
+    fn pending_outgoing_dto_keeps_full_scoped_target() {
+        let item = OutgoingForward {
+            peer_id: "peer-1".into(),
+            proto: "tcp".into(),
+            listen_port: 8080,
+            local_addr: "127.0.0.1:8080".into(),
+            remote_addr: "10.0.0.5:80".into(),
+            target: "tcp:10.0.0.5:80@node-a".into(),
+        };
+        let dto = pending_outgoing_dto(&item);
+        assert_eq!(dto.target, "tcp:10.0.0.5:80@node-a");
     }
 }

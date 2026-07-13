@@ -2,6 +2,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::auth::{AuthDecision, AuthEvent, PendingAuthorization, TrustEntry};
 use crate::controller::ForwardStatus;
+use crate::forward_args::node_scoped_target;
 use crate::negotiation::{IncomingForward, OutgoingForward};
 
 use super::TuiContext;
@@ -353,6 +354,7 @@ impl App {
             1 => {
                 let mut draft = draft;
                 draft.peer_id = peers[0].clone();
+                draft.target = node_scoped_target(&draft.target, &draft.peer_id);
                 self.send_request(draft).await;
             }
             _ => {
@@ -380,6 +382,7 @@ impl App {
             KeyCode::Enter => {
                 let mut draft = sel.draft;
                 draft.peer_id = sel.peers[sel.sel].clone();
+                draft.target = node_scoped_target(&draft.target, &draft.peer_id);
                 self.send_request(draft).await;
             }
             _ => self.popup = Popup::SelectPeer(sel),

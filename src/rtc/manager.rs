@@ -7,6 +7,7 @@ mod handlers;
 mod payload;
 mod state;
 
+use crate::forward_args::{node_scoped_target, split_node_scope};
 use event::dispatch_event;
 use payload::P2pPayload;
 use state::{PeerRole, RTCManagerInner};
@@ -107,10 +108,32 @@ impl RTCManagerHandle {
     /// information, so this filters both branches down to peers currently
     /// present in `peers` -- otherwise a departed peer whose capabilities we
     /// still remember would keep being routed to.
+    ///
+    /// A node-scoped `target` (`"{base}@{peer_id}"`, see
+    /// [`crate::forward_args::split_node_scope`]) pins routing to that one
+    /// peer: this returns `vec![peer_id]` only if the peer is currently live
+    /// AND has advertised the exact scoped target string, and returns an
+    /// empty vec otherwise. A scoped target never falls back to the
+    /// server-role-peer list below -- that fallback would route pinned
+    /// traffic to a node the caller didn't ask for. Unscoped targets keep
+    /// their original behavior: exact advertiser match, falling back to
+    /// every live server-role peer when nobody advertises the target.
     pub async fn get_server_peers_for(&self, target: &str) -> Vec<String> {
         let live = self.inner.peers.read().await;
 
         if !target.is_empty() {
+            let (_, scope) = split_node_scope(target);
+            if let Some(scope) = scope {
+                let keys = self.inner.peer_forward_keys.read().await;
+                return if live.contains(scope)
+                    && keys.get(scope).is_some_and(|k| k.contains(target))
+                {
+                    vec![scope.to_string()]
+                } else {
+                    Vec::new()
+                };
+            }
+
             let keys = self.inner.peer_forward_keys.read().await;
             let matched = keys
                 .iter()
@@ -144,6 +167,11 @@ impl RTCManagerHandle {
     /// all peers that advertise the target key using a per-target round-robin
     /// cursor. Peers that disconnect drop out of the advertised key set, so this
     /// also provides failover. Returns `None` when no peer is available yet.
+    ///
+    /// A node-scoped target (see [`get_server_peers_for`](Self::get_server_peers_for))
+    /// always resolves to the same single pinned peer (or `None`) -- the
+    /// round-robin cursor is a no-op in that case since there is at most one
+    /// candidate.
     pub async fn select_server_peer_for(&self, target: &str) -> Option<String> {
         let mut peers = self.get_server_peers_for(target).await;
         if peers.is_empty() {
@@ -215,17 +243,31 @@ impl RTCManagerHandle {
         .await
     }
 
+    /// Advertises `target` as servable by this node. When `target` is
+    /// unscoped, this also advertises the self-scoped variant
+    /// (`"{target}@{self_id}"`, see [`node_scoped_target`]) so a connecting
+    /// client can pin to this specific node even though it was started with
+    /// a plain, unscoped target. An already-scoped `target` is published
+    /// as-is only.
     pub async fn publish_tunnel_target(&self, target: &str) {
-        self.inner
-            .self_forward_keys
-            .write()
-            .await
-            .insert(target.to_string());
+        let mut keys = self.inner.self_forward_keys.write().await;
+        keys.insert(target.to_string());
+        if split_node_scope(target).1.is_none() {
+            keys.insert(node_scoped_target(target, &self.inner.self_id));
+        }
+        drop(keys);
         self.send_capabilities_to_all().await;
     }
 
+    /// Reverses [`publish_tunnel_target`](Self::publish_tunnel_target),
+    /// removing the self-scoped variant alongside an unscoped `target` too.
     pub async fn unpublish_tunnel_target(&self, target: &str) {
-        self.inner.self_forward_keys.write().await.remove(target);
+        let mut keys = self.inner.self_forward_keys.write().await;
+        keys.remove(target);
+        if split_node_scope(target).1.is_none() {
+            keys.remove(&node_scoped_target(target, &self.inner.self_id));
+        }
+        drop(keys);
         self.send_capabilities_to_all().await;
     }
 
