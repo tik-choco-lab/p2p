@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::app::session::SessionContext;
+use crate::app::session::{NoticeKind, SessionContext, SessionNotice};
 use crate::auth::{AuthDecision, AuthEventSource, PendingAuthorization, TrustDecision, TrustEntry};
 use crate::controller::{Direction, ForwardSpec, ForwardState, ForwardStatus};
 use crate::negotiation::{IncomingForward, OutgoingForward};
@@ -69,6 +69,15 @@ pub(crate) struct EventDto {
     pub(crate) source: String,
 }
 
+/// A user-facing notice (see `SessionNotice`), e.g. a forward-negotiation
+/// outcome. `kind` is `"info"` or `"error"`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct NoticeDto {
+    pub(crate) time: String,
+    pub(crate) kind: String,
+    pub(crate) text: String,
+}
+
 /// The full `GET /api/state` payload; also what's flattened into the
 /// `{"type":"state", ...}` WebSocket push (see `web::ws`).
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
@@ -82,6 +91,9 @@ pub(crate) struct StateDto {
     pub(crate) pending_outgoing: Vec<PendingOutgoingDto>,
     pub(crate) trust: Vec<TrustDto>,
     pub(crate) events: Vec<EventDto>,
+    /// Recent user-facing notices, oldest first, capped at 50 (see
+    /// `SessionContext::notices`).
+    pub(crate) notices: Vec<NoticeDto>,
 }
 
 /// Bodies accepted by the mutating endpoints.
@@ -174,6 +186,7 @@ pub(crate) async fn build_state_dto(ctx: &SessionContext) -> StateDto {
             .collect(),
         trust: snap.trust.iter().map(trust_dto).collect(),
         events: snap.events.iter().map(event_dto).collect(),
+        notices: snap.notices.iter().map(notice_dto).collect(),
     }
 }
 
@@ -273,6 +286,18 @@ fn event_dto(ev: &crate::auth::AuthEvent) -> EventDto {
     }
 }
 
+fn notice_dto(notice: &SessionNotice) -> NoticeDto {
+    NoticeDto {
+        time: format_timestamp_ms(notice.timestamp_ms),
+        kind: match notice.kind {
+            NoticeKind::Info => "info",
+            NoticeKind::Error => "error",
+        }
+        .to_string(),
+        text: notice.text.clone(),
+    }
+}
+
 /// Formats a Unix timestamp in milliseconds as an RFC3339 UTC string (e.g.
 /// `2026-07-12T09:30:00.123Z`) so the frontend's `new Date(...)` parses it
 /// directly. Implemented by hand with Howard Hinnant's `civil_from_days`
@@ -362,6 +387,11 @@ mod tests {
                 decision: "allow".into(),
                 source: "policy".into(),
             }],
+            notices: vec![NoticeDto {
+                time: "2026-01-01T00:00:00.000Z".into(),
+                kind: "info".into(),
+                text: "forward established: tcp:127.0.0.1:80".into(),
+            }],
         };
 
         let json = serde_json::to_value(&dto).unwrap();
@@ -376,6 +406,11 @@ mod tests {
         assert_eq!(json["pending_outgoing"][0]["remote"], "10.0.0.5:80");
         assert_eq!(json["trust"][0]["decision"], "allow");
         assert_eq!(json["events"][0]["source"], "policy");
+        assert_eq!(json["notices"][0]["kind"], "info");
+        assert_eq!(
+            json["notices"][0]["text"],
+            "forward established: tcp:127.0.0.1:80"
+        );
 
         // Round trip back through serde_json::Value to ensure the shape is
         // stable (keys are exactly what's expected, nothing extra/missing).
@@ -387,6 +422,7 @@ mod tests {
                 "events",
                 "forwards",
                 "node_id",
+                "notices",
                 "peers",
                 "pending_auth",
                 "pending_forwards",
@@ -395,6 +431,24 @@ mod tests {
                 "trust",
             ]
         );
+    }
+
+    #[test]
+    fn notice_dto_maps_kind_and_formats_timestamp() {
+        let info = notice_dto(&SessionNotice {
+            timestamp_ms: 1_609_459_200_000,
+            kind: NoticeKind::Info,
+            text: "forward established: tcp:127.0.0.1:80".into(),
+        });
+        assert_eq!(info.kind, "info");
+        assert_eq!(info.time, "2021-01-01T00:00:00.000Z");
+
+        let error = notice_dto(&SessionNotice {
+            timestamp_ms: 1_609_459_200_000,
+            kind: NoticeKind::Error,
+            text: "peer denied tcp:127.0.0.1:80".into(),
+        });
+        assert_eq!(error.kind, "error");
     }
 
     #[test]
