@@ -13,6 +13,14 @@
 (function () {
   var latestState = null;
 
+  // Tracks which notices (by time+kind+text) have already been surfaced as a
+  // toast, so re-renders (duplicate state pushes, unrelated re-renders) never
+  // re-toast the same notice. `null` means "no baseline yet" — the next
+  // batch of notices seeds the baseline without toasting (used for the very
+  // first render and after every WS reconnect, so a reconnect never replays
+  // toasts for the whole backlog).
+  var seenNoticeKeys = null;
+
   /* ----------------------------- dom refs ------------------------------ */
 
   var el = {
@@ -153,6 +161,17 @@
     return String(v);
   }
 
+  // Displayed targets omit the redundant "proto:" prefix the backend keeps
+  // in the raw target string (the proto is already shown in its own
+  // column/label). Display-only: callers must keep using the untouched
+  // value for API payloads and the `fwd.id` for the delete action.
+  function displayTarget(target, proto) {
+    if (typeof target !== "string" || !proto) return target;
+    var prefix = proto + ":";
+    if (target.indexOf(prefix) === 0) return target.slice(prefix.length);
+    return target;
+  }
+
   function formatTimeValue(v) {
     var d = null;
     if (typeof v === "number") {
@@ -274,6 +293,10 @@
       reconnectDelay = 500;
       setConnState("live");
       stopPolling();
+      // Fresh connection: the next state push is a full backlog, not
+      // incremental activity, so don't toast any of it — just re-seed the
+      // baseline from it.
+      seenNoticeKeys = null;
     };
 
     ws.onmessage = function (evt) {
@@ -346,8 +369,31 @@
     renderPeerSelect(data.peers || []);
     renderPeersSection(data.peers || []);
     renderTrust(data.trust || []);
-    renderEvents(data.events || []);
+    renderEvents(data.events || [], data.notices || []);
+    processNoticeToasts(data.notices || []);
     updateTitleBadge((data.pending_auth || []).length + (data.pending_forwards || []).length);
+  }
+
+  function noticeKey(n) {
+    return n.time + "|" + n.kind + "|" + n.text;
+  }
+
+  // Toasts any notice that wasn't present the last time we looked (see
+  // `seenNoticeKeys` above for the reconnect/first-load baseline rule).
+  function processNoticeToasts(notices) {
+    var currentKeys = {};
+    notices.forEach(function (n) {
+      var key = noticeKey(n);
+      currentKeys[key] = true;
+      if (seenNoticeKeys !== null && !seenNoticeKeys[key]) {
+        if (n.kind === "error") {
+          toast(n.text, "error");
+        } else if (n.kind === "info") {
+          toast(n.text, "info");
+        }
+      }
+    });
+    seenNoticeKeys = currentKeys;
   }
 
   function updateTitleBadge(pendingCount) {
@@ -453,7 +499,7 @@
     var info = mkEl("div", { className: "info" }, [
       mkEl("div", { text: shortId(item.peer_id) + "  ·  " + item.proto, title: item.peer_id }),
       mkEl("div", { className: "sub", text: "remote: " + item.remote_addr }),
-      mkEl("div", { className: "sub", text: "target: " + item.target }),
+      mkEl("div", { className: "sub", text: "target: " + displayTarget(item.target, item.proto) }),
     ]);
 
     var acceptBtn = mkEl("button", {
@@ -518,7 +564,7 @@
         mkEl("td", { className: "mono", text: fwd.proto || "" }),
         mkEl("td", { text: fwd.direction || "" }),
         mkEl("td", { className: "mono", text: fwd.local || "" }),
-        mkEl("td", { className: "mono", text: fwd.target || "" }),
+        mkEl("td", { className: "mono", text: displayTarget(fwd.target, fwd.proto) || "" }),
         statusCell,
         mkEl("td", {}, [deleteBtn]),
       ]);
@@ -607,11 +653,30 @@
 
   var EVENTS_CAP = 100;
 
-  function renderEvents(events) {
-    // Cap to the most recent EVENTS_CAP entries before comparing/rendering.
-    // Backend is assumed to append events in chronological order (oldest
-    // first); we take the tail and display it most-recent-first.
-    var capped = events.length > EVENTS_CAP ? events.slice(events.length - EVENTS_CAP) : events;
+  // Renders auth events and forward-negotiation notices as one merged,
+  // chronologically-ordered log. Both arrive from the backend already
+  // sorted oldest-first with RFC3339 `time` strings, so a stable string sort
+  // on `time` interleaves them correctly (equal timestamps keep insertion
+  // order — events pushed before notices — since Array#sort is spec-stable).
+  function renderEvents(events, notices) {
+    var merged = events
+      .map(function (ev) {
+        return { time: ev.time, isNotice: false, item: ev };
+      })
+      .concat(
+        notices.map(function (n) {
+          return { time: n.time, isNotice: true, item: n };
+        })
+      );
+    merged.sort(function (a, b) {
+      if (a.time < b.time) return -1;
+      if (a.time > b.time) return 1;
+      return 0;
+    });
+
+    // Cap to the most recent EVENTS_CAP entries before comparing/rendering;
+    // we take the tail and display it most-recent-first.
+    var capped = merged.length > EVENTS_CAP ? merged.slice(merged.length - EVENTS_CAP) : merged;
     if (unchanged("events", capped)) return;
 
     clearChildren(el.eventsLog);
@@ -619,8 +684,18 @@
 
     // .events-log uses column-reverse layout, so appending in chronological
     // order renders most-recent-first visually without an extra reverse().
-    capped.forEach(function (ev) {
-      el.eventsLog.appendChild(mkEl("div", { className: "event-row", text: formatEventLine(ev) }));
+    capped.forEach(function (entry) {
+      if (entry.isNotice) {
+        var n = entry.item;
+        var cls = "event-row" + (n.kind === "error" ? " event-error" : "");
+        el.eventsLog.appendChild(
+          mkEl("div", { className: cls, text: "[" + formatTimeValue(n.time) + "] " + n.text })
+        );
+      } else {
+        el.eventsLog.appendChild(
+          mkEl("div", { className: "event-row", text: formatEventLine(entry.item) })
+        );
+      }
     });
   }
 

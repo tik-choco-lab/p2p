@@ -498,6 +498,8 @@ section { min-width: 0; }
 
 .event-row:first-child { border-bottom: none; }
 
+.event-row.event-error { color: var(--danger); }
+
 /* ---------- toasts ---------- */
 #toast-container {
   position: fixed;

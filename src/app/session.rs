@@ -5,7 +5,11 @@
 //! side-effect logic (approving forwards, sending requests, persisting
 //! trust, etc).
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::Result;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::auth::{
@@ -16,6 +20,30 @@ use crate::controller::{Direction, ForwardController, ForwardSpec, ForwardStatus
 use crate::forward_store::{default_forward_store_path, ForwardStore};
 use crate::negotiation::{ForwardNegotiator, ForwardOutcome, IncomingForward, OutgoingForward};
 use crate::rtc::RTCManager;
+
+/// How many notices `SessionContext::push_notice` retains before dropping the
+/// oldest -- mirrors `AuthAuditLog`'s capacity-trim pattern (see
+/// `auth::audit::AuthAuditLog::record`), just with a smaller cap since
+/// notices are meant to be a short "what just happened" strip, not a full
+/// audit trail (that's what the audit log/events pane is for).
+const MAX_NOTICES: usize = 50;
+
+/// A user-facing "something happened" message surfaced by both the TUI and
+/// Web UI -- e.g. a forward negotiation outcome that would otherwise only be
+/// visible via `tracing` logs (which default to the `error` level and so are
+/// invisible in normal use; see `SessionContext::apply_forward_outcome`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SessionNotice {
+    pub(crate) timestamp_ms: u128,
+    pub(crate) kind: NoticeKind,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    Info,
+    Error,
+}
 
 /// How long to wait after a peer's `EVENT_LEAVE` before treating pending
 /// auth requests / forward negotiations addressed to it as abandoned.
@@ -39,6 +67,10 @@ pub(crate) struct SessionContext {
     pub(crate) pending_auth: PendingAuthorizations,
     pub(crate) negotiator: ForwardNegotiator,
     pub(crate) forward_store: ForwardStore,
+    /// Recent user-facing notices (forward-negotiation outcomes, etc), newest
+    /// last, capped at `MAX_NOTICES`. Shared (not per-clone) so every handle
+    /// to this `SessionContext` sees the same feed.
+    pub(crate) notices: Arc<Mutex<Vec<SessionNotice>>>,
 }
 
 /// A recoverable failure from a session operation. Carries a human-readable
@@ -76,6 +108,8 @@ pub(crate) struct Snapshot {
     pub(crate) pending_outgoing: Vec<OutgoingForward>,
     pub(crate) trust: Vec<TrustEntry>,
     pub(crate) events: Vec<AuthEvent>,
+    /// Recent user-facing notices, oldest first (see `SessionContext::notices`).
+    pub(crate) notices: Vec<SessionNotice>,
 }
 
 impl SessionContext {
@@ -158,7 +192,25 @@ impl SessionContext {
             pending_auth,
             negotiator,
             forward_store,
+            notices: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Appends a notice, trimming the oldest entries past `MAX_NOTICES`. The
+    /// single choke point for user-facing notices so both the TUI and Web UI
+    /// pick them up via `snapshot()` regardless of which one happened to
+    /// trigger the underlying event.
+    async fn push_notice(&self, kind: NoticeKind, text: String) {
+        let mut notices = self.notices.lock().await;
+        notices.push(SessionNotice {
+            timestamp_ms: now_ms(),
+            kind,
+            text,
+        });
+        if notices.len() > MAX_NOTICES {
+            let drop = notices.len() - MAX_NOTICES;
+            notices.drain(0..drop);
+        }
     }
 
     /// Gathers current state for display. Cheap-ish (a handful of lock
@@ -181,6 +233,7 @@ impl SessionContext {
             pending_outgoing: self.negotiator.list_outgoing().await,
             trust: self.trust_store.list().await,
             events,
+            notices: self.notices.lock().await.clone(),
         }
     }
 
@@ -294,21 +347,28 @@ impl SessionContext {
 
     /// Requester-side handling of a peer's answer to a forward we sent:
     /// establishes the local connect-forward on acceptance. Mirrors the
-    /// TUI's original `apply_outcome`. Used directly by the Web UI's
-    /// background outcome-drain loop; the TUI keeps its own copy (see
-    /// `tui/app.rs::apply_outcome`) because of a subtle pre-existing quirk
-    /// (an invalid proto is silently ignored there) that this conservative
-    /// refactor intentionally didn't touch.
+    /// TUI's original `apply_outcome`. Used by both the TUI (via
+    /// `tui/app.rs::apply_outcome`, which now just delegates here) and the
+    /// Web UI's background outcome-drain loop (`drain_and_apply_outcomes`
+    /// below) -- the single choke point through which every forward
+    /// negotiation outcome passes, so it's also where `SessionNotice`s are
+    /// pushed (see `push_notice`): otherwise a denied/failed/duplicate
+    /// outcome would only ever reach `tracing::warn!`, which is invisible at
+    /// the default "error" log level (see `main.rs`'s log filter) and left
+    /// users with no explanation for a pending-outgoing entry that just
+    /// vanished.
     pub(crate) async fn apply_forward_outcome(
         &self,
         outcome: &ForwardOutcome,
     ) -> Result<String, SessionError> {
         let out = &outcome.outgoing;
         if !outcome.accepted {
-            return Ok(match &outcome.reason {
+            let text = match &outcome.reason {
                 Some(reason) => format!("forward {} failed: {}", out.target, reason),
                 None => format!("peer denied {}", out.target),
-            });
+            };
+            self.push_notice(NoticeKind::Error, text.clone()).await;
+            return Ok(text);
         }
         let proto = Proto::from_name(&out.proto)
             .map_err(|e| SessionError::Invalid(format!("invalid proto: {}", e)))?;
@@ -319,17 +379,43 @@ impl SessionContext {
             listen_port: out.listen_port,
             target: out.target.clone(),
         };
-        self.controller
-            .add_forward(spec.clone())
-            .await
-            .map_err(|e| SessionError::Invalid(format!("add failed: {}", e)))?;
+        if let Err(first_err) = self.controller.add_forward(spec.clone()).await {
+            // A forward restored from `forward_store` at startup (see
+            // `SessionContext::build`) can occupy the same key (`target`) a
+            // freshly negotiated one now wants. A peer's live approval
+            // should win over that stale/persisted entry, so replace it and
+            // retry once rather than surfacing "forward already exists" for
+            // a forward the user just approved.
+            let key_taken = self
+                .controller
+                .list_forwards()
+                .await
+                .iter()
+                .any(|f| f.key == spec.target);
+            let retry = if key_taken {
+                let _ = self.controller.remove_forward(&spec.target).await;
+                self.controller.add_forward(spec.clone()).await
+            } else {
+                Err(first_err)
+            };
+            if let Err(e) = retry {
+                let text = format!("add failed: {}", e);
+                self.push_notice(NoticeKind::Error, text.clone()).await;
+                return Err(SessionError::Invalid(text));
+            }
+        }
         let _ = self.forward_store.add(&spec).await;
-        Ok(format!("forward established: {}", out.target))
+        let text = format!("forward established: {}", out.target);
+        self.push_notice(NoticeKind::Info, text.clone()).await;
+        Ok(text)
     }
 
     /// Drains any outcomes of forwards this node requested and applies them.
     /// Used by the Web UI's background loop in place of the TUI's per-tick
-    /// `refresh()`; logs failures instead of surfacing them in a UI.
+    /// `refresh()`. User-facing surfacing happens inside
+    /// `apply_forward_outcome` itself (via `SessionNotice`s, visible to both
+    /// front ends); this loop only additionally logs at the `tracing` level
+    /// for anyone tailing logs.
     pub(crate) async fn drain_and_apply_outcomes(&self) {
         for outcome in self.negotiator.drain_outcomes().await {
             match self.apply_forward_outcome(&outcome).await {
@@ -440,6 +526,15 @@ pub(crate) fn parse_addr_port(addr: &str) -> Option<i32> {
     addr.rsplit(':').next()?.parse::<i32>().ok()
 }
 
+/// Current Unix time in milliseconds. Mirrors `auth::audit::now_ms` (kept
+/// as a separate copy since that one is private to its module).
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +563,136 @@ mod tests {
             target_addr: "127.0.0.1:80".to_string(),
             proto: "tcp".to_string(),
         }
+    }
+
+    /// Builds a `SessionContext` backed by inert/for-test components (no
+    /// real network, disk state scoped to a throwaway temp dir) so
+    /// `apply_forward_outcome` can be exercised directly.
+    async fn test_session_context() -> SessionContext {
+        let dir = std::env::temp_dir().join(format!("p2p-session-test-{}", uuid::Uuid::new_v4()));
+        SessionContext {
+            room: "room".to_string(),
+            manager: RTCManager::for_test("self"),
+            controller: ForwardController::new_inert(),
+            trust_store: TrustStore::load(dir.join("trust.json")).await.unwrap(),
+            audit_log: AuthAuditLog::default(),
+            pending_auth: PendingAuthorizations::new(),
+            negotiator: ForwardNegotiator::new(),
+            forward_store: ForwardStore::load(dir.join("forwards.json")).await.unwrap(),
+            notices: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn sample_outgoing_forward(target: &str) -> OutgoingForward {
+        OutgoingForward {
+            peer_id: "peer-1".to_string(),
+            proto: "tcp".to_string(),
+            listen_port: 8080,
+            local_addr: "127.0.0.1:8080".to_string(),
+            remote_addr: "127.0.0.1:80".to_string(),
+            target: target.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_forward_outcome_pushes_info_notice_on_success() {
+        let ctx = test_session_context().await;
+        let outcome = ForwardOutcome {
+            outgoing: sample_outgoing_forward("tcp:127.0.0.1:80"),
+            accepted: true,
+            reason: None,
+        };
+
+        let msg = ctx.apply_forward_outcome(&outcome).await.unwrap();
+        assert_eq!(msg, "forward established: tcp:127.0.0.1:80");
+
+        let notices = ctx.notices.lock().await.clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].kind, NoticeKind::Info);
+        assert_eq!(notices[0].text, "forward established: tcp:127.0.0.1:80");
+    }
+
+    #[tokio::test]
+    async fn apply_forward_outcome_pushes_error_notice_on_add_failure() {
+        let ctx = test_session_context().await;
+        // An empty target is rejected by `ForwardController::add_forward`
+        // ("forward target must not be empty") and isn't a duplicate-key
+        // situation, so this exercises the plain add-failure path.
+        let outcome = ForwardOutcome {
+            outgoing: sample_outgoing_forward(""),
+            accepted: true,
+            reason: None,
+        };
+
+        let err = ctx.apply_forward_outcome(&outcome).await.unwrap_err();
+        assert!(err.to_string().contains("add failed"));
+
+        let notices = ctx.notices.lock().await.clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].kind, NoticeKind::Error);
+        assert!(notices[0].text.contains("add failed"));
+    }
+
+    #[tokio::test]
+    async fn apply_forward_outcome_pushes_error_notice_on_denied_and_failed() {
+        let ctx = test_session_context().await;
+
+        let denied = ForwardOutcome {
+            outgoing: sample_outgoing_forward("tcp:127.0.0.1:80"),
+            accepted: false,
+            reason: None,
+        };
+        let msg = ctx.apply_forward_outcome(&denied).await.unwrap();
+        assert_eq!(msg, "peer denied tcp:127.0.0.1:80");
+
+        let failed = ForwardOutcome {
+            outgoing: sample_outgoing_forward("tcp:127.0.0.1:81"),
+            accepted: false,
+            reason: Some("peer disconnected".to_string()),
+        };
+        let msg = ctx.apply_forward_outcome(&failed).await.unwrap();
+        assert_eq!(msg, "forward tcp:127.0.0.1:81 failed: peer disconnected");
+
+        let notices = ctx.notices.lock().await.clone();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|n| n.kind == NoticeKind::Error));
+    }
+
+    #[tokio::test]
+    async fn apply_forward_outcome_replaces_stale_duplicate_key() {
+        let ctx = test_session_context().await;
+        let target = "tcp:127.0.0.1:80";
+
+        // Stands in for a forward restored from `forward_store` at startup
+        // (see `SessionContext::build`) that happens to share a key with a
+        // forward now being negotiated fresh.
+        ctx.controller
+            .add_forward(ForwardSpec {
+                direction: Direction::Serve,
+                proto: Proto::Tcp,
+                addr: "stale:1".to_string(),
+                listen_port: -1,
+                target: target.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let outcome = ForwardOutcome {
+            outgoing: sample_outgoing_forward(target),
+            accepted: true,
+            reason: None,
+        };
+        let msg = ctx.apply_forward_outcome(&outcome).await.unwrap();
+        assert_eq!(msg, format!("forward established: {}", target));
+
+        let statuses = ctx.controller.list_forwards().await;
+        assert_eq!(statuses.len(), 1, "the stale entry must be replaced, not duplicated");
+        assert_eq!(statuses[0].spec.direction, Direction::Connect);
+        assert_eq!(statuses[0].spec.addr, "127.0.0.1:8080");
+
+        let notices = ctx.notices.lock().await.clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].kind, NoticeKind::Info);
     }
 
     // --- purge_after_grace: the epoch-changed ⇒ no-purge wiring rule -------

@@ -189,12 +189,26 @@ impl ForwardController {
         let state = self.forwards.clone();
 
         Some(tokio::spawn(async move {
+            // Only Serve forwards publish/serve the tunnel target: a
+            // non-empty remote-addr param makes `tcp`/`udp`'s
+            // `listen_and_serve_with_target_and_auth` call
+            // `publish_tunnel_target`, advertising this node as able to
+            // serve `spec.target`. For Connect forwards, `spec.addr` holds
+            // the *local* listen address (display-only, see
+            // `web::state::local_endpoint`) -- passing it through here would
+            // make the requester wrongly advertise itself as a server for
+            // the target it's merely connecting to. Pass an empty string
+            // instead so only the actual Serve side ever publishes.
+            let remote_addr = match spec.direction {
+                Direction::Serve => spec.addr.clone(),
+                Direction::Connect => String::new(),
+            };
             let result = match spec.proto {
                 Proto::Tcp => {
                     tcp::TcpManager::listen_and_serve_with_target_and_auth(
                         manager,
                         spec.listen_port,
-                        spec.addr.clone(),
+                        remote_addr,
                         spec.target.clone(),
                         runtime,
                         authorizer,
@@ -205,7 +219,7 @@ impl ForwardController {
                     udp::UdpManager::listen_and_serve_with_target_and_auth(
                         manager,
                         spec.listen_port,
-                        spec.addr.clone(),
+                        remote_addr,
                         spec.target.clone(),
                         runtime,
                         authorizer,

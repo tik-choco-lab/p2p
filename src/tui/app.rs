@@ -1,7 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::auth::{AuthDecision, AuthEvent, PendingAuthorization, TrustEntry};
-use crate::controller::{Direction, ForwardSpec, ForwardStatus, Proto};
+use crate::controller::ForwardStatus;
 use crate::negotiation::{IncomingForward, OutgoingForward};
 
 use super::TuiContext;
@@ -270,39 +270,15 @@ impl App {
     }
 
     /// Requester-side handling of a peer's answer to our forward request.
-    /// Deliberately kept as its own copy rather than delegating to
-    /// `SessionContext::apply_forward_outcome` (used by the Web UI's
-    /// background loop): that shared version surfaces an "invalid proto"
-    /// message on the `Err(_) => return` branch below, which would be an
-    /// observable TUI behavior change. TODO: reconcile once that's judged
-    /// intentional.
+    /// The side-effect chain (establishing the connect-forward, duplicate-key
+    /// replacement, pushing a `SessionNotice`) lives in
+    /// `SessionContext::apply_forward_outcome`, shared with the Web UI's
+    /// background outcome-drain loop.
     async fn apply_outcome(&mut self, outcome: crate::negotiation::ForwardOutcome) {
-        let reason = outcome.reason.clone();
-        let out = outcome.outgoing;
-        if !outcome.accepted {
-            self.message = Some(match reason {
-                Some(reason) => format!("forward {} failed: {}", out.target, reason),
-                None => format!("peer denied {}", out.target),
-            });
-            return;
-        }
-        let proto = match Proto::from_name(&out.proto) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let spec = ForwardSpec {
-            direction: Direction::Connect,
-            proto,
-            addr: out.local_addr.clone(),
-            listen_port: out.listen_port,
-            target: out.target.clone(),
-        };
-        if let Err(e) = self.ctx.controller.add_forward(spec.clone()).await {
-            self.message = Some(format!("add failed: {}", e));
-            return;
-        }
-        let _ = self.ctx.forward_store.add(&spec).await;
-        self.message = Some(format!("forward established: {}", out.target));
+        self.message = Some(match self.ctx.apply_forward_outcome(&outcome).await {
+            Ok(msg) => msg,
+            Err(e) => e.to_string(),
+        });
     }
 
     async fn handle_add_key(&mut self, key: KeyEvent, mut form: AddForm) {
