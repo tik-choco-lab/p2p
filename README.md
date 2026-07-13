@@ -121,7 +121,7 @@ p2p connect my-room 8080:80
 p2p connect my-room 8080:80 15432:5432
 ```
 
-Forward notation for `connect` is `[proto://]<listen-port>:<remote-port>`. If `remote-port` is omitted it defaults to `listen-port`. The matching peer is selected automatically from the forward keys it advertises.
+Forward notation for `connect` is `[proto://]<listen-port>:<remote-port>[@node]`. If `remote-port` is omitted it defaults to `listen-port`. The matching peer is selected automatically from the forward keys it advertises. The optional `@node` suffix pins the forward to a specific peer node id instead of relying on advertised-key matching, which lets forwards to the *same* remote port on *different* nodes coexist, e.g. `p2p connect my-room 10022:22@node-a 10023:22@node-b`.
 
 ### 4. Chat Mode
 

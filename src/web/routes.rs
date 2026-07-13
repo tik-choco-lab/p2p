@@ -9,6 +9,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use crate::app::session::{parse_addr_port, SessionError};
+use crate::forward_args::node_scoped_target;
 use crate::negotiation::OutgoingForward;
 
 use super::state::{
@@ -120,7 +121,7 @@ async fn post_forwards(
         }
     };
 
-    let target = format!("{}:{}", proto, remote);
+    let target = node_scoped_target(&format!("{}:{}", proto, remote), &peer_id);
     let draft = OutgoingForward {
         peer_id,
         proto,

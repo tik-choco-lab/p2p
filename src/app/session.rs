@@ -695,6 +695,77 @@ mod tests {
         assert_eq!(notices[0].kind, NoticeKind::Info);
     }
 
+    #[tokio::test]
+    async fn apply_forward_outcome_scoped_targets_on_different_peers_coexist() {
+        let ctx = test_session_context().await;
+
+        // Regression test for the original node-scoping bug: two forwards to
+        // the *same* remote addr but on different peer nodes previously
+        // collided on the unscoped target key (second replaced the first).
+        // With `@node` scoping baked into `target`, they must coexist.
+        let mut on_a = sample_outgoing_forward("tcp:127.0.0.1:22@node-a");
+        on_a.listen_port = 10022;
+        let outcome_a = ForwardOutcome {
+            outgoing: on_a,
+            accepted: true,
+            reason: None,
+        };
+        let msg = ctx.apply_forward_outcome(&outcome_a).await.unwrap();
+        assert_eq!(msg, "forward established: tcp:127.0.0.1:22@node-a");
+
+        let mut on_b = sample_outgoing_forward("tcp:127.0.0.1:22@node-b");
+        on_b.listen_port = 10023;
+        let outcome_b = ForwardOutcome {
+            outgoing: on_b,
+            accepted: true,
+            reason: None,
+        };
+        let msg = ctx.apply_forward_outcome(&outcome_b).await.unwrap();
+        assert_eq!(msg, "forward established: tcp:127.0.0.1:22@node-b");
+
+        let statuses = ctx.controller.list_forwards().await;
+        assert_eq!(
+            statuses.len(),
+            2,
+            "forwards to the same remote addr but scoped to different peers must coexist"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_forward_outcome_replaces_same_scoped_target() {
+        let ctx = test_session_context().await;
+        let target = "tcp:127.0.0.1:22@node-a";
+
+        // The existing replace-on-duplicate-key behavior, now exercised
+        // per-node: a second accepted outcome for the *same* scoped target
+        // still replaces the first rather than duplicating it.
+        let mut first = sample_outgoing_forward(target);
+        first.listen_port = 10022;
+        let outcome_first = ForwardOutcome {
+            outgoing: first,
+            accepted: true,
+            reason: None,
+        };
+        ctx.apply_forward_outcome(&outcome_first).await.unwrap();
+
+        let mut second = sample_outgoing_forward(target);
+        second.listen_port = 10099;
+        let outcome_second = ForwardOutcome {
+            outgoing: second,
+            accepted: true,
+            reason: None,
+        };
+        ctx.apply_forward_outcome(&outcome_second).await.unwrap();
+
+        let statuses = ctx.controller.list_forwards().await;
+        assert_eq!(
+            statuses.len(),
+            1,
+            "second outcome for the same scoped target must replace, not duplicate"
+        );
+        assert_eq!(statuses[0].spec.listen_port, 10099);
+    }
+
     // --- purge_after_grace: the epoch-changed ⇒ no-purge wiring rule -------
     //
     // These drive `purge_after_grace` directly rather than through a real

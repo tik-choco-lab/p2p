@@ -23,10 +23,21 @@ pub(super) fn state_name(s: &ForwardState) -> &str {
     }
 }
 
+/// A connect forward's target may carry a trailing `@node-id` (see
+/// [`crate::forward_args::split_node_scope`]) pinning it to a specific peer.
+/// Rendering the raw `proto:addr@node-id` string would leak the separator
+/// into the UI, so this splits it and shows the node as a readable
+/// `base @ node` suffix instead.
 pub(super) fn endpoint(spec: &ForwardSpec) -> String {
     match spec.direction {
         Direction::Serve => format!("serving {}", spec.addr),
-        Direction::Connect => format!(":{} → peer {}", spec.listen_port, spec.target),
+        Direction::Connect => {
+            let (base, scope) = crate::forward_args::split_node_scope(&spec.target);
+            match scope {
+                Some(node) => format!(":{} → peer {} @ {}", spec.listen_port, base, node),
+                None => format!(":{} → peer {}", spec.listen_port, base),
+            }
+        }
     }
 }
 

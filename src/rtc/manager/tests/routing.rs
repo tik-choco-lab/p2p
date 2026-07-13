@@ -283,6 +283,231 @@ async fn leave_retains_capabilities_but_routing_excludes_departed_peer_until_rej
 }
 
 #[tokio::test]
+async fn scoped_target_always_selects_pinned_peer_without_round_robin() {
+    let manager = test_manager("self", PeerRole::Client);
+
+    // Two peers both advertise the base target; only "peer-a" also
+    // advertises the peer-a-scoped variant.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-a".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80".to_string(), "tcp:80@peer-a".to_string()],
+        }),
+    )
+    .await;
+    handle_payload(
+        manager.inner.clone(),
+        "peer-b".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80".to_string()],
+        }),
+    )
+    .await;
+
+    for _ in 0..6 {
+        assert_eq!(
+            manager.select_server_peer_for("tcp:80@peer-a").await,
+            Some("peer-a".to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn scoped_target_returns_none_when_pinned_peer_not_live() {
+    let manager = test_manager("self", PeerRole::Client);
+
+    // "peer-b" is live and advertises the base target, but the pinned peer
+    // ("peer-a") never joined -- there must be no fallback to peer-b.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-b".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80".to_string()],
+        }),
+    )
+    .await;
+
+    assert!(manager
+        .get_server_peers_for("tcp:80@peer-a")
+        .await
+        .is_empty());
+    assert_eq!(manager.select_server_peer_for("tcp:80@peer-a").await, None);
+}
+
+#[tokio::test]
+async fn scoped_target_returns_none_when_pinned_peer_advertises_unrelated_key() {
+    let manager = test_manager("self", PeerRole::Client);
+
+    // "peer-a" is live, but only advertises an unrelated key -- not the
+    // scoped target, and not even the unscoped base target.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-a".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:5432".to_string()],
+        }),
+    )
+    .await;
+    handle_payload(
+        manager.inner.clone(),
+        "peer-b".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80".to_string()],
+        }),
+    )
+    .await;
+
+    assert!(manager
+        .get_server_peers_for("tcp:80@peer-a")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn scoped_target_ignores_the_key_when_advertised_by_a_different_peer() {
+    let manager = test_manager("self", PeerRole::Client);
+
+    // "peer-a" is live but doesn't advertise the scoped key itself; the
+    // literal string "tcp:80@peer-a" is instead advertised by "peer-b".
+    // The pinned peer's own advertisement is what must be checked, not
+    // whether the string is advertised by *someone*.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-a".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:5432".to_string()],
+        }),
+    )
+    .await;
+    handle_payload(
+        manager.inner.clone(),
+        "peer-b".to_string(),
+        encode(P2pPayload::Capabilities {
+            forwards: vec!["tcp:80@peer-a".to_string()],
+        }),
+    )
+    .await;
+
+    assert!(manager
+        .get_server_peers_for("tcp:80@peer-a")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn scoped_message_reaches_base_target_handler_only_when_pinned_to_self() {
+    let manager = test_manager("self", PeerRole::Client);
+    let received = Arc::new(Mutex::new(Vec::new()));
+
+    {
+        let received = received.clone();
+        manager
+            .on_tunnel_message_for("tcp:80".to_string(), move |peer, data| {
+                let tm: TunnelMessage = serde_json::from_slice(&data).unwrap();
+                received.lock().unwrap().push((peer, tm.conn_id));
+            })
+            .await;
+    }
+
+    // Pinned to a different node -- must not reach the "tcp:80" handler.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        encode(P2pPayload::Tunnel {
+            data: encode_tunnel("tcp:80@other", "conn-other"),
+        }),
+    )
+    .await;
+    assert!(received.lock().unwrap().is_empty());
+
+    // Pinned to "self" -- reaches the "tcp:80" handler.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-1".to_string(),
+        encode(P2pPayload::Tunnel {
+            data: encode_tunnel("tcp:80@self", "conn-self"),
+        }),
+    )
+    .await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![("peer-1".to_string(), "conn-self".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn base_target_message_reaches_scoped_handler_only_from_pinned_sender() {
+    let manager = test_manager("self", PeerRole::Client);
+    let received = Arc::new(Mutex::new(Vec::new()));
+
+    {
+        let received = received.clone();
+        manager
+            .on_tunnel_message_for("tcp:80@peer-a".to_string(), move |peer, data| {
+                let tm: TunnelMessage = serde_json::from_slice(&data).unwrap();
+                received.lock().unwrap().push((peer, tm.conn_id));
+            })
+            .await;
+    }
+
+    // Base-target message from an unrelated sender -- must not reach the
+    // "tcp:80@peer-a"-scoped handler.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-b".to_string(),
+        encode(P2pPayload::Tunnel {
+            data: encode_tunnel("tcp:80", "conn-from-b"),
+        }),
+    )
+    .await;
+    assert!(received.lock().unwrap().is_empty());
+
+    // Base-target message from the pinned sender "peer-a" -- reaches it.
+    handle_payload(
+        manager.inner.clone(),
+        "peer-a".to_string(),
+        encode(P2pPayload::Tunnel {
+            data: encode_tunnel("tcp:80", "conn-from-a"),
+        }),
+    )
+    .await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![("peer-a".to_string(), "conn-from-a".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn publish_tunnel_target_also_advertises_self_scoped_variant() {
+    let manager = test_manager("node-x", PeerRole::Server);
+
+    manager.publish_tunnel_target("tcp:80").await;
+
+    let keys = manager.inner.self_forward_keys.read().await;
+    assert!(keys.contains("tcp:80"));
+    assert!(keys.contains("tcp:80@node-x"));
+    drop(keys);
+
+    manager.unpublish_tunnel_target("tcp:80").await;
+    let keys = manager.inner.self_forward_keys.read().await;
+    assert!(!keys.contains("tcp:80"));
+    assert!(!keys.contains("tcp:80@node-x"));
+}
+
+#[tokio::test]
+async fn publish_tunnel_target_with_scope_does_not_add_a_second_scope() {
+    let manager = test_manager("node-x", PeerRole::Server);
+
+    manager.publish_tunnel_target("tcp:80@node-y").await;
+
+    let keys = manager.inner.self_forward_keys.read().await;
+    assert!(keys.contains("tcp:80@node-y"));
+    assert!(!keys.contains("tcp:80"));
+    assert!(!keys.contains("tcp:80@node-x"));
+}
+
+#[tokio::test]
 async fn empty_tunnel_target_uses_next_handler_after_default_removed() {
     let manager = test_manager("self", PeerRole::Client);
     let first = Arc::new(Mutex::new(Vec::new()));
