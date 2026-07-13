@@ -1,0 +1,190 @@
+# Builds release binaries for p2p on every push to `main` and publishes them
+# as a GitHub Release with downloadable archives + a SHA256SUMS file.
+#
+# Release strategy:
+#   - If the version in Cargo.toml's [package] section has NOT been released
+#     yet (no `vX.Y.Z` tag exists), this creates a proper stable release
+#     tagged `vX.Y.Z` with auto-generated release notes.
+#   - If a push to `main` lands without a version bump (tag already exists),
+#     this instead republishes a rolling prerelease tagged `latest` ("Latest
+#     build (main)") pointing at the new commit, so every push stays
+#     immediately downloadable even between version bumps.
+#
+# This workflow does NOT run `just release` or any mistlib vendoring/ensure
+# scripts - it builds directly against the vendored source already checked
+# into the repo via `cargo build --release --locked`.
+#
+# Manual run: Actions tab -> release -> Run workflow (workflow_dispatch),
+# or `gh workflow run release.yml`.
+
+name: release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      tag_exists: ${{ steps.meta.outputs.tag_exists }}
+      # Tag the assets are named after: the version tag for a stable release,
+      # `latest` for the rolling prerelease, so download URLs like
+      # .../releases/download/latest/p2p-latest-<target>.tar.gz stay valid.
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from Cargo.toml and check for existing tag
+        id: meta
+        shell: bash
+        run: |
+          version=$(awk -F'"' '
+            /^\[package\]/ { in_pkg=1; next }
+            /^\[/          { in_pkg=0 }
+            in_pkg && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+
+          if [ -z "$version" ]; then
+            echo "failed to parse version from Cargo.toml [package] section" >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            echo "release_tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          stage="p2p-${{ needs.version.outputs.release_tag }}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/p2p" "$stage/"
+          cp LICENSE README.md "$stage/"
+          tar czf "${stage}.tar.gz" "$stage"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "p2p-${{ needs.version.outputs.release_tag }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/p2p.exe" "$stage/"
+          Copy-Item LICENSE, README.md "$stage/"
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-${{ needs.version.outputs.release_tag }}-${{ matrix.target }}
+          path: |
+            p2p-${{ needs.version.outputs.release_tag }}-${{ matrix.target }}.tar.gz
+            p2p-${{ needs.version.outputs.release_tag }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: p2p-${{ needs.version.outputs.release_tag }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        shell: bash
+        run: sha256sum * > SHA256SUMS
+
+      - name: Reset rolling "latest" release
+        if: needs.version.outputs.tag_exists == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag --repo "${{ github.repository }}" || true
+
+      - name: Publish stable release
+        if: needs.version.outputs.tag_exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*
+
+      - name: Publish rolling "latest" build
+        if: needs.version.outputs.tag_exists == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest build (main)"
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          body: |
+            Rolling build produced from the latest push to `main` (commit
+            ${{ github.sha }}). This is not a stable release - for tagged
+            versions see the releases named `vX.Y.Z`.
+          files: |
+            dist/*
