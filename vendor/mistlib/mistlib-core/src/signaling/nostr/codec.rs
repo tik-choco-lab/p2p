@@ -84,7 +84,10 @@ impl NostrCodecConfig {
         scopes
     }
 
-    fn room_scope_rotation_seconds(&self) -> u64 {
+    /// Interval at which the room scope ("d" tag) rotates. Subscriptions
+    /// embed a static scope window, so subscribers must re-issue REQ filters
+    /// at least once per rotation to keep receiving events from new peers.
+    pub fn room_scope_rotation_seconds(&self) -> u64 {
         self.ttl_seconds.clamp(
             MIN_ROOM_SCOPE_ROTATION_SECONDS,
             MAX_ROOM_SCOPE_ROTATION_SECONDS,

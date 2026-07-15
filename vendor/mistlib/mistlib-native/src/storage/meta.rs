@@ -76,7 +76,10 @@ mod tests {
     async fn test_set_get_roundtrip_and_overwrite() {
         let (store, _dir) = temp_store().await;
         store.set("pins", b"v1").await.unwrap();
-        assert_eq!(store.get("pins").await.unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(
+            store.get("pins").await.unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
         // Overwrite (last-write-wins, shorter content must truncate).
         store.set("pins", b"2").await.unwrap();
         assert_eq!(store.get("pins").await.unwrap().as_deref(), Some(&b"2"[..]));

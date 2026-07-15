@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use mistlib_core::config::NostrSignalingConfig;
 use mistlib_core::signaling::nostr::{
-    DedupeCache, DiscoveryTable, InvitePskCrypto, NostrCodecConfig, TemporarySignalingIdentity,
+    random_subscription_id, DedupeCache, DiscoveryTable, InvitePskCrypto, NostrCodecConfig,
+    TemporarySignalingIdentity,
 };
 use mistlib_core::signaling::{MessageContent, Signaler};
 use mistlib_core::types::NodeId;
@@ -17,9 +18,31 @@ mod processing;
 mod publish;
 mod refresh;
 mod relay_source;
+mod resubscribe;
 
 #[cfg(test)]
 mod tests;
+
+/// Subscription ids for a room's active discovery/message REQ filters.
+///
+/// These are generated once per room join and reused across relay
+/// (re)connects and periodic filter refreshes so that re-issuing a REQ with
+/// the same subscription id replaces the relay-side filter (NIP-01) instead
+/// of opening an ever-growing set of parallel subscriptions.
+#[derive(Clone)]
+struct RoomSubscriptionIds {
+    discovery: String,
+    message: String,
+}
+
+impl RoomSubscriptionIds {
+    fn generate() -> Self {
+        Self {
+            discovery: random_subscription_id(),
+            message: random_subscription_id(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct NostrSignaler {
@@ -42,6 +65,8 @@ pub struct NostrSignaler {
     requested_pubkeys: Arc<Mutex<HashSet<String>>>,
     peer_sessions: Arc<Mutex<HashMap<String, u64>>>,
     refresh_epoch: Arc<AtomicU64>,
+    resubscribe_epoch: Arc<AtomicU64>,
+    subscription_ids: Arc<Mutex<Option<RoomSubscriptionIds>>>,
     reconnect_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
@@ -71,8 +96,23 @@ impl NostrSignaler {
             requested_pubkeys: Arc::new(Mutex::new(HashSet::new())),
             peer_sessions: Arc::new(Mutex::new(HashMap::new())),
             refresh_epoch: Arc::new(AtomicU64::new(0)),
+            resubscribe_epoch: Arc::new(AtomicU64::new(0)),
+            subscription_ids: Arc::new(Mutex::new(None)),
             reconnect_cancel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns the current room's discovery/message subscription ids,
+    /// generating and persisting them on first use so that all relay
+    /// connections and later filter refreshes reuse the same ids.
+    async fn current_subscription_ids(&self) -> RoomSubscriptionIds {
+        let mut lock = self.subscription_ids.lock().await;
+        if let Some(ids) = lock.as_ref() {
+            return ids.clone();
+        }
+        let ids = RoomSubscriptionIds::generate();
+        *lock = Some(ids.clone());
+        ids
     }
 
     async fn set_room_id(&self, room_id: &str) -> mistlib_core::error::Result<()> {
@@ -96,9 +136,11 @@ impl NostrSignaler {
             self.incoming_sequences.lock().await.clear();
             self.requested_pubkeys.lock().await.clear();
             self.peer_sessions.lock().await.clear();
+            self.subscription_ids.lock().await.take();
             *self.local_joined_at.lock().await = Some(current_unix_millis());
             self.subscribe_room(room_id).await?;
             self.spawn_discovery_refresh(room_id.to_string());
+            self.spawn_room_resubscribe(room_id.to_string());
         }
         Ok(())
     }
@@ -216,6 +258,7 @@ impl Signaler for NostrSignaler {
 
     async fn close(&self) -> mistlib_core::error::Result<()> {
         self.cancel_discovery_refresh();
+        self.cancel_room_resubscribe();
         self.session_epoch.fetch_add(1, Ordering::SeqCst);
         if let Some(cancel) = self.reconnect_cancel.lock().await.take() {
             cancel.cancel();
@@ -225,6 +268,7 @@ impl Signaler for NostrSignaler {
         self.clear_session_state().await;
         self.local_joined_at.lock().await.take();
         self.rotated_identity.lock().await.take();
+        self.subscription_ids.lock().await.take();
         Ok(())
     }
 }

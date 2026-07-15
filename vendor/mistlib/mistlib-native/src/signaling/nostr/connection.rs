@@ -1,8 +1,7 @@
 use super::NostrSignaler;
 use futures_util::{SinkExt, StreamExt};
 use mistlib_core::signaling::nostr::{
-    discovery_filter, message_filter, parse_relay_message, random_subscription_id, req_frame_json,
-    RelayMessage,
+    discovery_filter, message_filter, parse_relay_message, req_frame_json, RelayMessage,
 };
 use mistlib_core::signaling::reconnect::random_reconnect_backoff_delay;
 use mistlib_core::signaling::MessageContent;
@@ -136,6 +135,7 @@ impl NostrSignaler {
             self.subscribe(&tx, room_id).await?;
         }
 
+        let reader_tx = tx.clone();
         {
             let mut senders = self.senders.lock().await;
             senders.retain(|tx| !tx.is_closed());
@@ -229,7 +229,7 @@ impl NostrSignaler {
                             }
                         };
                         signaler
-                            .handle_relay_message(parsed, incoming_tx.clone())
+                            .handle_relay_message(parsed, incoming_tx.clone(), &reader_tx)
                             .await;
                     }
                 }
@@ -247,6 +247,7 @@ impl NostrSignaler {
         &self,
         message: RelayMessage,
         incoming_tx: mpsc::Sender<MessageContent>,
+        relay_tx: &mpsc::Sender<String>,
     ) {
         match message {
             RelayMessage::Event { event, .. } => {
@@ -254,19 +255,39 @@ impl NostrSignaler {
                     tracing::warn!("NostrSignaler: event processing failed: {:?}", err);
                 }
             }
+            RelayMessage::Closed {
+                subscription_id,
+                message,
+            } => {
+                tracing::warn!(
+                    "NostrSignaler: relay closed subscription {}: {}",
+                    subscription_id,
+                    message
+                );
+                self.resubscribe_after_closed(relay_tx, &subscription_id)
+                    .await;
+            }
             status => log_relay_status(status),
         }
     }
 
+    /// Sends the room's discovery/message REQ frames on `tx`.
+    ///
+    /// Reuses the room's persisted subscription ids (generating them on
+    /// first use) so that re-invoking this — on reconnect, periodic
+    /// resubscribe, or after a relay-issued CLOSED — replaces the relay-side
+    /// filter for the same subscription instead of opening a new one
+    /// (NIP-01 REQ semantics).
     pub(super) async fn subscribe(
         &self,
         tx: &mpsc::Sender<String>,
         room_id: &str,
     ) -> mistlib_core::error::Result<()> {
+        let ids = self.current_subscription_ids().await;
         let discovery = discovery_filter(&self.codec_config, room_id);
         let message = message_filter(&self.codec_config, room_id);
-        let discovery_frame = req_frame_json(&random_subscription_id(), &[discovery])?;
-        let message_frame = req_frame_json(&random_subscription_id(), &[message])?;
+        let discovery_frame = req_frame_json(&ids.discovery, &[discovery])?;
+        let message_frame = req_frame_json(&ids.message, &[message])?;
         tx.send(discovery_frame).await.map_err(|e| {
             mistlib_core::error::MistError::Signaling(format!(
                 "NostrSignaler: subscribe failed: {e}"
@@ -278,6 +299,29 @@ impl NostrSignaler {
             ))
         })?;
         Ok(())
+    }
+
+    /// Re-issues the room's REQ frames on `tx` after the relay sent a
+    /// `CLOSED` for one of our active subscriptions, so the peer keeps
+    /// receiving events instead of silently losing the subscription.
+    async fn resubscribe_after_closed(&self, tx: &mpsc::Sender<String>, subscription_id: &str) {
+        let Some(room_id) = self.current_room_id().await else {
+            return;
+        };
+        let ids = self.subscription_ids.lock().await.clone();
+        let Some(ids) = ids else {
+            return;
+        };
+        if subscription_id != ids.discovery && subscription_id != ids.message {
+            return;
+        }
+        if let Err(err) = self.subscribe(tx, &room_id).await {
+            tracing::warn!(
+                "NostrSignaler: resubscribe after CLOSED failed for room {}: {:?}",
+                room_id,
+                err
+            );
+        }
     }
 }
 
@@ -305,22 +349,12 @@ fn log_relay_status(message: RelayMessage) {
         RelayMessage::Notice(message) => {
             tracing::warn!("NostrSignaler: relay notice: {}", message);
         }
-        RelayMessage::Closed {
-            subscription_id,
-            message,
-        } => {
-            tracing::warn!(
-                "NostrSignaler: relay closed subscription {}: {}",
-                subscription_id,
-                message
-            );
-        }
         RelayMessage::Auth(challenge) => {
             tracing::warn!(
                 "NostrSignaler: relay requested AUTH challenge {}; NIP-42 auth is not implemented",
                 challenge
             );
         }
-        RelayMessage::Eose { .. } | RelayMessage::Event { .. } => {}
+        RelayMessage::Eose { .. } | RelayMessage::Event { .. } | RelayMessage::Closed { .. } => {}
     }
 }
