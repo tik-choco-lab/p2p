@@ -50,8 +50,12 @@ pub(crate) async fn run(room_id: Option<&str>, port: u16, open: bool) -> Result<
     };
 
     let self_id = load_or_create_node_id().await?;
-    let ctx = SessionContext::build(self_id, room, true).await?;
+    let ctx = SessionContext::build(self_id, room.clone(), true).await?;
     let manager = ctx.manager.clone();
+
+    let room_store =
+        crate::room_store::RoomStore::load(crate::room_store::default_room_store_path()).await?;
+    let _ = room_store.record_use(&room).await;
 
     let initial = state::build_state_dto(&ctx).await;
     let (state_tx, _state_rx) = watch::channel(Arc::new(initial));
@@ -59,7 +63,11 @@ pub(crate) async fn run(room_id: Option<&str>, port: u16, open: bool) -> Result<
     // `state_tx.send()` always has at least one receiver; every real
     // subscriber comes from `AppState::state_tx.subscribe()` in the WS
     // handler.
-    let app_state = Arc::new(AppState { ctx, state_tx });
+    let app_state = Arc::new(AppState {
+        ctx,
+        room_store,
+        state_tx,
+    });
 
     // Background loop: apply requester-side forward outcomes as they
     // arrive (this is the Web UI's equivalent of the TUI's per-tick
@@ -115,9 +123,17 @@ pub(crate) async fn start_in_process(ctx: SessionContext, preferred_port: u16) -
     };
     let url = format!("http://{}", listener.local_addr()?);
 
+    let room_store =
+        crate::room_store::RoomStore::load(crate::room_store::default_room_store_path()).await?;
+    let _ = room_store.record_use(&ctx.room.lock().await.clone()).await;
+
     let initial = state::build_state_dto(&ctx).await;
     let (state_tx, _state_rx) = watch::channel(Arc::new(initial));
-    let app_state = Arc::new(AppState { ctx, state_tx });
+    let app_state = Arc::new(AppState {
+        ctx,
+        room_store,
+        state_tx,
+    });
 
     {
         let app_state = app_state.clone();

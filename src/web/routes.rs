@@ -8,13 +8,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
+use crate::app::generate_room_id;
 use crate::app::session::{parse_addr_port, SessionError};
 use crate::forward_args::node_scoped_target;
 use crate::negotiation::OutgoingForward;
 
 use super::state::{
     build_state_dto, parse_auth_decision, ActionResult, AddForwardBody, AppState, AuthDecisionBody,
-    ForwardAcceptBody, RemoveTrustBody,
+    ChatSendBody, ForwardAcceptBody, RemoveTrustBody, RoomSwitchResult, RoomsResponse,
+    SwitchRoomBody,
 };
 use super::ws;
 
@@ -29,6 +31,9 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/forwards", post(post_forwards))
         .route("/api/forwards/{id}", delete(delete_forward))
         .route("/api/trust", delete(delete_trust))
+        .route("/api/rooms", get(get_rooms))
+        .route("/api/room", post(post_room))
+        .route("/api/chat", post(post_chat))
         .route("/api/ws", get(ws::handler))
         .with_state(state)
 }
@@ -162,6 +167,48 @@ async fn delete_trust(
     match result {
         Ok(true) => success(),
         Ok(false) => not_found("trust entry not found".to_string()),
+        Err(e) => bad_request(e.to_string()),
+    }
+}
+
+async fn get_rooms(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(RoomsResponse {
+        rooms: state.room_store.list().await,
+    })
+}
+
+async fn post_room(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SwitchRoomBody>,
+) -> Response {
+    let room_id = match body
+        .room_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(r) => r.to_string(),
+        None => generate_room_id(),
+    };
+    state.ctx.switch_room(room_id.clone()).await;
+    let _ = state.room_store.record_use(&room_id).await;
+    state.broadcast_now().await;
+    (
+        StatusCode::OK,
+        Json(RoomSwitchResult {
+            ok: true,
+            room_id: Some(room_id),
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+async fn post_chat(State(state): State<Arc<AppState>>, Json(body): Json<ChatSendBody>) -> Response {
+    let result = state.ctx.send_chat(&body.text).await;
+    state.broadcast_now().await;
+    match result {
+        Ok(()) => success(),
         Err(e) => bad_request(e.to_string()),
     }
 }

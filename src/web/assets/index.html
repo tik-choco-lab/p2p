@@ -22,10 +22,29 @@
 <header id="app-header">
   <div class="header-left">
     <span class="app-name">p2p</span>
-    <button type="button" id="room-id-btn" class="id-chip" title="Click to copy room id">
-      <span class="id-label">room</span>
-      <span class="id-value" id="room-id-value">—</span>
-    </button>
+    <span class="room-id-group">
+      <button type="button" id="room-id-btn" class="id-chip" title="Click to copy room id">
+        <span class="id-label">room</span>
+        <span class="id-value" id="room-id-value">—</span>
+      </button>
+      <button type="button" id="room-switch-btn" class="room-switch-btn" title="Switch room" aria-label="Switch room" aria-haspopup="true" aria-expanded="false">▾</button>
+      <div id="room-switch-popover" class="room-switch-popover hidden" role="menu">
+        <div class="room-switch-section">
+          <div class="room-switch-heading">Recent rooms</div>
+          <div id="room-list" class="room-list"></div>
+          <div id="room-list-empty" class="empty-state">No recent rooms yet.</div>
+        </div>
+        <div class="room-switch-section">
+          <form id="room-connect-form" class="room-connect-form">
+            <input type="text" id="room-connect-input" placeholder="room id" autocomplete="off">
+            <button type="submit" class="btn btn-primary">Connect</button>
+          </form>
+        </div>
+        <div class="room-switch-section">
+          <button type="button" id="room-new-btn" class="btn">New room</button>
+        </div>
+      </div>
+    </span>
     <button type="button" id="node-id-btn" class="id-chip" title="Click to copy node id">
       <span class="id-label">node</span>
       <span class="id-value" id="node-id-value">—</span>
@@ -48,6 +67,16 @@
     <div id="pending-auth-list" class="pending-list"></div>
     <div id="pending-forward-list" class="pending-list"></div>
     <div id="pending-outgoing-list" class="pending-list"></div>
+  </section>
+
+  <section id="chat-section" class="card" aria-label="Chat">
+    <h2 class="section-title">Chat</h2>
+    <div id="chat-log" class="chat-log"></div>
+    <div id="chat-empty" class="empty-state">No messages yet.</div>
+    <form id="chat-form" class="chat-form">
+      <input type="text" id="chat-input" placeholder="Message" autocomplete="off" required>
+      <button type="submit" class="btn btn-primary">Send</button>
+    </form>
   </section>
 
   <section id="forwards-section" class="card" aria-label="Forwards">

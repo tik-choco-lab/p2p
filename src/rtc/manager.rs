@@ -322,6 +322,35 @@ impl RTCManagerHandle {
         mistlib::clear_raw_handler();
         mistlib::leave_room();
     }
+
+    /// Switches the underlying mistlib session to a different room without
+    /// tearing down this manager. Rebuilding a fresh `RTCManagerHandle`
+    /// would call `mistlib::init` again, but that initializes mistlib's
+    /// process-wide singleton engine and is not meant to be called more
+    /// than once per process; `leave_room`/`join_room` are the pair mistlib
+    /// exposes for changing rooms mid-session (its engine even has a
+    /// dedicated race guard -- `MistEngine::run`'s `await_previous_cleanup`
+    /// -- specifically so a `leave_room()` immediately followed by a new
+    /// join is safe).
+    ///
+    /// Every handler registered via `on_*` stays wired (they live on this
+    /// same `inner`, untouched here). Only per-room membership state is
+    /// reset: `leave_room()` tears the transport down directly rather than
+    /// emitting a real `EVENT_LEAVE` per peer (see `event::handle_leave`),
+    /// so `peers`/`peer_roles`/`peer_forward_keys`/`peer_epochs` are cleared
+    /// by hand here instead. Callers that need the equivalent of a per-peer
+    /// leave notification (e.g. `SessionContext::switch_room`, which purges
+    /// pending auth/forward state scoped to peers about to become
+    /// unreachable) must snapshot `connected_peers()` before calling this.
+    pub async fn switch_room(&self, room_id: String) {
+        mistlib::leave_room();
+        self.inner.peers.write().await.clear();
+        self.inner.peer_roles.write().await.clear();
+        self.inner.peer_forward_keys.write().await.clear();
+        self.inner.peer_epochs.write().await.clear();
+        mistlib::join_room(room_id);
+        self.send_role_to_all().await;
+    }
 }
 
 pub type RTCManager = RTCManagerHandle;

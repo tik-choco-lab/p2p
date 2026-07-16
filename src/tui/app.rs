@@ -72,6 +72,10 @@ pub(super) struct App {
     pub(super) events: Vec<AuthEvent>,
     pub(super) trust: Vec<TrustEntry>,
     pub(super) peers: Vec<String>,
+    /// Cached from `ctx.room` (now behind a lock so it can be switched at
+    /// runtime — see `SessionContext::switch_room`) each `refresh()`, so
+    /// synchronous rendering code (`ui.rs`) doesn't need to await a lock.
+    pub(super) room: String,
     pub(super) forwards_sel: usize,
     pub(super) pending_sel: usize,
     pub(super) expanded: bool,
@@ -94,6 +98,7 @@ impl App {
             events: Vec::new(),
             trust: Vec::new(),
             peers: Vec::new(),
+            room: String::new(),
             forwards_sel: 0,
             pending_sel: 0,
             expanded: false,
@@ -126,6 +131,7 @@ impl App {
         self.events = self.ctx.audit_log.list().await;
         self.trust = self.ctx.trust_store.list().await;
         self.peers = self.ctx.manager.connected_peers().await;
+        self.room = self.ctx.room.lock().await.clone();
         if self.forwards_sel >= self.forwards.len() {
             self.forwards_sel = self.forwards.len().saturating_sub(1);
         }

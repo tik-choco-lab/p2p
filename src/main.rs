@@ -7,6 +7,7 @@ mod forward_runtime;
 mod forward_store;
 mod negotiation;
 mod proxy;
+mod room_store;
 mod rtc;
 mod stdio;
 mod tcp;
