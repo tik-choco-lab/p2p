@@ -28,6 +28,13 @@
 
     roomIdBtn: document.getElementById("room-id-btn"),
     roomIdValue: document.getElementById("room-id-value"),
+    roomSwitchBtn: document.getElementById("room-switch-btn"),
+    roomSwitchPopover: document.getElementById("room-switch-popover"),
+    roomList: document.getElementById("room-list"),
+    roomListEmpty: document.getElementById("room-list-empty"),
+    roomConnectForm: document.getElementById("room-connect-form"),
+    roomConnectInput: document.getElementById("room-connect-input"),
+    roomNewBtn: document.getElementById("room-new-btn"),
     nodeIdBtn: document.getElementById("node-id-btn"),
     nodeIdValue: document.getElementById("node-id-value"),
     peerCount: document.getElementById("peer-count"),
@@ -57,6 +64,11 @@
 
     eventsLog: document.getElementById("events-log"),
     eventsEmpty: document.getElementById("events-empty"),
+
+    chatLog: document.getElementById("chat-log"),
+    chatEmpty: document.getElementById("chat-empty"),
+    chatForm: document.getElementById("chat-form"),
+    chatInput: document.getElementById("chat-input"),
   };
 
   /* ----------------------------- helpers -------------------------------- */
@@ -276,6 +288,40 @@
       });
   }
 
+  // Like postJSON, but for POST /api/room specifically: that endpoint's
+  // success response carries the actual room_id (which may differ from what
+  // was requested, e.g. an empty/omitted room_id asks the server to
+  // auto-generate one), and callers need that value to toast/confirm which
+  // room was actually joined. postJSON/handleMutationResponse intentionally
+  // discard the parsed body down to a boolean, so this duplicates just
+  // enough of that logic to surface data.room_id instead.
+  function postRoomJSON(body) {
+    return fetch(apiUrl("/api/room"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(function (res) {
+        return res
+          .json()
+          .catch(function () {
+            return null;
+          })
+          .then(function (data) {
+            if (!res.ok || !data || data.ok === false) {
+              var msg = data && data.error ? data.error : "Request failed (" + res.status + ")";
+              toast(msg, "error");
+              return null;
+            }
+            return data.room_id || null;
+          });
+      })
+      .catch(function (e) {
+        toast("Network error: " + e.message, "error");
+        return null;
+      });
+  }
+
   /* ------------------------------ ws layer ------------------------------ */
 
   var ws = null;
@@ -388,6 +434,7 @@
     renderPeersSection(data.peers || []);
     renderTrust(data.trust || []);
     renderEvents(data.events || [], data.notices || []);
+    renderChat(data.chat || []);
     processNoticeToasts(data.notices || []);
     updateTitleBadge((data.pending_auth || []).length + (data.pending_forwards || []).length);
   }
@@ -739,6 +786,160 @@
         }
       }
     );
+  });
+
+  /* ----------------------------- room switch ------------------------------ */
+
+  function openRoomSwitchPopover() {
+    el.roomSwitchPopover.classList.remove("hidden");
+    el.roomSwitchBtn.setAttribute("aria-expanded", "true");
+    loadRoomList();
+    // Bound only while open (rather than one permanent listener) so the
+    // common case — popover closed — costs nothing on every click/keydown.
+    document.addEventListener("mousedown", onRoomSwitchOutsideClick);
+    document.addEventListener("keydown", onRoomSwitchKeydown);
+  }
+
+  function closeRoomSwitchPopover() {
+    el.roomSwitchPopover.classList.add("hidden");
+    el.roomSwitchBtn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("mousedown", onRoomSwitchOutsideClick);
+    document.removeEventListener("keydown", onRoomSwitchKeydown);
+  }
+
+  function onRoomSwitchOutsideClick(e) {
+    if (!el.roomSwitchPopover.contains(e.target) && e.target !== el.roomSwitchBtn) {
+      closeRoomSwitchPopover();
+    }
+  }
+
+  function onRoomSwitchKeydown(e) {
+    if (e.key === "Escape") closeRoomSwitchPopover();
+  }
+
+  el.roomSwitchBtn.addEventListener("click", function () {
+    if (el.roomSwitchPopover.classList.contains("hidden")) {
+      openRoomSwitchPopover();
+    } else {
+      closeRoomSwitchPopover();
+    }
+  });
+
+  // Always fetches fresh (never relies on cached state) so the list
+  // reflects rooms used since the last state push, per the popover spec.
+  function loadRoomList() {
+    clearChildren(el.roomList);
+    el.roomListEmpty.style.display = "none";
+    el.roomList.appendChild(mkEl("div", { className: "room-list-loading", text: "Loading…" }));
+    fetch(apiUrl("/api/rooms"))
+      .then(function (r) {
+        return r.json();
+      })
+      .then(function (data) {
+        renderRoomList((data && data.rooms) || []);
+      })
+      .catch(function () {
+        clearChildren(el.roomList);
+        el.roomList.appendChild(mkEl("div", { className: "room-list-loading", text: "Failed to load rooms" }));
+      });
+  }
+
+  function renderRoomList(rooms) {
+    clearChildren(el.roomList);
+    el.roomListEmpty.style.display = rooms.length === 0 ? "" : "none";
+
+    rooms.forEach(function (r) {
+      var row = mkEl(
+        "div",
+        { className: "room-list-row", attrs: { role: "menuitem", tabindex: "0" }, title: r.room_id },
+        [
+          mkEl("span", { className: "room-list-id mono", text: r.room_id }),
+          mkEl("span", { className: "room-list-time", text: formatTimeValue(r.last_used_ms) }),
+        ]
+      );
+      row.addEventListener("click", function () {
+        switchRoom(r.room_id);
+      });
+      el.roomList.appendChild(row);
+    });
+  }
+
+  function setRoomSwitchBusy(busy) {
+    el.roomSwitchBtn.disabled = busy;
+    el.roomNewBtn.disabled = busy;
+    var connectBtn = el.roomConnectForm.querySelector("button[type=submit]");
+    if (connectBtn) connectBtn.disabled = busy;
+  }
+
+  // Shared by the recent-room list, the "connect to id" form, and "new
+  // room": all three just POST /api/room with a different room_id (a real
+  // one, a user-typed one, or null to ask the server to auto-generate).
+  function switchRoom(roomId) {
+    setRoomSwitchBusy(true);
+    return postRoomJSON({ room_id: roomId }).then(function (actualRoomId) {
+      setRoomSwitchBusy(false);
+      if (actualRoomId) {
+        toast("Switched to room " + actualRoomId, "info");
+        closeRoomSwitchPopover();
+      }
+      return actualRoomId;
+    });
+  }
+
+  el.roomNewBtn.addEventListener("click", function () {
+    switchRoom(null);
+  });
+
+  el.roomConnectForm.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var val = el.roomConnectInput.value.trim();
+    if (!val) {
+      toast("Enter a room id", "error");
+      return;
+    }
+    switchRoom(val).then(function (actualRoomId) {
+      if (actualRoomId) el.roomConnectInput.value = "";
+    });
+  });
+
+  /* -------------------------------- chat ----------------------------------- */
+
+  function isNearBottom(node) {
+    return node.scrollHeight - node.scrollTop - node.clientHeight < 30;
+  }
+
+  function renderChat(chat) {
+    if (unchanged("chat", chat)) return;
+
+    var wasNearBottom = isNearBottom(el.chatLog);
+
+    clearChildren(el.chatLog);
+    el.chatEmpty.style.display = chat.length === 0 ? "" : "none";
+
+    chat.forEach(function (msg) {
+      var bubble = mkEl("div", { className: "chat-bubble" }, [
+        msg.mine ? null : mkEl("div", { className: "chat-peer", text: shortId(msg.peer_id || ""), title: msg.peer_id || "" }),
+        mkEl("div", { className: "chat-text", text: msg.text }),
+        mkEl("div", { className: "chat-time", text: formatTimeValue(msg.time) }),
+      ]);
+      el.chatLog.appendChild(
+        mkEl("div", { className: "chat-row " + (msg.mine ? "chat-row-mine" : "chat-row-theirs") }, [bubble])
+      );
+    });
+
+    if (wasNearBottom) {
+      el.chatLog.scrollTop = el.chatLog.scrollHeight;
+    }
+  }
+
+  el.chatForm.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var text = el.chatInput.value.trim();
+    if (!text) return;
+
+    postJSON("/api/chat", { text: text }).then(function (ok) {
+      if (ok) el.chatInput.value = "";
+    });
   });
 
   /* ------------------------------- theme --------------------------------- */

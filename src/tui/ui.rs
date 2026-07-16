@@ -55,7 +55,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let conn = app.forwards.len() - serve;
     let text = format!(
         " p2p — room: {}   {}   serve: {} / conn: {}   pending: {} ",
-        app.ctx.room,
+        app.room,
         peers,
         serve,
         conn,

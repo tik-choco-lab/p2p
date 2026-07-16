@@ -45,6 +45,21 @@ pub(crate) enum NoticeKind {
     Error,
 }
 
+/// How many chat messages `SessionContext::chat_log` retains before dropping
+/// the oldest -- mirrors `MAX_NOTICES`'s trim pattern.
+const MAX_CHAT_MESSAGES: usize = 200;
+
+/// A single chat message, either sent by this node (`mine: true`) or
+/// received from a peer (`mine: false`). Surfaced to both front ends via
+/// `Snapshot::chat`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChatMessage {
+    pub(crate) timestamp_ms: u128,
+    pub(crate) peer_id: String,
+    pub(crate) mine: bool,
+    pub(crate) text: String,
+}
+
 /// How long to wait after a peer's `EVENT_LEAVE` before treating pending
 /// auth requests / forward negotiations addressed to it as abandoned.
 /// Mirrors the grace window `crate::tcp::PEER_LEAVE_GRACE` uses for
@@ -59,7 +74,7 @@ const PEER_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(10)
 /// (e.g. axum handlers).
 #[derive(Clone)]
 pub(crate) struct SessionContext {
-    pub(crate) room: String,
+    pub(crate) room: Arc<Mutex<String>>,
     pub(crate) manager: RTCManager,
     pub(crate) controller: ForwardController,
     pub(crate) trust_store: TrustStore,
@@ -71,6 +86,10 @@ pub(crate) struct SessionContext {
     /// last, capped at `MAX_NOTICES`. Shared (not per-clone) so every handle
     /// to this `SessionContext` sees the same feed.
     pub(crate) notices: Arc<Mutex<Vec<SessionNotice>>>,
+    /// Recent chat messages (sent and received), oldest first, capped at
+    /// `MAX_CHAT_MESSAGES`. Shared (not per-clone) so every handle to this
+    /// `SessionContext` sees the same feed.
+    pub(crate) chat_log: Arc<Mutex<Vec<ChatMessage>>>,
 }
 
 /// A recoverable failure from a session operation. Carries a human-readable
@@ -110,6 +129,8 @@ pub(crate) struct Snapshot {
     pub(crate) events: Vec<AuthEvent>,
     /// Recent user-facing notices, oldest first (see `SessionContext::notices`).
     pub(crate) notices: Vec<SessionNotice>,
+    /// Recent chat messages, oldest first (see `SessionContext::chat_log`).
+    pub(crate) chat: Vec<ChatMessage>,
 }
 
 impl SessionContext {
@@ -183,8 +204,21 @@ impl SessionContext {
         )
         .await;
 
+        let chat_log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let chat_log = chat_log.clone();
+            manager
+                .on_chat_message(move |peer_id, text| {
+                    let chat_log = chat_log.clone();
+                    tokio::spawn(async move {
+                        push_chat(&chat_log, peer_id, false, text).await;
+                    });
+                })
+                .await;
+        }
+
         Ok(Self {
-            room,
+            room: Arc::new(Mutex::new(room)),
             manager,
             controller,
             trust_store,
@@ -193,6 +227,7 @@ impl SessionContext {
             negotiator,
             forward_store,
             notices: Arc::new(Mutex::new(Vec::new())),
+            chat_log,
         })
     }
 
@@ -225,7 +260,7 @@ impl SessionContext {
         }
         Snapshot {
             self_id: self.manager.self_id().to_string(),
-            room: self.room.clone(),
+            room: self.room.lock().await.clone(),
             peers: self.manager.connected_peers().await,
             forwards: self.controller.list_forwards().await,
             pending_auth: self.pending_auth.list().await,
@@ -234,6 +269,7 @@ impl SessionContext {
             trust: self.trust_store.list().await,
             events,
             notices: self.notices.lock().await.clone(),
+            chat: self.chat_log.lock().await.clone(),
         }
     }
 
@@ -451,6 +487,42 @@ impl SessionContext {
             .await
             .map_err(|e| SessionError::Invalid(format!("remove failed: {}", e)))
     }
+
+    /// Sends a chat message to every connected peer and immediately records it
+    /// in the local chat log (own sends never loop back through
+    /// `on_chat_message`, unlike a received message).
+    pub(crate) async fn send_chat(&self, text: &str) -> Result<(), SessionError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(SessionError::Invalid("message must not be empty".into()));
+        }
+        push_chat(
+            &self.chat_log,
+            self.manager.self_id().to_string(),
+            true,
+            text.to_string(),
+        )
+        .await;
+        self.manager.send_chat_to_all(text).await;
+        Ok(())
+    }
+
+    /// Switches to a different room. Snapshots currently-connected peers first
+    /// and purges pending auth/forward-negotiation state scoped to them: they
+    /// are about to become unreachable, and `RTCManager::switch_room` won't
+    /// emit real per-peer leave notifications for them (see its doc comment in
+    /// src/rtc/manager.rs).
+    pub(crate) async fn switch_room(&self, new_room: String) {
+        let old_peers = self.manager.connected_peers().await;
+        self.manager.switch_room(new_room.clone()).await;
+        *self.room.lock().await = new_room.clone();
+        for peer_id in old_peers {
+            self.pending_auth.purge_peer(&peer_id).await;
+            self.negotiator.purge_peer(&peer_id).await;
+        }
+        self.push_notice(NoticeKind::Info, format!("switched to room {}", new_room))
+            .await;
+    }
 }
 
 /// Registers a hook that ties a peer's departure to cleanup of state keyed
@@ -509,6 +581,26 @@ async fn purge_after_grace(
             "purged state for departed peer {}: {} pending auth, {} incoming forwards, {} outgoing forwards",
             peer_id, auth_count, incoming, outgoing
         );
+    }
+}
+
+/// Appends a chat message, trimming the oldest entries past
+/// `MAX_CHAT_MESSAGES`. Called both from `SessionContext::send_chat` (our
+/// own outbound messages, `mine: true`) and from the `on_chat_message` hook
+/// wired in `SessionContext::build` (peer-received messages, `mine: false`)
+/// -- a free function rather than a method since the hook closure doesn't
+/// have a `self`.
+async fn push_chat(log: &Arc<Mutex<Vec<ChatMessage>>>, peer_id: String, mine: bool, text: String) {
+    let mut chat = log.lock().await;
+    chat.push(ChatMessage {
+        timestamp_ms: now_ms(),
+        peer_id,
+        mine,
+        text,
+    });
+    if chat.len() > MAX_CHAT_MESSAGES {
+        let drop = chat.len() - MAX_CHAT_MESSAGES;
+        chat.drain(0..drop);
     }
 }
 
@@ -571,7 +663,7 @@ mod tests {
     async fn test_session_context() -> SessionContext {
         let dir = std::env::temp_dir().join(format!("p2p-session-test-{}", uuid::Uuid::new_v4()));
         SessionContext {
-            room: "room".to_string(),
+            room: Arc::new(Mutex::new("room".to_string())),
             manager: RTCManager::for_test("self"),
             controller: ForwardController::new_inert(),
             trust_store: TrustStore::load(dir.join("trust.json")).await.unwrap(),
@@ -580,6 +672,7 @@ mod tests {
             negotiator: ForwardNegotiator::new(),
             forward_store: ForwardStore::load(dir.join("forwards.json")).await.unwrap(),
             notices: Arc::new(Mutex::new(Vec::new())),
+            chat_log: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -852,5 +945,42 @@ mod tests {
         assert!(pending_auth.list().await.is_empty());
         assert_eq!(receiver.await.unwrap(), AuthDecision::Deny);
         assert!(negotiator.list_incoming().await.is_empty());
+    }
+
+    // --- chat -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn send_chat_pushes_mine_entry_with_own_id() {
+        let ctx = test_session_context().await;
+        ctx.send_chat("hello").await.unwrap();
+
+        let chat = ctx.chat_log.lock().await.clone();
+        assert_eq!(chat.len(), 1);
+        assert!(chat[0].mine);
+        assert_eq!(chat[0].peer_id, ctx.manager.self_id());
+        assert_eq!(chat[0].text, "hello");
+    }
+
+    #[tokio::test]
+    async fn send_chat_rejects_empty_message() {
+        let ctx = test_session_context().await;
+        let err = ctx.send_chat("   ").await.unwrap_err();
+        assert!(matches!(err, SessionError::Invalid(_)));
+        assert!(ctx.chat_log.lock().await.is_empty());
+    }
+
+    // --- room switching ---------------------------------------------------
+
+    #[tokio::test]
+    async fn switch_room_updates_room_and_pushes_notice() {
+        let ctx = test_session_context().await;
+        ctx.switch_room("new-room".to_string()).await;
+
+        assert_eq!(ctx.room.lock().await.clone(), "new-room");
+
+        let notices = ctx.notices.lock().await.clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].kind, NoticeKind::Info);
+        assert!(notices[0].text.contains("new-room"));
     }
 }

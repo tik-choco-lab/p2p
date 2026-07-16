@@ -78,6 +78,15 @@ pub(crate) struct NoticeDto {
     pub(crate) text: String,
 }
 
+/// A chat message (see `crate::app::session::ChatMessage`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ChatMessageDto {
+    pub(crate) time: String,
+    pub(crate) peer_id: String,
+    pub(crate) mine: bool,
+    pub(crate) text: String,
+}
+
 /// The full `GET /api/state` payload; also what's flattened into the
 /// `{"type":"state", ...}` WebSocket push (see `web::ws`).
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
@@ -94,6 +103,9 @@ pub(crate) struct StateDto {
     /// Recent user-facing notices, oldest first, capped at 50 (see
     /// `SessionContext::notices`).
     pub(crate) notices: Vec<NoticeDto>,
+    /// Recent chat messages, oldest first, capped at 200 (see
+    /// `SessionContext::chat_log`).
+    pub(crate) chat: Vec<ChatMessageDto>,
 }
 
 /// Bodies accepted by the mutating endpoints.
@@ -119,6 +131,30 @@ pub(crate) struct AddForwardBody {
 pub(crate) struct RemoveTrustBody {
     pub(crate) peer_id: String,
     pub(crate) forward_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SwitchRoomBody {
+    pub(crate) room_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RoomSwitchResult {
+    pub(crate) ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) room_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChatSendBody {
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RoomsResponse {
+    pub(crate) rooms: Vec<crate::room_store::RoomHistoryEntry>,
 }
 
 /// The uniform envelope for mutating endpoints:
@@ -147,6 +183,7 @@ pub(crate) fn parse_auth_decision(s: &str) -> Option<AuthDecision> {
 /// subscriber immediately sees current state on connect.
 pub(crate) struct AppState {
     pub(crate) ctx: SessionContext,
+    pub(crate) room_store: crate::room_store::RoomStore,
     pub(crate) state_tx: watch::Sender<Arc<StateDto>>,
 }
 
@@ -187,6 +224,7 @@ pub(crate) async fn build_state_dto(ctx: &SessionContext) -> StateDto {
         trust: snap.trust.iter().map(trust_dto).collect(),
         events: snap.events.iter().map(event_dto).collect(),
         notices: snap.notices.iter().map(notice_dto).collect(),
+        chat: snap.chat.iter().map(chat_dto).collect(),
     }
 }
 
@@ -298,6 +336,15 @@ fn notice_dto(notice: &SessionNotice) -> NoticeDto {
     }
 }
 
+fn chat_dto(msg: &crate::app::session::ChatMessage) -> ChatMessageDto {
+    ChatMessageDto {
+        time: format_timestamp_ms(msg.timestamp_ms),
+        peer_id: msg.peer_id.clone(),
+        mine: msg.mine,
+        text: msg.text.clone(),
+    }
+}
+
 /// Formats a Unix timestamp in milliseconds as an RFC3339 UTC string (e.g.
 /// `2026-07-12T09:30:00.123Z`) so the frontend's `new Date(...)` parses it
 /// directly. Implemented by hand with Howard Hinnant's `civil_from_days`
@@ -396,6 +443,12 @@ mod tests {
                 kind: "info".into(),
                 text: "forward established: tcp:127.0.0.1:80".into(),
             }],
+            chat: vec![ChatMessageDto {
+                time: "2026-01-01T00:00:00.000Z".into(),
+                peer_id: "peer-1".into(),
+                mine: true,
+                text: "hello".into(),
+            }],
         };
 
         let json = serde_json::to_value(&dto).unwrap();
@@ -416,6 +469,9 @@ mod tests {
             json["notices"][0]["text"],
             "forward established: tcp:127.0.0.1:80"
         );
+        assert_eq!(json["chat"][0]["peer_id"], "peer-1");
+        assert_eq!(json["chat"][0]["mine"], true);
+        assert_eq!(json["chat"][0]["text"], "hello");
 
         // Round trip back through serde_json::Value to ensure the shape is
         // stable (keys are exactly what's expected, nothing extra/missing).
@@ -424,6 +480,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "chat",
                 "events",
                 "forwards",
                 "node_id",
