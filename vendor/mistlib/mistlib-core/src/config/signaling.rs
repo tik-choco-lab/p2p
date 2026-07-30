@@ -9,6 +9,7 @@ const DEFAULT_NOSTR_INVITE_CODE: &str = "dev-invite-001";
 const DEFAULT_NOSTR_DISCOVERY_KIND: u32 = 25049;
 const DEFAULT_NOSTR_MESSAGE_KIND: u32 = 25050;
 const DEFAULT_NOSTR_TTL_SECONDS: u64 = 600;
+const DEFAULT_NOSTR_MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 
 fn default_discovery_kind() -> u32 {
     DEFAULT_NOSTR_DISCOVERY_KIND
@@ -18,6 +19,9 @@ fn default_message_kind() -> u32 {
 }
 fn default_ttl_seconds() -> u64 {
     DEFAULT_NOSTR_TTL_SECONDS
+}
+fn default_max_clock_skew_seconds() -> u64 {
+    DEFAULT_NOSTR_MAX_CLOCK_SKEW_SECONDS
 }
 fn default_invite_salt() -> String {
     DEFAULT_NOSTR_INVITE_SALT.to_string()
@@ -79,6 +83,15 @@ pub struct NostrSignalingConfig {
     pub message_kind: u32,
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
+    /// 受信イベントの `created_at` / `expiration` 検証で許容する時計ずれ秒数。
+    ///
+    /// 時刻同期できない環境（共用計算機など）でノードの時計が数分ずれていても
+    /// 相互発見できるようにするためのローカル検証パラメータ。ワイヤーフォーマット
+    /// には影響しないため、ピア同士で異なる値を設定していても相互通信は可能
+    /// （この値は自ノードが「何を受理するか」だけを決める）。値を大きくすると
+    /// リプレイ受容窓（`ttl_seconds + max_clock_skew_seconds`）が広がるトレードオフがある。
+    #[serde(default = "default_max_clock_skew_seconds")]
+    pub max_clock_skew_seconds: u64,
     #[serde(default = "default_invite_salt")]
     pub invite_salt: String,
     #[serde(default = "default_invite_code")]
@@ -93,6 +106,7 @@ impl Default for NostrSignalingConfig {
             discovery_kind: 25049,
             message_kind: 25050,
             ttl_seconds: 600,
+            max_clock_skew_seconds: DEFAULT_NOSTR_MAX_CLOCK_SKEW_SECONDS,
             invite_salt: DEFAULT_NOSTR_INVITE_SALT.to_string(),
             invite_code: DEFAULT_NOSTR_INVITE_CODE.to_string(),
         }

@@ -284,8 +284,9 @@ impl NostrSignaler {
         room_id: &str,
     ) -> mistlib_core::error::Result<()> {
         let ids = self.current_subscription_ids().await;
+        let identity = self.current_identity().await;
         let discovery = discovery_filter(&self.codec_config, room_id);
-        let message = message_filter(&self.codec_config, room_id);
+        let message = message_filter(&self.codec_config, room_id, &identity.public_key);
         let discovery_frame = req_frame_json(&ids.discovery, &[discovery])?;
         let message_frame = req_frame_json(&ids.message, &[message])?;
         tx.send(discovery_frame).await.map_err(|e| {

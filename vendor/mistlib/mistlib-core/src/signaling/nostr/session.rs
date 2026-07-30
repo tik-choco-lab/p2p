@@ -6,17 +6,52 @@ use std::collections::HashMap;
 
 pub const DEFAULT_MAX_DISCOVERY_RESPONDERS_PER_PEER: usize = 2;
 
+/// Bounded reorder tolerance for `accept_message_order`.
+///
+/// A message whose sequence trails the per-sender high-water mark by fewer
+/// than this many positions is still accepted (without moving the mark)
+/// instead of being treated as stale. This absorbs two sources of legitimate
+/// reordering that are not attacks: the sender-side race where a
+/// small/cheap message (e.g. a trickled ICE candidate) can win the wire race
+/// against a message that was assigned an earlier sequence but is still
+/// doing CPU-bound crypto, and, looking ahead, delivery across multiple
+/// relay connections where cross-relay ordering is not guaranteed at all.
+/// Replay safety does not depend on this window: every message must first
+/// pass the event-id dedupe cache, so a message beyond the window is
+/// rejected as `StaleSequence` only because it is old, not because it could
+/// be a replay.
+pub const NOSTR_SEQUENCE_REORDER_WINDOW: u64 = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageOrderAcceptance {
     Accepted,
     DuplicateMessageId,
-    StaleSequence { last: u64, sequence: u64 },
-    Gap { last: u64, sequence: u64 },
+    /// Sequence is at or behind the high-water mark but within
+    /// `NOSTR_SEQUENCE_REORDER_WINDOW` of it: accepted, high-water mark
+    /// unchanged.
+    ReorderedWithinWindow {
+        last: u64,
+        sequence: u64,
+    },
+    /// Sequence is behind the high-water mark by at least
+    /// `NOSTR_SEQUENCE_REORDER_WINDOW`: rejected as too old to be legitimate
+    /// reorder.
+    StaleSequence {
+        last: u64,
+        sequence: u64,
+    },
+    Gap {
+        last: u64,
+        sequence: u64,
+    },
 }
 
 impl MessageOrderAcceptance {
     pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Accepted | Self::Gap { .. })
+        matches!(
+            self,
+            Self::Accepted | Self::Gap { .. } | Self::ReorderedWithinWindow { .. }
+        )
     }
 }
 
@@ -87,7 +122,13 @@ pub fn accept_message_order(
     };
 
     match incoming_sequences.get(sender_pubkey).copied() {
-        Some(last) if sequence <= last => MessageOrderAcceptance::StaleSequence { last, sequence },
+        Some(last) if sequence <= last => {
+            if last - sequence < NOSTR_SEQUENCE_REORDER_WINDOW {
+                MessageOrderAcceptance::ReorderedWithinWindow { last, sequence }
+            } else {
+                MessageOrderAcceptance::StaleSequence { last, sequence }
+            }
+        }
         Some(last) if sequence > last.saturating_add(1) => {
             incoming_sequences.insert(sender_pubkey.to_string(), sequence);
             MessageOrderAcceptance::Gap { last, sequence }
@@ -171,6 +212,7 @@ mod tests {
             discovery_kind: 25049,
             message_kind: 25050,
             ttl_seconds: 60,
+            max_clock_skew_seconds: 300,
             invite_salt: "salt".to_string(),
             invite_code: "invite".to_string(),
         };
@@ -230,7 +272,7 @@ mod tests {
         );
         assert_eq!(
             accept_message_order(&mut dedupe, &mut sequences, "peer", Some("m2"), Some(1)),
-            MessageOrderAcceptance::StaleSequence {
+            MessageOrderAcceptance::ReorderedWithinWindow {
                 last: 1,
                 sequence: 1
             }
@@ -251,6 +293,106 @@ mod tests {
                 Some(1),
             ),
             MessageOrderAcceptance::Accepted
+        );
+    }
+
+    #[test]
+    fn message_order_accepts_bounded_reorder_without_advancing_high_water() {
+        let mut dedupe = DedupeCache::new(Duration::from_secs(60));
+        let mut sequences = HashMap::new();
+
+        assert_eq!(
+            accept_message_order(&mut dedupe, &mut sequences, "peer", Some("seed"), Some(100)),
+            MessageOrderAcceptance::Accepted
+        );
+
+        // Trails the high-water mark by less than the reorder window: accepted,
+        // but the mark itself does not move backwards.
+        let reordered_sequence = 100 - (NOSTR_SEQUENCE_REORDER_WINDOW - 1);
+        assert_eq!(
+            accept_message_order(
+                &mut dedupe,
+                &mut sequences,
+                "peer",
+                Some("reordered"),
+                Some(reordered_sequence),
+            ),
+            MessageOrderAcceptance::ReorderedWithinWindow {
+                last: 100,
+                sequence: reordered_sequence
+            }
+        );
+        assert_eq!(sequences.get("peer").copied(), Some(100));
+
+        // A genuinely newer sequence still advances the mark afterwards.
+        assert_eq!(
+            accept_message_order(
+                &mut dedupe,
+                &mut sequences,
+                "peer",
+                Some("newer"),
+                Some(101)
+            ),
+            MessageOrderAcceptance::Accepted
+        );
+        assert_eq!(sequences.get("peer").copied(), Some(101));
+    }
+
+    #[test]
+    fn message_order_boundary_and_beyond_reorder_window_are_stale() {
+        let mut dedupe = DedupeCache::new(Duration::from_secs(60));
+        let mut sequences = HashMap::new();
+        assert_eq!(
+            accept_message_order(&mut dedupe, &mut sequences, "peer", Some("seed"), Some(200)),
+            MessageOrderAcceptance::Accepted
+        );
+
+        // Exactly `NOSTR_SEQUENCE_REORDER_WINDOW` behind is outside the window
+        // (the guard is `last - sequence < window`, so equality is stale).
+        let at_boundary = 200 - NOSTR_SEQUENCE_REORDER_WINDOW;
+        assert_eq!(
+            accept_message_order(
+                &mut dedupe,
+                &mut sequences,
+                "peer",
+                Some("at-boundary"),
+                Some(at_boundary),
+            ),
+            MessageOrderAcceptance::StaleSequence {
+                last: 200,
+                sequence: at_boundary
+            }
+        );
+
+        // One position closer is inside the window.
+        let just_inside = at_boundary + 1;
+        assert_eq!(
+            accept_message_order(
+                &mut dedupe,
+                &mut sequences,
+                "peer",
+                Some("just-inside"),
+                Some(just_inside),
+            ),
+            MessageOrderAcceptance::ReorderedWithinWindow {
+                last: 200,
+                sequence: just_inside
+            }
+        );
+
+        // Well beyond the window is stale too.
+        assert_eq!(
+            accept_message_order(
+                &mut dedupe,
+                &mut sequences,
+                "peer",
+                Some("ancient"),
+                Some(1)
+            ),
+            MessageOrderAcceptance::StaleSequence {
+                last: 200,
+                sequence: 1
+            }
         );
     }
 }

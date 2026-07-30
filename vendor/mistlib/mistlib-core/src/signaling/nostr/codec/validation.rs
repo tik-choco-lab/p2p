@@ -5,8 +5,7 @@ use super::super::limits::{
 };
 use super::super::util::now_unix_seconds;
 use super::{
-    NostrCodecConfig, MAX_EVENT_CLOCK_SKEW_SECONDS, TAG_DISCOVERY_PROOF, TAG_EXPIRATION,
-    TAG_INVITE_SCOPE, TAG_NONCE, TAG_P,
+    NostrCodecConfig, TAG_DISCOVERY_PROOF, TAG_EXPIRATION, TAG_INVITE_SCOPE, TAG_NONCE, TAG_P,
 };
 use crate::error::{MistError, Result};
 
@@ -17,6 +16,31 @@ pub fn is_room_mailbox_message(
 ) -> bool {
     event.kind == config.message_kind
         && event.tag_value(TAG_P).is_none()
+        && config
+            .accepted_room_scopes(room_id)
+            .iter()
+            .any(|scope| event.has_tag_value(TAG_INVITE_SCOPE, scope))
+}
+
+/// True when `event` is a kind-25050 message tagged with the room's shared
+/// broadcast sentinel rather than a specific recipient pubkey — i.e. its
+/// logical receiver was `NodeId::broadcast` at build time. Such messages are,
+/// by design, still delivered to every room member (the sentinel is
+/// identical for all of them), so — exactly like
+/// [`is_room_mailbox_message`] for legacy p-tag-less events — a decrypt
+/// failure for one of them means "not addressed to me", not a genuine error.
+pub fn is_broadcast_sentinel_message(
+    config: &NostrCodecConfig,
+    event: &NostrEvent,
+    room_id: &str,
+) -> bool {
+    event.kind == config.message_kind
+        && event.tag_value(TAG_P).is_some_and(|pubkey| {
+            config
+                .accepted_broadcast_sentinels(room_id)
+                .iter()
+                .any(|sentinel| sentinel == pubkey)
+        })
         && config
             .accepted_room_scopes(room_id)
             .iter()
@@ -105,7 +129,7 @@ pub(super) fn validate_event_basics(
         ));
     }
     let now = now_unix_seconds();
-    if event.created_at > now.saturating_add(MAX_EVENT_CLOCK_SKEW_SECONDS) {
+    if event.created_at > now.saturating_add(config.max_clock_skew_seconds) {
         return Err(MistError::Signaling(
             "Nostr event timestamp is too far in the future".to_string(),
         ));
@@ -113,7 +137,7 @@ pub(super) fn validate_event_basics(
     if event
         .created_at
         .saturating_add(config.ttl_seconds)
-        .saturating_add(MAX_EVENT_CLOCK_SKEW_SECONDS)
+        .saturating_add(config.max_clock_skew_seconds)
         < now
     {
         return Err(MistError::Signaling(
@@ -131,7 +155,7 @@ pub(super) fn validate_event_basics(
     }
     let max_expiration = now
         .saturating_add(config.ttl_seconds)
-        .saturating_add(MAX_EVENT_CLOCK_SKEW_SECONDS);
+        .saturating_add(config.max_clock_skew_seconds);
     if expires_at > max_expiration {
         return Err(MistError::Signaling(
             "Nostr expiration is too far in the future".to_string(),

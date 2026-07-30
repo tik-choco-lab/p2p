@@ -73,10 +73,59 @@ pub struct DiscoveryEntry {
     pub topology_rank: String,
 }
 
+/// A node id's binding to a signaling pubkey, plus the peer-declared session
+/// epoch (typically the `joined_at` timestamp carried on discovery/message
+/// envelopes) that binding was last seen with. `epoch` is `None` when the
+/// peer never supplied one (e.g. a legacy sender, or the binding was created
+/// via one of the epoch-agnostic `bind_node*` wrappers).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeBinding {
+    pubkey: String,
+    epoch: Option<u64>,
+}
+
+/// Outcome of binding a node id to a signaling pubkey.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindOutcome {
+    /// Already bound to this same pubkey.
+    Known,
+    /// First time this node id is bound.
+    New,
+    /// The node id was bound to a *different* pubkey and the change was
+    /// accepted: the peer restarted (browser reload) with a fresh signaling
+    /// identity under the same node id.
+    Rebound { previous_pubkey: String },
+}
+
+impl BindOutcome {
+    /// True only for [`BindOutcome::Known`].
+    pub fn is_known(&self) -> bool {
+        matches!(self, BindOutcome::Known)
+    }
+
+    /// The pubkey this node id was bound to before the rebind, if this
+    /// outcome is a [`BindOutcome::Rebound`].
+    pub fn rebound_from(&self) -> Option<&str> {
+        match self {
+            BindOutcome::Rebound { previous_pubkey } => Some(previous_pubkey.as_str()),
+            _ => None,
+        }
+    }
+}
+
+fn newer_epoch(stored: Option<u64>, incoming: Option<u64>) -> Option<u64> {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => Some(stored.max(incoming)),
+        (Some(stored), None) => Some(stored),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct DiscoveryTable {
     by_pubkey: HashMap<String, DiscoveryEntry>,
-    node_to_pubkey: HashMap<NodeId, String>,
+    node_to_pubkey: HashMap<NodeId, NodeBinding>,
 }
 
 impl DiscoveryTable {
@@ -136,6 +185,12 @@ impl DiscoveryTable {
         )
     }
 
+    /// Thin wrapper over [`bind_node_with_epoch`](Self::bind_node_with_epoch)
+    /// that never supplies a session epoch. Kept byte-for-byte identical in
+    /// behavior to its pre-epoch implementation for existing callers
+    /// (mistlib-native, mistlib-wasm): with `sender_epoch: None`, a pubkey
+    /// change is only ever accepted when `allow_rebind` is true, exactly as
+    /// before.
     pub fn bind_node_checked_with_rank_and_rebind(
         &mut self,
         node_id: NodeId,
@@ -144,28 +199,117 @@ impl DiscoveryTable {
         topology_rank: String,
         allow_rebind: bool,
     ) -> Result<bool> {
+        self.bind_node_with_epoch(
+            node_id,
+            signaling_pubkey,
+            expires_at,
+            topology_rank,
+            None,
+            allow_rebind,
+        )
+        .map(|outcome| outcome.is_known())
+    }
+
+    /// Binds `node_id` to `signaling_pubkey`, taking a peer-declared session
+    /// epoch (`sender_epoch`, the `joined_at` timestamp carried on a
+    /// discovery/message envelope) into account when the node id is already
+    /// bound to a *different* pubkey.
+    ///
+    /// If the node id is unbound, the binding is created (`New`). If it is
+    /// already bound to the same pubkey, the stored epoch is advanced to the
+    /// newer of the stored and incoming epoch (`Known`). If it is bound to a
+    /// *different* pubkey, the rebind is accepted (`Rebound`) when either:
+    ///   a. `sender_epoch` is strictly greater than the stored epoch (or the
+    ///      stored epoch is absent) — a genuinely newer session announcing
+    ///      itself, e.g. a browser peer that reloaded and regenerated its
+    ///      temporary signaling keypair while keeping the same host-assigned
+    ///      `NodeId`; or
+    ///   b. `allow_rebind` is set, preserving the pre-epoch escape hatch.
+    /// Otherwise the pubkey change is rejected with the pre-existing
+    /// `"Nostr sender node id changed pubkey"` error.
+    ///
+    /// Security note: path (a) intentionally trusts a peer-declared,
+    /// unauthenticated `joined_at` value — a hostile room member could send
+    /// a large `joined_at` to steal an existing node id's binding away from
+    /// its legitimate owner. This is an accepted trade-off, not an
+    /// oversight: the pre-existing guard was already weak (any member can
+    /// freely claim an *unbound* node id, and only the "already bound to a
+    /// different pubkey" case was ever guarded), and dropping every message
+    /// from a validly-reloaded peer for the full discovery TTL (minutes) is
+    /// a hard availability failure in exchange for a marginal hardening of
+    /// an already-soft guard. Epochs must be STRICTLY greater than the
+    /// stored value to win a rebind; a tie is rejected (unless
+    /// `allow_rebind` is set), so a replayed/duplicate `joined_at` cannot
+    /// steal a binding.
+    pub fn bind_node_with_epoch(
+        &mut self,
+        node_id: NodeId,
+        signaling_pubkey: String,
+        expires_at: u64,
+        topology_rank: String,
+        sender_epoch: Option<u64>,
+        allow_rebind: bool,
+    ) -> Result<BindOutcome> {
         self.sweep_expired(now_unix_seconds());
-        let known = match self.node_to_pubkey.get(&node_id) {
-            Some(existing) if existing == &signaling_pubkey => true,
-            Some(existing) if allow_rebind => {
-                self.by_pubkey.remove(existing);
-                false
+
+        let (outcome, epoch) = match self.node_to_pubkey.get(&node_id) {
+            None => (BindOutcome::New, sender_epoch),
+            Some(existing) if existing.pubkey == signaling_pubkey => (
+                BindOutcome::Known,
+                newer_epoch(existing.epoch, sender_epoch),
+            ),
+            Some(existing) => {
+                let previous_pubkey = existing.pubkey.clone();
+                let stored_epoch = existing.epoch;
+                let epoch_is_newer = matches!(
+                    sender_epoch,
+                    Some(candidate) if stored_epoch.is_none_or(|stored| candidate > stored)
+                );
+                if epoch_is_newer || allow_rebind {
+                    self.by_pubkey.remove(&previous_pubkey);
+                    (BindOutcome::Rebound { previous_pubkey }, sender_epoch)
+                } else {
+                    return Err(MistError::Signaling(
+                        "Nostr sender node id changed pubkey".to_string(),
+                    ));
+                }
             }
-            Some(_) => {
-                return Err(MistError::Signaling(
-                    "Nostr sender node id changed pubkey".to_string(),
-                ))
-            }
-            None => false,
         };
+
         self.insert_pubkey_with_rank(signaling_pubkey.clone(), expires_at, topology_rank);
-        self.node_to_pubkey.insert(node_id, signaling_pubkey);
-        Ok(known)
+        self.node_to_pubkey.insert(
+            node_id,
+            NodeBinding {
+                pubkey: signaling_pubkey,
+                epoch,
+            },
+        );
+        Ok(outcome)
     }
 
     pub fn pubkey_for_node(&mut self, node_id: &NodeId) -> Option<String> {
         self.sweep_expired(now_unix_seconds());
-        self.node_to_pubkey.get(node_id).cloned()
+        self.node_to_pubkey
+            .get(node_id)
+            .map(|binding| binding.pubkey.clone())
+    }
+
+    /// The session epoch (peer-declared `joined_at`) last recorded for
+    /// `node_id`'s current binding, if any. `None` both when the node id is
+    /// unbound and when it is bound but no epoch has ever been supplied for
+    /// it.
+    pub fn epoch_for_node(&self, node_id: &NodeId) -> Option<u64> {
+        self.node_to_pubkey
+            .get(node_id)
+            .and_then(|binding| binding.epoch)
+    }
+
+    /// Removes `node_id`'s binding and its backing `by_pubkey` entry,
+    /// returning the pubkey it was bound to.
+    pub fn unbind_node(&mut self, node_id: &NodeId) -> Option<String> {
+        let binding = self.node_to_pubkey.remove(node_id)?;
+        self.by_pubkey.remove(&binding.pubkey);
+        Some(binding.pubkey)
     }
 
     /// Renews the discovery entry backing an already-bound node using the
@@ -188,7 +332,11 @@ impl DiscoveryTable {
     pub fn touch_node(&mut self, node_id: &NodeId, ttl_seconds: u64) {
         let now = now_unix_seconds();
         self.sweep_expired(now);
-        let Some(pubkey) = self.node_to_pubkey.get(node_id).cloned() else {
+        let Some(pubkey) = self
+            .node_to_pubkey
+            .get(node_id)
+            .map(|binding| binding.pubkey.clone())
+        else {
             return;
         };
         if let Some(entry) = self.by_pubkey.get_mut(&pubkey) {
@@ -264,7 +412,7 @@ impl DiscoveryTable {
     pub fn sweep_expired(&mut self, now: u64) {
         self.by_pubkey.retain(|_, entry| entry.expires_at > now);
         self.node_to_pubkey
-            .retain(|_, pubkey| self.by_pubkey.contains_key(pubkey));
+            .retain(|_, binding| self.by_pubkey.contains_key(&binding.pubkey));
     }
 
     pub fn clear(&mut self) {
@@ -275,7 +423,7 @@ impl DiscoveryTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{now_unix_seconds, DiscoveryTable};
+    use super::{now_unix_seconds, BindOutcome, DiscoveryTable};
     use crate::types::NodeId;
     use std::time::Duration;
 
@@ -344,5 +492,206 @@ mod tests {
 
         let responders = table.responder_pubkeys_for("z", "00", "c", "03", 2);
         assert_eq!(responders, vec!["c".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn newer_epoch_wins_rebind_even_without_allow_rebind() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-reload".to_string());
+        let far_future = now_unix_seconds() + 3600;
+
+        table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-old".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(100),
+                false,
+            )
+            .unwrap();
+
+        let outcome = table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-new".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(200),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            BindOutcome::Rebound {
+                previous_pubkey: "pk-old".to_string()
+            }
+        );
+        assert_eq!(table.pubkey_for_node(&node), Some("pk-new".to_string()));
+        assert!(!table.active_pubkeys().contains(&"pk-old".to_string()));
+    }
+
+    #[test]
+    fn equal_epoch_is_rejected_without_allow_rebind() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-reload".to_string());
+        let far_future = now_unix_seconds() + 3600;
+
+        table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-old".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(100),
+                false,
+            )
+            .unwrap();
+
+        let result = table.bind_node_with_epoch(
+            node,
+            "pk-new".to_string(),
+            far_future,
+            "rank".to_string(),
+            Some(100),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn older_epoch_is_rejected_without_allow_rebind() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-reload".to_string());
+        let far_future = now_unix_seconds() + 3600;
+
+        table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-old".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(100),
+                false,
+            )
+            .unwrap();
+
+        let result = table.bind_node_with_epoch(
+            node,
+            "pk-new".to_string(),
+            far_future,
+            "rank".to_string(),
+            Some(50),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_sender_epoch_is_rejected_without_allow_rebind() {
+        // Regression guard: a legacy peer that never supplies a `joined_at`
+        // must keep hitting the old strict rejection, not slip through.
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-legacy".to_string());
+        let far_future = now_unix_seconds() + 3600;
+
+        table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-old".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(100),
+                false,
+            )
+            .unwrap();
+
+        let result = table.bind_node_with_epoch(
+            node,
+            "pk-new".to_string(),
+            far_future,
+            "rank".to_string(),
+            None,
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unset_stored_epoch_allows_a_later_epoch_to_rebind() {
+        // A peer that upgraded mid-session (bound without an epoch, e.g. via
+        // a plain `bind_node`) must not be permanently locked out just
+        // because its original binding predates epoch support.
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-upgraded".to_string());
+        let far_future = now_unix_seconds() + 3600;
+
+        table.bind_node(node.clone(), "pk-old".to_string(), far_future);
+        assert_eq!(table.epoch_for_node(&node), None);
+
+        let outcome = table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-new".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(1),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            BindOutcome::Rebound {
+                previous_pubkey: "pk-old".to_string()
+            }
+        );
+        assert_eq!(table.pubkey_for_node(&node), Some("pk-new".to_string()));
+    }
+
+    #[test]
+    fn same_pubkey_with_increasing_epochs_stays_known_and_tracks_newest() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-steady".to_string());
+        let far_future = now_unix_seconds() + 3600;
+
+        let first = table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-steady".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(10),
+                false,
+            )
+            .unwrap();
+        assert_eq!(first, BindOutcome::New);
+
+        let second = table
+            .bind_node_with_epoch(
+                node.clone(),
+                "pk-steady".to_string(),
+                far_future,
+                "rank".to_string(),
+                Some(20),
+                false,
+            )
+            .unwrap();
+        assert_eq!(second, BindOutcome::Known);
+        assert_eq!(table.epoch_for_node(&node), Some(20));
+    }
+
+    #[test]
+    fn unbind_node_removes_binding_and_pubkey_entry() {
+        let mut table = DiscoveryTable::default();
+        let node = NodeId("peer-leaving".to_string());
+        let far_future = now_unix_seconds() + 3600;
+        table.bind_node(node.clone(), "pk-leaving".to_string(), far_future);
+
+        let removed = table.unbind_node(&node);
+        assert_eq!(removed, Some("pk-leaving".to_string()));
+        assert_eq!(table.pubkey_for_node(&node), None);
+        assert!(!table.active_pubkeys().contains(&"pk-leaving".to_string()));
     }
 }

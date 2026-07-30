@@ -26,6 +26,8 @@ impl NostrSignaler {
         let room_state = Arc::downgrade(&self.room_id);
         let senders = Arc::downgrade(&self.senders);
         let subscription_ids = Arc::downgrade(&self.subscription_ids);
+        let identity_pubkey = self.identity.public_key.clone();
+        let rotated_identity = Arc::downgrade(&self.rotated_identity);
         let codec_config = self.codec_config.clone();
         let rotation_seconds = codec_config.room_scope_rotation_seconds();
 
@@ -59,8 +61,18 @@ impl NostrSignaler {
                     }
                 };
 
+                let Some(rotated_identity) = rotated_identity.upgrade() else {
+                    break;
+                };
+                let local_pubkey = rotated_identity
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|identity| identity.public_key.clone())
+                    .unwrap_or_else(|| identity_pubkey.clone());
+
                 let discovery = discovery_filter(&codec_config, &room_id);
-                let message = message_filter(&codec_config, &room_id);
+                let message = message_filter(&codec_config, &room_id, &local_pubkey);
                 let discovery_frame = match req_frame_json(&ids.discovery, &[discovery]) {
                     Ok(frame) => frame,
                     Err(err) => {

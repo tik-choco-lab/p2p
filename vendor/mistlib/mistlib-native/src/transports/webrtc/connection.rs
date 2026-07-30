@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use mistlib_core::signaling::{MessageContent, SignalingData, SignalingType};
 use mistlib_core::transport::NetworkEvent;
@@ -226,10 +227,18 @@ impl WebRtcTransport {
     }
 
     async fn replace_peer_and_close_old(&self, node: &NodeId, peer: Arc<Peer>) {
+        let send_tx = peer.send_tx.clone();
         let old_peer = {
             let mut peers = self.peers.write().await;
             peers.insert(node.clone(), peer)
         };
+        // Mirror the swap into `send_queues` -- see
+        // `WebRtcTransport::send_queues`'s doc comment. Inserted after the
+        // `peers` insert above, per its ordering note.
+        self.send_queues
+            .write()
+            .unwrap()
+            .insert(node.clone(), send_tx);
         if let Some(old_peer) = old_peer {
             tracing::warn!("[WebRTC Close] reason=replace_peer node={}", node);
             old_peer.close_all().await;
@@ -363,11 +372,30 @@ impl WebRtcTransport {
             created_peer = Some(peer.clone());
 
             let attempt_id = self.reserve_connection_attempt(node);
+            // `[ConnTiming]` instrumentation: attempt-start timestamp,
+            // overwritten on every fresh attempt for this node -- see
+            // `WebRtcTransport::connect_started_at`'s doc comment.
+            self.connect_started_at
+                .write()
+                .unwrap()
+                .insert(node.clone(), Instant::now());
+            // `[ConnTiming]` instrumentation: the offering side's connection
+            // attempt is starting right now, at the same point
+            // `connect_started_at` is stamped.
+            super::conn_timing::log_attempt_start(node);
             self.spawn_connection_watchdog(node.clone(), attempt_id);
 
             self.setup_outgoing_data_channels(&peer, node).await?;
             self.replace_peer_and_close_old(node, peer.clone()).await;
-            self.send_offer(node, &peer).await
+            self.send_offer(node, &peer).await?;
+            // Offer resend, initiator side: only the fresh connect_inner
+            // attempt path opts into this -- `send_offer` is also called by
+            // renegotiation/ICE-restart paths on an already-established
+            // session, which must NOT get a resend (see
+            // `sweeper::spawn_offer_resend`'s doc comment for the full
+            // mechanism and the guards that make a stale resend a no-op).
+            self.spawn_offer_resend(node.clone(), attempt_id, peer.clone());
+            Ok(())
         }
         .await;
 

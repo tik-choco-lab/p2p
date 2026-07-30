@@ -416,6 +416,41 @@ pub async fn get_connected_nodes_async() -> Vec<String> {
     nodes.into_iter().collect()
 }
 
+/// Room-scoped counterpart of `get_connected_nodes`: instead of a
+/// cross-session union, returns each active session's own room id paired
+/// with its connected peers and their per-room connection state. A node
+/// connected in more than one room appears once under each room; every
+/// active session appears even if it currently has no peers. Added so
+/// consumers (mistl's topology view) can show which peer is connected in
+/// which room.
+pub fn get_room_connections() -> Vec<(String, Vec<(String, String)>)> {
+    ENGINE.runtime.block_on(get_room_connections_async())
+}
+
+pub async fn get_room_connections_async() -> Vec<(String, Vec<(String, String)>)> {
+    let mut rooms = Vec::new();
+    for (room_id, ctx) in ENGINE.sessions_snapshot().await {
+        let session_nodes = ctx
+            .webrtc_transport
+            .as_ref()
+            .map(|transport| transport.get_connected_nodes())
+            .unwrap_or_else(|| ctx.transport.get_connected_nodes());
+        let peers = session_nodes
+            .into_iter()
+            .map(|node| {
+                let state = ctx
+                    .webrtc_transport
+                    .as_ref()
+                    .map(|transport| transport.get_connection_state(&node))
+                    .unwrap_or_else(|| ctx.transport.get_connection_state(&node));
+                (node.0, state.to_string())
+            })
+            .collect();
+        rooms.push((room_id, peers));
+    }
+    rooms
+}
+
 pub fn get_connection_state(node_id: &str) -> String {
     get_connection_state_value(node_id).to_string()
 }
