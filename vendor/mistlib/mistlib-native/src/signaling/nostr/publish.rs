@@ -1,7 +1,7 @@
 use super::NostrSignaler;
 use mistlib_core::signaling::nostr::{
-    build_discovery_event_with_joined_at, build_message_event_with_sequence, event_frame_json,
-    next_outgoing_sequence,
+    build_discovery_event_with_joined_at, build_message_event_with_sequence_and_joined_at,
+    event_frame_json, next_outgoing_sequence,
 };
 use mistlib_core::signaling::{SignalingData, SignalingType};
 use mistlib_core::stats::STATS;
@@ -78,15 +78,37 @@ impl NostrSignaler {
         receiver_pubkey: &str,
         data: &SignalingData,
     ) -> mistlib_core::error::Result<()> {
+        // `Rejoin` is synthesized locally by this signaler for its own
+        // transport to consume (see `SignalingType::Rejoin`'s doc comment)
+        // and must never reach a relay -- even if every caller above this
+        // point believes it is unreachable for `Rejoin`, this is the last
+        // point before anything goes on the wire, so it guards
+        // unconditionally.
+        if data.signaling_type.is_local_only() {
+            return Ok(());
+        }
+        // Held from sequence assignment through the enqueue below so the two
+        // steps happen atomically with respect to other targeted publishes;
+        // see the `send_order` field doc comment on `NostrSignaler` for the
+        // race this closes.
+        let _send_order = self.send_order.lock().await;
         let sequence = self.next_outgoing_sequence(receiver_pubkey).await;
         let identity = self.current_identity().await;
-        let event = build_message_event_with_sequence(
+        // Carrying our own session epoch (`local_joined_at`, set on room
+        // join/reset -- see `set_room_id`/`reset_session`) on every targeted
+        // message, not just discovery announces, lets a peer detect a rejoin
+        // (this identity's pubkey rotating under the same NodeId) even if it
+        // misses our discovery re-announce and only ever sees our targeted
+        // messages -- see `bind_node_with_epoch` on the receiving side.
+        let joined_at = *self.local_joined_at.lock().await;
+        let event = build_message_event_with_sequence_and_joined_at(
             &self.codec_config,
             &self.crypto,
             &identity,
             receiver_pubkey,
             data,
             sequence,
+            joined_at,
         )?;
         self.publish_event(&event).await
     }

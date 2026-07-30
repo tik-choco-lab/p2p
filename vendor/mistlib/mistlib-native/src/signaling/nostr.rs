@@ -54,6 +54,21 @@ pub struct NostrSignaler {
     session_epoch: Arc<AtomicU64>,
     codec_config: NostrCodecConfig,
     crypto: InvitePskCrypto,
+    /// Serializes targeted (per-receiver) publishes end-to-end: held from
+    /// sequence assignment through the `senders` mpsc enqueue in
+    /// `publish_message_to_pubkey`. Without this, two concurrent targeted
+    /// publishes to the same receiver can assign sequences in one order
+    /// (T0: assign 5, T1: assign 6) but enqueue onto the relay channel in the
+    /// other order (T1 enqueues 6, then T0 enqueues 5) because the
+    /// CPU-bound crypto (ECDH + HKDF + AES-GCM + schnorr sign) between
+    /// assignment and enqueue has no ordering guarantee across tasks. The
+    /// receiver's monotonic sequence gate would then see 6 before 5 and
+    /// silently discard 5 forever (no retransmit). Holding this mutex across
+    /// both steps makes sequence-assignment order and wire-enqueue order the
+    /// same order, at the cost of serializing outbound targeted publishes
+    /// per node (acceptable: tens of messages/sec, ~100us of crypto each).
+    /// Discovery (broadcast) publishes carry no sequence and do not take it.
+    send_order: Arc<Mutex<()>>,
     senders: Arc<Mutex<Vec<mpsc::Sender<String>>>>,
     room_id: Arc<Mutex<Option<String>>>,
     discovery_table: Arc<Mutex<DiscoveryTable>>,
@@ -85,6 +100,7 @@ impl NostrSignaler {
             session_epoch: Arc::new(AtomicU64::new(0)),
             codec_config,
             crypto,
+            send_order: Arc::new(Mutex::new(())),
             senders: Arc::new(Mutex::new(Vec::new())),
             room_id: Arc::new(Mutex::new(None)),
             discovery_table: Arc::new(Mutex::new(DiscoveryTable::default())),
@@ -224,6 +240,16 @@ impl Signaler for NostrSignaler {
                 "NostrSignaler: unsupported message type".to_string(),
             ));
         };
+
+        // `Rejoin` is synthesized locally by this signaler purely to notify
+        // its own transport (see `SignalingType::Rejoin`'s doc comment) and
+        // must never be published to a relay. No caller is expected to reach
+        // this with one -- the transport reacts to it without ever routing
+        // it back through `Signaler::send_signaling` -- but guard here too
+        // rather than rely on that.
+        if data.signaling_type.is_local_only() {
+            return Ok(());
+        }
 
         self.set_room_id(&data.room_id).await?;
 

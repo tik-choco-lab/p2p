@@ -285,6 +285,23 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
         // across an `.await` point.
         let positions = self.resolve_positions_for_eviction().await;
 
+        // The in-memory pinned set must reflect the persisted PinRegistry
+        // before computing eviction candidates (SPEC-18): a freshly
+        // constructed engine starts with an empty pinned set, which would
+        // let capacity eviction delete blocks that are actually pinned.
+        // Gated on actually being over capacity so a write that was never
+        // going to evict anything doesn't fail just because the persisted
+        // registry happens to be unreadable (mirrors `is_pinned`'s
+        // never-fails contract for the no-op case; see
+        // `ensure_pin_registry_loaded`).
+        let over_capacity = {
+            let mgr = self.manager.lock().unwrap();
+            mgr.current_usage() > mgr.max_capacity()
+        };
+        if over_capacity {
+            self.ensure_pin_registry_loaded().await?;
+        }
+
         let victims = {
             let mgr = self.manager.lock().unwrap();
             if positions.is_empty() {
@@ -326,6 +343,23 @@ impl<B: BlockStore, P: PeerResolver> StorageEngine<B, P> {
     pub async fn run_decay_sweep(&self) -> usize {
         let positions = self.resolve_positions_for_eviction().await;
         if positions.is_empty() {
+            return 0;
+        }
+
+        // Same rationale as `enforce_capacity_limit`: without this, a
+        // freshly constructed engine's empty in-memory pinned set would let
+        // the decay sweep delete blocks the persisted PinRegistry protects.
+        // Gated on there actually being positions to sweep against (same
+        // early-return above) so a no-op sweep can't fail just because the
+        // persisted registry happens to be unreadable. Can't propagate an
+        // error either way -- this fn returns `usize` -- so a load failure
+        // just skips this sweep rather than risking an unprotected decay
+        // pass; the next sweep retries the load.
+        if let Err(e) = self.ensure_pin_registry_loaded().await {
+            warn!(
+                "StorageEngine: decay sweep skipped; pin registry load failed: {}",
+                e
+            );
             return 0;
         }
 

@@ -237,6 +237,21 @@ impl WebSocketSupervisor {
                     };
                     match parse_result {
                         Ok(data) => {
+                            // `Rejoin` is locally synthesized (see
+                            // `SignalingType::Rejoin`'s doc comment) and must
+                            // never be accepted from the wire: a remote peer
+                            // must never be able to make us tear down a live
+                            // connection just by sending a crafted frame.
+                            if data.signaling_type.is_local_only() {
+                                tracing::warn!(
+                                    "WebSocketSignaler: dropping wire-delivered {:?} from {} -- \
+                                     this signaling type is local-only and must never arrive \
+                                     from the wire",
+                                    data.signaling_type,
+                                    data.sender_id
+                                );
+                                continue;
+                            }
                             if incoming_tx.send(MessageContent::Data(data)).await.is_err() {
                                 break;
                             }
@@ -294,6 +309,12 @@ impl Signaler for WebSocketSignaler {
                 "WebSocketSignaler: unsupported message type".to_string(),
             ));
         };
+        // `Rejoin` is synthesized locally by the signaling layer purely to
+        // notify this process's own transport (see `SignalingType::Rejoin`'s
+        // doc comment) and must never be sent over the wire.
+        if data.signaling_type.is_local_only() {
+            return Ok(());
+        }
         let data_str = serde_json::to_string(&data)
             .map_err(|e| mistlib_core::error::MistError::Serialization(e.to_string()))?;
 

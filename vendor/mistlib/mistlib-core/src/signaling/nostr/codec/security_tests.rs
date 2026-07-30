@@ -11,6 +11,7 @@ fn config() -> (NostrCodecConfig, InvitePskCrypto) {
         discovery_kind: 25049,
         message_kind: 25050,
         ttl_seconds: 60,
+        max_clock_skew_seconds: 300,
         invite_salt: "salt".to_string(),
         invite_code: "invite".to_string(),
     };
@@ -200,6 +201,90 @@ sdp"
         "secret-room",
     )
     .is_err());
+}
+
+#[test]
+fn legacy_message_event_without_p_tag_still_decodes() {
+    // A sender that predates the `p` tag scheme omits it entirely. Decode
+    // must tolerate its absence (falls back to the room-mailbox path) rather
+    // than requiring it, so old senders keep working against new receivers.
+    let (codec, crypto) = config();
+    let alice = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([1u8; 32]),
+    );
+    let bob = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([2u8; 32]),
+    );
+    let data = SignalingData {
+        sender_id: NodeId("alice".to_string()),
+        receiver_id: NodeId("bob".to_string()),
+        room_id: "secret-room".to_string(),
+        data: "v=0\r\nsdp".to_string(),
+        signaling_type: SignalingType::Offer,
+    };
+    let mut event = build_message_event(&codec, &crypto, &alice, &bob.public_key, &data).unwrap();
+    assert!(
+        event.tag_value(TAG_P).is_some(),
+        "sanity: new builds do tag p"
+    );
+    event
+        .tags
+        .retain(|tag| tag.first().map(String::as_str) != Some(TAG_P));
+    event.refresh_id();
+    event.sig = crypto.sign_event(&alice, &event).unwrap();
+    assert!(event.tag_value(TAG_P).is_none());
+
+    let decoded = decode_message_event(
+        &codec,
+        &crypto,
+        &bob,
+        &NodeId("bob".to_string()),
+        &event,
+        "secret-room",
+    )
+    .unwrap();
+
+    assert_eq!(decoded.data.data, data.data);
+}
+
+#[test]
+fn message_addressed_to_a_different_peer_is_rejected() {
+    // Defense in depth: even if a misbehaving/legacy relay delivers an event
+    // whose `p` tag names someone else, decode must not treat us as the
+    // recipient (a correctly filtering relay would never deliver it to us
+    // at all, since our subscription only asks for our own pubkey or the
+    // broadcast sentinel).
+    let (codec, crypto) = config();
+    let alice = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([1u8; 32]),
+    );
+    let bob = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([2u8; 32]),
+    );
+    let charlie = TemporarySignalingIdentity::from_secret_key(
+        SignalingSecretKey::from_bytes_for_tests([3u8; 32]),
+    );
+    let data = SignalingData {
+        sender_id: NodeId("alice".to_string()),
+        receiver_id: NodeId("bob".to_string()),
+        room_id: "secret-room".to_string(),
+        data: "v=0\r\nsdp".to_string(),
+        signaling_type: SignalingType::Offer,
+    };
+    let event = build_message_event(&codec, &crypto, &alice, &bob.public_key, &data).unwrap();
+    assert_eq!(event.tag_value(TAG_P), Some(bob.public_key.as_str()));
+
+    let err = decode_message_event(
+        &codec,
+        &crypto,
+        &charlie,
+        &NodeId("charlie".to_string()),
+        &event,
+        "secret-room",
+    )
+    .unwrap_err();
+
+    assert!(format!("{err:?}").contains("receiver pubkey mismatch"));
 }
 
 #[test]

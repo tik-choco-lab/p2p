@@ -72,10 +72,23 @@ const SIGNALING_SEND_RETRY_BACKOFF_MS: u64 = 100;
 /// failure that persists across every attempt (some other negotiation
 /// genuinely in flight) won't be fixed by trying a fourth time either.
 const ICE_RESTART_RETRY_ATTEMPTS: u32 = 3;
+/// Exponential backoff schedule for [`PeerSharedHandles::try_ice_restart`]'s
+/// retry loop (see `super::backoff::exponential_backoff_ms`): starts at
+/// `ICE_RESTART_RETRY_INITIAL_BACKOFF_MS`, doubles each retry, capped at
+/// `ICE_RESTART_RETRY_MAX_BACKOFF_MS`. Replaces the old fixed 500ms
+/// interval. With `ICE_RESTART_RETRY_ATTEMPTS == 3` (2 waited intervals:
+/// 500ms, 1000ms in production) the whole retry loop still finishes in ~1.5s
+/// -- well inside `DISCONNECTED_GRACE_MS`'s 5s default, so the sweeper never
+/// reaps a session ICE restart is still actively working on.
 #[cfg(test)]
-const ICE_RESTART_RETRY_BACKOFF_MS: u64 = 5;
+const ICE_RESTART_RETRY_INITIAL_BACKOFF_MS: u64 = 5;
 #[cfg(not(test))]
-const ICE_RESTART_RETRY_BACKOFF_MS: u64 = 500;
+const ICE_RESTART_RETRY_INITIAL_BACKOFF_MS: u64 = 500;
+const ICE_RESTART_RETRY_BACKOFF_MULTIPLIER: f64 = 2.0;
+#[cfg(test)]
+const ICE_RESTART_RETRY_MAX_BACKOFF_MS: u64 = 20;
+#[cfg(not(test))]
+const ICE_RESTART_RETRY_MAX_BACKOFF_MS: u64 = 2000;
 
 /// Bounded retry for a `send_signaling` call: tries up to
 /// [`SIGNALING_SEND_RETRY_ATTEMPTS`] times with a short fixed backoff between
@@ -226,13 +239,37 @@ pub(crate) struct QueuedSend {
 pub struct PeerSharedHandles {
     pub connection_states: Arc<StdRwLock<HashMap<NodeId, ConnectionState>>>,
     pub peers: Arc<RwLock<HashMap<NodeId, Arc<Peer>>>>,
+    /// Sync mirror of `peers`' keyset -- see
+    /// `WebRtcTransport::send_queues`'s doc comment. Threaded through here
+    /// because `cleanup_session_impl`/`remove_peer_if_current` and the
+    /// `Failed`/`Closed` and data-channel-close teardown paths below are
+    /// removal sites that must stay in lock-step with `peers`.
+    pub(crate) send_queues: Arc<StdRwLock<HashMap<NodeId, mpsc::Sender<QueuedSend>>>>,
     pub pending_candidates: Arc<RwLock<HashMap<NodeId, Vec<String>>>>,
     pub connection_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
     pub connect_request_attempt_ids: Arc<StdRwLock<HashMap<NodeId, u32>>>,
+    /// Sweeper livelock fix -- see `WebRtcTransport::connecting_reserved_at`'s
+    /// doc comment.
+    pub connecting_reserved_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
     pub pc_connected_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+    /// Remote-takeover fix -- see `WebRtcTransport::established_at`'s doc
+    /// comment.
+    pub established_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
     pub handshake_permits: Arc<StdRwLock<HashMap<NodeId, OwnedSemaphorePermit>>>,
     pub last_disconnect_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+    /// Repair-first ICE restart -- see `WebRtcTransport::last_ice_restart_at`'s
+    /// doc comment.
+    pub last_ice_restart_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
     pub disconnected_since: Arc<StdRwLock<HashMap<NodeId, DisconnectGrace>>>,
+    /// `[ConnTiming]` instrumentation -- see
+    /// `WebRtcTransport::connect_started_at`'s doc comment.
+    pub connect_started_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+    /// `[ConnTiming]` instrumentation -- see
+    /// `WebRtcTransport::disconnect_observed_at`'s doc comment.
+    pub disconnect_observed_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+    /// Buffer-don't-drop fix -- see
+    /// `WebRtcTransport::pending_candidates_first_seen`'s doc comment.
+    pub pending_candidates_first_seen: Arc<RwLock<HashMap<NodeId, Instant>>>,
     pub signaler: Arc<dyn Signaler>,
     pub isolation_recovery_epoch: Arc<AtomicU64>,
     /// The room this transport belongs to (SPEC-15): each session owns its
@@ -255,6 +292,14 @@ impl PeerSharedHandles {
     /// `freshly_started` is `true` only when this call actually created the
     /// grace entry -- a repeat call while a grace period is already running
     /// leaves the original `started_at`/`origin` untouched and reports `false`.
+    ///
+    /// Repair-first ICE restart: a freshly-started grace, regardless of
+    /// `origin`, also fires the appropriate repair trigger via
+    /// `spawn_repair_trigger` -- both the ICE `Disconnected` state-change arm
+    /// (`origin: Ice`) and a freshly-suspected liveness failure (`origin:
+    /// LivenessSuspect`) are equally good reasons to attempt the same cheap,
+    /// non-destructive repair, so this is centralized here instead of
+    /// duplicated at each of `start_disconnect_grace`'s two call sites.
     fn start_disconnect_grace(&self, node: &NodeId, origin: GraceOrigin) -> (bool, bool) {
         let mut states = self.connection_states.write().unwrap();
         if !states.contains_key(node) {
@@ -281,15 +326,95 @@ impl PeerSharedHandles {
             node,
             states.len()
         );
+        if started_now {
+            self.spawn_repair_trigger(node, origin);
+        }
         (true, started_now)
     }
 
-    /// Returns `(reserved, freshly_started)` -- see `start_disconnect_grace`.
-    /// `freshly_started` gates the one-shot ICE-restart attempt (see the
-    /// `RTCPeerConnectionState::Disconnected` arm in
-    /// `setup_connection_state_handler`): only a grace period that just
-    /// began should trigger a restart, not a repeat notification for one
-    /// already running.
+    /// Repair-first ICE restart: fires the appropriate repair trigger for a
+    /// grace period that just began, based on which side of the
+    /// deterministic initiator/non-initiator split (`is_ice_restart_initiator`)
+    /// `self.local_node_id` is on for `node`. The initiator attempts the
+    /// actual (non-destructive) ICE restart itself, subject to the per-peer
+    /// rate limit (`maybe_try_ice_restart`); the non-initiator has no
+    /// PC-level trigger of its own -- only the initiator ever calls
+    /// `create_offer(ice_restart: true)` for this pair -- so it sends a
+    /// lightweight `RestartRequest` nudge instead, asking the initiator to
+    /// try (`send_restart_request`).
+    ///
+    /// Both are fire-and-forget `tokio::spawn`s: `self` (`PeerSharedHandles`)
+    /// is cheap to clone into the spawned task, and every caller of
+    /// `start_disconnect_grace` (including the synchronous
+    /// `on_peer_connection_state_change` callback) cannot `.await` directly.
+    ///
+    /// Storm-avoidance fix: both branches first run their action through
+    /// `debounce_repair_trigger`, which sleeps
+    /// `super::REPAIR_TRIGGER_DEBOUNCE_MS` (plus per-pair jitter) and
+    /// re-checks that the grace is still pending before proceeding -- see
+    /// that method's doc comment and `super::REPAIR_TRIGGER_DEBOUNCE_MS`'s
+    /// for the measured repair-storm regression this closes.
+    fn spawn_repair_trigger(&self, node: &NodeId, origin: GraceOrigin) {
+        let handles = self.clone();
+        let node = node.clone();
+        if super::is_ice_restart_initiator(&self.local_node_id, &node) {
+            let restart_origin = match origin {
+                GraceOrigin::Ice => "ice_state",
+                GraceOrigin::LivenessSuspect => "liveness_suspect",
+            };
+            tokio::spawn(async move {
+                if handles.debounce_repair_trigger(&node).await {
+                    handles.maybe_try_ice_restart(&node, restart_origin).await;
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if handles.debounce_repair_trigger(&node).await {
+                    handles.send_restart_request(&node).await;
+                }
+            });
+        }
+    }
+
+    /// Repair-first ICE restart, storm-avoidance fix: sleeps
+    /// `super::REPAIR_TRIGGER_DEBOUNCE_MS` plus a deterministic per-pair
+    /// jitter (`super::repair_trigger_jitter_ms`, bounded by
+    /// `super::REPAIR_TRIGGER_JITTER_MS`) before either spawned branch of
+    /// `spawn_repair_trigger` is allowed to act, then re-checks that `node`'s
+    /// disconnect grace (`disconnected_since`) is STILL present. Returns
+    /// `true` iff the grace survived the debounce window and the caller
+    /// should proceed with its repair action; `false` means the session
+    /// already recovered on its own during the wait (e.g. the wake-race
+    /// backlog was processed, `recover_connected_from_grace` fired, or a
+    /// liveness suspect was `clear_suspect`d by a PONG) and the repair action
+    /// must be skipped entirely.
+    ///
+    /// Checking `disconnected_since` alone is sufficient -- no extra PC-state
+    /// probe is needed -- because every recovery path removes the entry (see
+    /// `mark_connection_state`'s `Connected` arm) while a still-broken
+    /// session always keeps it. See `super::REPAIR_TRIGGER_DEBOUNCE_MS`'s doc
+    /// comment for the measured repair-storm regression (a resumed-from-
+    /// freeze process spuriously detecting all peers as `Disconnected`
+    /// before draining its socket backlog) this closes.
+    async fn debounce_repair_trigger(&self, node: &NodeId) -> bool {
+        let jitter_ms = super::repair_trigger_jitter_ms(&self.local_node_id, node);
+        let delay_ms = super::REPAIR_TRIGGER_DEBOUNCE_MS + jitter_ms;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let still_pending = self.disconnected_since.read().unwrap().contains_key(node);
+        if !still_pending {
+            tracing::debug!(
+                "[IceRestart] debounce-skip {}: grace cleared during {}ms debounce+jitter \
+                 window (self-recovered)",
+                node,
+                delay_ms
+            );
+        }
+        still_pending
+    }
+
+    /// Returns `(reserved, freshly_started)` -- see `start_disconnect_grace`,
+    /// which also fires the repair-trigger side effect for a freshly-started
+    /// grace.
     pub(crate) fn mark_disconnected_grace(&self, node: &NodeId) -> (bool, bool) {
         self.start_disconnect_grace(node, GraceOrigin::Ice)
     }
@@ -299,7 +424,11 @@ impl PeerSharedHandles {
     /// liveness-suspect-originated. A peer that isn't `Connected` (already
     /// reconnecting, disconnected, or unknown) is left untouched -- there's
     /// either already a grace period running (whatever its origin) or nothing
-    /// to suspect in the first place.
+    /// to suspect in the first place. Repair-first ICE restart: a freshly-
+    /// started grace also fires a repair trigger (see
+    /// `start_disconnect_grace`/`spawn_repair_trigger`) -- app-level liveness
+    /// suspicion used to only ever start a grace and wait, never attempt
+    /// repair.
     pub(crate) fn mark_suspect_disconnected(&self, node: &NodeId) -> bool {
         {
             let states = self.connection_states.read().unwrap();
@@ -378,12 +507,181 @@ impl PeerSharedHandles {
         self.mark_connection_state(node, ConnectionState::Connected)
     }
 
-    /// ICE restart attempt for `node`'s existing `RTCPeerConnection`, fired
-    /// right when its ICE-origin disconnect grace begins (see the
-    /// `RTCPeerConnectionState::Disconnected` arm below) -- only for the
-    /// initiator side (`super::is_ice_restart_initiator`); the other side
-    /// waits for this restart offer and lets the ordinary `apply_offer`
-    /// (Stable -> in-place renegotiation, `signaling.rs`) path handle it.
+    /// Repair-first ICE restart: rate-limited entry point for an ICE-restart
+    /// repair attempt, shared by all three trigger sites --
+    /// `spawn_repair_trigger`'s initiator branch (ICE `Disconnected` state
+    /// change and a freshly-started `LivenessSuspect` grace, both routed
+    /// through `start_disconnect_grace`) and `WebRtcTransport::handle_restart_request`
+    /// (an incoming `RestartRequest` from the non-initiator side). `origin` is
+    /// used only for `[IceRestart]` observability, not for any difference in
+    /// gating behavior -- the rate limit (`super::ice_restart_allowed`,
+    /// `super::ICE_RESTART_MIN_INTERVAL_MS`) applies uniformly regardless of
+    /// which signal triggered it.
+    ///
+    /// The timestamp backing the rate limit (`last_ice_restart_at`) is
+    /// recorded here, immediately before actually calling `try_ice_restart`
+    /// -- i.e. when an attempt actually starts, not when it succeeds and not
+    /// on a rate-limited skip. `try_ice_restart` itself can still end up
+    /// doing nothing (e.g. `IceRestartOutcome::NoPeer`); that's fine, this
+    /// gate only needs to bound how often the whole attempt sequence is
+    /// *tried* for a given peer, not condition it on success.
+    ///
+    /// ICE restart as rescue, not reflex: the same admission point also
+    /// re-arms `node`'s disconnect grace (`rearm_disconnect_grace`), if one is
+    /// currently running -- see that method's doc comment for why an admitted
+    /// attempt needs a fresh grace window rather than racing the sweeper with
+    /// a clock that had already been running since the original failure was
+    /// detected.
+    ///
+    /// Degraded-transport gate: before any of the above, this also refuses to
+    /// act on a peer whose `RTCPeerConnection` is still (or already back to)
+    /// `Connected` -- see the in-body comment for the fault-injection evidence
+    /// that a restart offer applied to a healthy PC wipes the answerer's
+    /// candidate pairs and kills the session rather than being a harmless
+    /// renegotiation. This gate is checked first, ahead of the rate limit, and
+    /// applies uniformly to all three trigger sites regardless of `origin`.
+    pub(crate) async fn maybe_try_ice_restart(&self, node: &NodeId, origin: &'static str) {
+        // Restart only a transport that is actually degraded. Firing an ICE
+        // restart at a PC that is still `Connected` is NOT a harmless
+        // renegotiation in webrtc-rs: fault-injection tracing (4s cross-host
+        // UDP drop) showed the offerer's agent keeps riding its still-valid
+        // old candidate pair while the answerer, applying the restart offer,
+        // wipes its pairs and then sits at "pingAllCandidates called with no
+        // candidate pairs" until its connect watchdog kills the session. A
+        // healthy-looking PC therefore must never be restarted from a
+        // liveness hunch (missed PONGs on the best-effort channel) or a
+        // stale RestartRequest -- the sweeper's false-positive recovery and
+        // the app-level grace machinery already handle those. A genuinely
+        // broken transport (NAT rebind, path change) reports Disconnected/
+        // Failed here and passes this gate.
+        let pc_connected = {
+            let peers = self.peers.read().await;
+            peers
+                .get(node)
+                .map(|peer| peer.pc.connection_state() == RTCPeerConnectionState::Connected)
+        };
+        match pc_connected {
+            None => {
+                tracing::debug!(
+                    "[IceRestart] skip {} (origin={}): no live peer to restart",
+                    node,
+                    origin
+                );
+                return;
+            }
+            Some(true) => {
+                tracing::debug!(
+                    "[IceRestart] skip {} (origin={}): pc still Connected -- restart is for \
+                     degraded transports only",
+                    node,
+                    origin
+                );
+                return;
+            }
+            Some(false) => {}
+        }
+        let ms_since_last = self
+            .last_ice_restart_at
+            .read()
+            .unwrap()
+            .get(node)
+            .map(|at| at.elapsed().as_millis() as u64);
+        if !super::ice_restart_allowed(ms_since_last) {
+            tracing::debug!(
+                "[IceRestart] skip {} (origin={}): rate-limited (last attempt {:?}ms ago, min \
+                 interval {}ms)",
+                node,
+                origin,
+                ms_since_last,
+                super::ICE_RESTART_MIN_INTERVAL_MS
+            );
+            return;
+        }
+        self.last_ice_restart_at
+            .write()
+            .unwrap()
+            .insert(node.clone(), Instant::now());
+        self.rearm_disconnect_grace(node);
+        tracing::info!("[IceRestart] triggered for {} (origin={})", node, origin);
+        self.try_ice_restart(node).await;
+    }
+
+    /// ICE restart as rescue, not reflex: gives an admitted repair attempt a
+    /// fresh `super::DISCONNECTED_GRACE_MS` window to complete. Called from
+    /// `maybe_try_ice_restart` at the moment an attempt is actually admitted
+    /// (passed the rate limit) -- if a disconnect grace for `node` is
+    /// currently running, its `started_at` is reset to `Instant::now()` (the
+    /// `origin` is left unchanged: this never turns an `Ice`-origin grace
+    /// into a `LivenessSuspect` one or vice versa). A no-op if no grace is
+    /// running for `node` (e.g. the restart was triggered before any grace
+    /// started, or the peer was never in a grace in the first place).
+    ///
+    /// Without this, a restart admitted late in a grace's lifetime -- exactly
+    /// the case this repair-first redesign now produces on purpose, since
+    /// `super::REPAIR_TRIGGER_DEBOUNCE_MS`'s widening deliberately delays a
+    /// restart's first opportunity to fire until well into the grace window
+    /// -- would race `sweeper::decide_grace_expiry` using a clock that had
+    /// already been running since the grace began, not since the repair
+    /// attempt itself started. Measured in the 4s SIGSTOP/iptables fault
+    /// injections this rescue redesign responds to: the side that fired ~200
+    /// ICE restarts near the end of their graces saw 127 of those graces
+    /// expire mid-handshake (`sweeper_disconnected_grace_expired`) before the
+    /// restart could complete, tearing down sessions the restart itself was
+    /// actively repairing.
+    ///
+    /// This intentionally delays teardown of a truly-dead peer via this
+    /// specific path by up to one extra grace period -- remote-takeover
+    /// (`should_takeover_on_fresh_offer`/`maybe_takeover_for_connect_request`)
+    /// and the connect-timeout watchdog remain the fast, independent paths
+    /// for a peer that is actually gone rather than merely slow to
+    /// reconverge.
+    fn rearm_disconnect_grace(&self, node: &NodeId) {
+        if let Some(grace) = self.disconnected_since.write().unwrap().get_mut(node) {
+            grace.started_at = Instant::now();
+        }
+    }
+
+    /// Repair-first ICE restart, Change 3: sends a lightweight
+    /// `RestartRequest` nudge to `node` when we are the non-initiator side of
+    /// a freshly-started disconnect grace and therefore have no PC-level
+    /// repair trigger of our own (see `spawn_repair_trigger`). Fire-and-
+    /// forget: exactly one send attempt, no retry loop of its own -- the
+    /// initiator's own local ICE-`Disconnected` detection and the sweeper's
+    /// grace-period teardown remain the fallbacks if this is lost. Reuses the
+    /// existing `SignalingType::Request` wire message tagged with
+    /// `super::RESTART_REQUEST_MARKER` (see its doc comment for why this
+    /// isn't a new `SignalingType` variant) rather than a bounded-retry
+    /// helper like `send_signaling_with_retry`, matching the "no retry loop"
+    /// intent: a lost nudge should not itself generate more signaling
+    /// traffic.
+    pub(crate) async fn send_restart_request(&self, node: &NodeId) {
+        let msg = MessageContent::Data(SignalingData {
+            sender_id: self.local_node_id.clone(),
+            receiver_id: node.clone(),
+            room_id: self.room_id.clone(),
+            data: super::RESTART_REQUEST_MARKER.to_string(),
+            signaling_type: SignalingType::Request,
+        });
+        match self.signaler.send_signaling(node, msg).await {
+            Ok(()) => {
+                tracing::info!("[IceRestart] sent RestartRequest to {}", node);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "[IceRestart] failed to send RestartRequest to {}: {}",
+                    node,
+                    err
+                );
+            }
+        }
+    }
+
+    /// ICE restart attempt for `node`'s existing `RTCPeerConnection`. Called
+    /// through the rate-limited `maybe_try_ice_restart` by every trigger site
+    /// -- only the initiator side (`super::is_ice_restart_initiator`) ever
+    /// calls this; the other side sends a `RestartRequest` nudge instead and
+    /// lets the ordinary `apply_offer` (Stable -> in-place renegotiation,
+    /// `signaling.rs`) path handle the resulting offer.
     ///
     /// Retries the whole create-offer/apply/send sequence
     /// ([`try_ice_restart_once`]) up to [`ICE_RESTART_RETRY_ATTEMPTS`] times
@@ -404,16 +702,20 @@ impl PeerSharedHandles {
                 IceRestartOutcome::Sent | IceRestartOutcome::NoPeer => return,
                 IceRestartOutcome::Retryable => {
                     if attempt < ICE_RESTART_RETRY_ATTEMPTS {
+                        let backoff_ms = super::backoff::exponential_backoff_ms(
+                            attempt,
+                            ICE_RESTART_RETRY_INITIAL_BACKOFF_MS,
+                            ICE_RESTART_RETRY_BACKOFF_MULTIPLIER,
+                            ICE_RESTART_RETRY_MAX_BACKOFF_MS,
+                        );
                         tracing::debug!(
-                            "[IceRestart] attempt {}/{} failed for {}; retrying",
+                            "[IceRestart] attempt {}/{} failed for {}; retrying in {}ms",
                             attempt,
                             ICE_RESTART_RETRY_ATTEMPTS,
-                            node
+                            node,
+                            backoff_ms
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            ICE_RESTART_RETRY_BACKOFF_MS,
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
                 }
             }
@@ -583,13 +885,18 @@ impl PeerSharedHandles {
         // this `NodeId`'s bookkeeping now, and every map below must be left
         // to it.
         let peer = match expected {
-            Some(expected) => match remove_peer_if_current(&self.peers, node, expected).await {
-                Some(peer) => Some(peer),
-                None => return false,
-            },
+            Some(expected) => {
+                match remove_peer_if_current(&self.peers, &self.send_queues, node, expected).await {
+                    Some(peer) => Some(peer),
+                    None => return false,
+                }
+            }
             None => {
                 let mut peers = self.peers.write().await;
-                peers.remove(node)
+                let removed = peers.remove(node);
+                drop(peers);
+                self.send_queues.write().unwrap().remove(node);
+                removed
             }
         };
 
@@ -597,6 +904,13 @@ impl PeerSharedHandles {
             let mut attempts = self.connection_attempt_ids.write().unwrap();
             attempts.remove(node).is_some()
         };
+        {
+            // Sweeper livelock fix -- see `connecting_reserved_at`'s doc
+            // comment: an attempt being torn down here, however it got here,
+            // no longer needs its reservation timestamp, and a later fresh
+            // reservation for the same node always overwrites this anyway.
+            self.connecting_reserved_at.write().unwrap().remove(node);
+        }
         let had_request = {
             let mut attempts = self.connect_request_attempt_ids.write().unwrap();
             attempts.remove(node).is_some()
@@ -610,6 +924,13 @@ impl PeerSharedHandles {
             pc_connected.remove(node);
         }
         {
+            // Remote-takeover fix -- see `WebRtcTransport::established_at`'s
+            // doc comment for why this is cleared alongside `pc_connected_at`
+            // rather than swept on its own TTL.
+            let mut established = self.established_at.write().unwrap();
+            established.remove(node);
+        }
+        {
             let mut permits = self.handshake_permits.write().unwrap();
             permits.remove(node);
         }
@@ -617,17 +938,47 @@ impl PeerSharedHandles {
             let mut disconnected = self.disconnected_since.write().unwrap();
             disconnected.remove(node);
         }
+        {
+            // `[ConnTiming]` instrumentation: an attempt that is being torn
+            // down here can never reach establishment, so drop its
+            // attempt-start entry -- otherwise a later, unrelated attempt for
+            // the same node (a fresh `connect_started_at` insert would
+            // normally overwrite it, but not every teardown path is
+            // guaranteed to race a fresh attempt) could leak it forever.
+            self.connect_started_at.write().unwrap().remove(node);
+        }
         let had_pending_candidates = {
             let mut pc_lock = self.pending_candidates.write().await;
             pc_lock.remove(node).is_some()
         };
+        {
+            // Buffer-don't-drop fix -- see `pending_candidates_first_seen`'s
+            // doc comment: this attempt's buffer (if any) is gone now, so
+            // its age no longer needs tracking either.
+            self.pending_candidates_first_seen
+                .write()
+                .await
+                .remove(node);
+        }
 
         let had_peer = peer.is_some();
         let had_session_state =
             had_attempt || had_request || had_state || had_peer || had_pending_candidates;
         if had_session_state {
+            let now = std::time::Instant::now();
             let mut last_disconnect = self.last_disconnect_at.write().unwrap();
-            last_disconnect.insert(node.clone(), std::time::Instant::now());
+            last_disconnect.insert(node.clone(), now);
+            drop(last_disconnect);
+            // `[ConnTiming]` instrumentation: see
+            // `WebRtcTransport::disconnect_observed_at`'s doc comment for why
+            // this is kept separately from (and longer than)
+            // `last_disconnect_at`.
+            let mut disconnect_observed = self.disconnect_observed_at.write().unwrap();
+            super::conn_timing::insert_disconnect_observed(
+                &mut disconnect_observed,
+                node.clone(),
+                now,
+            );
         }
 
         if let Some(peer) = peer {
@@ -646,6 +997,21 @@ impl PeerSharedHandles {
         }
 
         if had_session_state {
+            // `[ConnTiming]` instrumentation: one `kind=disconnect` line per
+            // confirmed disconnect, gated on the same `had_session_state`
+            // check that gates `on_disconnected_internal` below -- this is
+            // the funnel point for every teardown path that goes through
+            // `cleanup_session_with_reason`/`cleanup_session_if_current`
+            // (explicit disconnect, the connect-timeout watchdog, and the
+            // periodic sweeper's three reap reasons). The remaining
+            // disconnect path -- the `Failed`/`Closed` peer-connection-state
+            // handler below, which bypasses this function entirely -- emits
+            // its own `kind=disconnect` at its own analogous
+            // `had_state`-gated point, so the two never double-fire for the
+            // same disconnect (whichever path's identity-guarded removal
+            // wins is the only one that observes `had_state`/`had_session_state`
+            // as `true`).
+            super::conn_timing::log_disconnect(node, reason);
             crate::events::on_disconnected_internal(self.room_id.clone(), node.clone());
             self.schedule_isolation_recovery();
         }
@@ -686,23 +1052,31 @@ impl PeerSharedHandles {
     }
 }
 
-/// Removes `node`'s entry from `peers` iff it currently still points at the
-/// `Peer` behind `expected`. Used by teardown paths that fire asynchronously
-/// and without any other serialization against a fresh reconnect for the
-/// same `NodeId` (the ICE-state-change and data-channel-close callbacks): a
-/// late/stale event belonging to an already-superseded `RTCPeerConnection`
-/// must not tear down the *new*, currently-live peer's registration just
-/// because it shares the same `NodeId` key. Returns the removed peer only
-/// when the identity check passes; otherwise leaves `peers` untouched.
+/// Removes `node`'s entry from `peers` (and, in lock-step, `send_queues` --
+/// see `WebRtcTransport::send_queues`'s doc comment) iff `peers` currently
+/// still points at the `Peer` behind `expected`. Used by teardown paths that
+/// fire asynchronously and without any other serialization against a fresh
+/// reconnect for the same `NodeId` (the ICE-state-change and
+/// data-channel-close callbacks): a late/stale event belonging to an
+/// already-superseded `RTCPeerConnection` must not tear down the *new*,
+/// currently-live peer's registration just because it shares the same
+/// `NodeId` key. Returns the removed peer only when the identity check
+/// passes; otherwise leaves both maps untouched.
 async fn remove_peer_if_current(
     peers: &RwLock<HashMap<NodeId, Arc<Peer>>>,
+    send_queues: &StdRwLock<HashMap<NodeId, mpsc::Sender<QueuedSend>>>,
     node: &NodeId,
     expected: &Weak<Peer>,
 ) -> Option<Arc<Peer>> {
     let expected = expected.upgrade()?;
     let mut lock = peers.write().await;
     match lock.get(node) {
-        Some(current) if Arc::ptr_eq(current, &expected) => lock.remove(node),
+        Some(current) if Arc::ptr_eq(current, &expected) => {
+            let removed = lock.remove(node);
+            drop(lock);
+            send_queues.write().unwrap().remove(node);
+            removed
+        }
         _ => None,
     }
 }
@@ -1079,27 +1453,19 @@ impl Peer {
                         }
                     }
                     RTCPeerConnectionState::Disconnected => {
-                        let (reserved, freshly_started) =
+                        // Repair-first ICE restart: `mark_disconnected_grace`
+                        // (-> `start_disconnect_grace`) itself fires the
+                        // appropriate repair trigger (initiator: rate-limited
+                        // ICE restart; non-initiator: a `RestartRequest`
+                        // nudge) for a freshly-started grace -- nothing
+                        // further to do here beyond the reservation check.
+                        let (reserved, _freshly_started) =
                             handles.mark_disconnected_grace(&remote_id_cb);
                         if !reserved {
                             tracing::warn!(
                                 "[CS] IGNORE disconnected grace for unreserved peer {}",
                                 remote_id_cb
                             );
-                        } else if freshly_started
-                            && super::is_ice_restart_initiator(
-                                &handles.local_node_id,
-                                &remote_id_cb,
-                            )
-                        {
-                            // Fire-and-forget: try_ice_restart needs `.await`
-                            // (create_offer, set_local_description, signaling
-                            // send) but this callback itself is synchronous.
-                            let restart_handles = handles.clone();
-                            let restart_node = remote_id_cb.clone();
-                            tokio::spawn(async move {
-                                restart_handles.try_ice_restart(&restart_node).await;
-                            });
                         }
                     }
                     RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
@@ -1134,6 +1500,9 @@ impl Peer {
                         let connect_request_attempts_cb =
                             handles.connect_request_attempt_ids.clone();
                         let pc_connected_at_cb = handles.pc_connected_at.clone();
+                        // Remote-takeover fix -- see
+                        // `WebRtcTransport::established_at`'s doc comment.
+                        let established_at_cb = handles.established_at.clone();
                         let handshake_permits_cb2 = handshake_permits_cb.clone();
                         let disconnected_since_cb = handles.disconnected_since.clone();
                         let last_disconnect_at_cb2 = last_disconnect_at_cb.clone();
@@ -1143,9 +1512,13 @@ impl Peer {
                             let Some(peers_cb) = peers_weak.upgrade() else {
                                 return;
                             };
-                            let peer =
-                                remove_peer_if_current(&peers_cb, &remote_id_cb_2, &self_weak_cb)
-                                    .await;
+                            let peer = remove_peer_if_current(
+                                &peers_cb,
+                                &handles_cb.send_queues,
+                                &remote_id_cb_2,
+                                &self_weak_cb,
+                            )
+                            .await;
                             let Some(peer) = peer else {
                                 return;
                             };
@@ -1174,6 +1547,9 @@ impl Peer {
                                 pc_connected_at_cb.write().unwrap().remove(&remote_id_cb_2);
                             }
                             {
+                                established_at_cb.write().unwrap().remove(&remote_id_cb_2);
+                            }
+                            {
                                 handshake_permits_cb2.write().unwrap().remove(&remote_id_cb_2);
                             }
                             {
@@ -1184,6 +1560,29 @@ impl Peer {
                                     .write()
                                     .unwrap()
                                     .insert(remote_id_cb_2.clone(), Instant::now());
+                            }
+                            {
+                                // `[ConnTiming]` instrumentation: confirmed
+                                // disconnect via a pc `Failed`/`Closed`
+                                // transition -- one of the three sites that
+                                // populate `disconnect_observed_at` (see
+                                // `WebRtcTransport::disconnect_observed_at`'s
+                                // doc comment). Also clear
+                                // `connect_started_at` defensively: this path
+                                // bypasses `cleanup_session_impl`, and a
+                                // Failed/Closed transition can fire before
+                                // the DC-open handler ever consumed it (e.g.
+                                // a handshake that never got that far).
+                                handles_cb
+                                    .connect_started_at
+                                    .write()
+                                    .unwrap()
+                                    .remove(&remote_id_cb_2);
+                                super::conn_timing::insert_disconnect_observed(
+                                    &mut handles_cb.disconnect_observed_at.write().unwrap(),
+                                    remote_id_cb_2.clone(),
+                                    Instant::now(),
+                                );
                             }
                             {
                                 pc_cb.write().await.remove(&remote_id_cb_2);
@@ -1198,6 +1597,19 @@ impl Peer {
                             crate::mem::record_peer_cleaned();
 
                             if had_state {
+                                // `[ConnTiming]` instrumentation: this path
+                                // bypasses `cleanup_session_impl` entirely
+                                // (see the comment there), so it emits its
+                                // own `kind=disconnect` line here, gated on
+                                // the same `had_state` check that gates
+                                // `on_disconnected_internal` below. Mutual
+                                // exclusion with `cleanup_session_impl`'s
+                                // emission is structural: both ultimately
+                                // depend on `remove_peer_if_current`'s
+                                // identity-guarded removal, which succeeds at
+                                // most once per `Peer`.
+                                let reason = format!("peer_state_{:?}", state_for_log);
+                                super::conn_timing::log_disconnect(&remote_id_cb_2, &reason);
                                 crate::events::on_disconnected_internal(
                                     handles_cb.room_id.clone(),
                                     remote_id_cb_2,
@@ -1235,7 +1647,10 @@ impl Peer {
             handles.connection_states.clone(),
             handles.disconnected_since.clone(),
             handles.pc_connected_at.clone(),
+            handles.established_at.clone(),
             handles.handshake_permits.clone(),
+            handles.connect_started_at.clone(),
+            handles.disconnect_observed_at.clone(),
             cancel_token.clone(),
             room_id,
         );
@@ -1257,7 +1672,10 @@ impl Peer {
         states: Arc<StdRwLock<HashMap<NodeId, ConnectionState>>>,
         disconnected_since: Arc<StdRwLock<HashMap<NodeId, DisconnectGrace>>>,
         pc_connected_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+        established_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
         handshake_permits: Arc<StdRwLock<HashMap<NodeId, OwnedSemaphorePermit>>>,
+        connect_started_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
+        disconnect_observed_at: Arc<StdRwLock<HashMap<NodeId, Instant>>>,
         cancel_token: CancellationToken,
         room_id: String,
     ) {
@@ -1265,6 +1683,9 @@ impl Peer {
             let remote_id = remote_id.clone();
             let states = states.clone();
             let disconnected_since = disconnected_since.clone();
+            // Named `_map` to avoid shadowing the `established_at: Instant`
+            // local bound just below, inside the `!already_connected` arm.
+            let established_at_map = established_at.clone();
             let cancel = cancel_token.clone();
             let room_id = room_id.clone();
             Box::pin(async move {
@@ -1305,6 +1726,43 @@ impl Peer {
                     total
                 );
                 if !already_connected {
+                    // `[ConnTiming]` instrumentation: this is the
+                    // establishment point (ReliableOrdered data channel
+                    // open, transitioning to `Connected`). `connect_started_at`
+                    // is consumed (removed) here; if it's missing (shouldn't
+                    // normally happen -- every attempt reserves one) skip the
+                    // log rather than emit a line with a made-up duration.
+                    let established_at = Instant::now();
+                    // Remote-takeover fix: record this establishment moment
+                    // for `takeover_allowed`'s recent-connect guard -- see
+                    // `WebRtcTransport::established_at`'s doc comment. Set
+                    // unconditionally here (not gated on any later step
+                    // succeeding), since data-channel establishment is itself
+                    // the thing the guard cares about.
+                    established_at_map
+                        .write()
+                        .unwrap()
+                        .insert(remote_id.clone(), established_at);
+                    let started_at = connect_started_at.write().unwrap().remove(&remote_id);
+                    if let Some(started_at) = started_at {
+                        let attempt_ms =
+                            established_at.saturating_duration_since(started_at).as_millis() as u64;
+                        let observed_disconnect_at =
+                            disconnect_observed_at.write().unwrap().remove(&remote_id);
+                        if let Some(observed_disconnect_at) = observed_disconnect_at {
+                            let downtime_ms = established_at
+                                .saturating_duration_since(observed_disconnect_at)
+                                .as_millis() as u64;
+                            super::conn_timing::log_reconnect(
+                                &remote_id,
+                                attempt_ms,
+                                downtime_ms,
+                                total,
+                            );
+                        } else {
+                            super::conn_timing::log_connect(&remote_id, attempt_ms, total);
+                        }
+                    }
                     crate::events::on_connected_internal(room_id, remote_id);
                 }
             })
@@ -1323,13 +1781,17 @@ impl Peer {
             let remote_id = remote_id.clone();
             let states = handles.connection_states.clone();
             let peers = handles.peers.clone();
+            let send_queues = handles.send_queues.clone();
             let pending = handles.pending_candidates.clone();
             let attempts = handles.connection_attempt_ids.clone();
             let connect_request_attempts = handles.connect_request_attempt_ids.clone();
             let pc_connected_at = handles.pc_connected_at.clone();
+            let established_at = handles.established_at.clone();
             let last_disconnect = handles.last_disconnect_at.clone();
             let disconnected_since = handles.disconnected_since.clone();
             let handshake_permits = handles.handshake_permits.clone();
+            let connect_started_at = handles.connect_started_at.clone();
+            let disconnect_observed_at = handles.disconnect_observed_at.clone();
             let room_id = handles.room_id.clone();
             let dc = dc_for_close.clone();
             let cancel = cancel_token.clone();
@@ -1355,7 +1817,8 @@ impl Peer {
                 // removing by NodeId here would rip out the live connection's
                 // state instead of the stale one's (see the "Node not found"
                 // overlay-send race this guards against).
-                let peer = remove_peer_if_current(&peers, &remote_id, &peer_weak).await;
+                let peer =
+                    remove_peer_if_current(&peers, &send_queues, &remote_id, &peer_weak).await;
                 let Some(peer) = peer else { return };
                 {
                     let mut lock = attempts.write().unwrap();
@@ -1370,12 +1833,32 @@ impl Peer {
                     lock.remove(&remote_id);
                 }
                 {
+                    // Remote-takeover fix -- see
+                    // `WebRtcTransport::established_at`'s doc comment.
+                    let mut lock = established_at.write().unwrap();
+                    lock.remove(&remote_id);
+                }
+                {
                     let mut lock = handshake_permits.write().unwrap();
                     lock.remove(&remote_id);
                 }
                 {
                     let mut lock = last_disconnect.write().unwrap();
                     lock.insert(remote_id.clone(), Instant::now());
+                }
+                {
+                    // `[ConnTiming]` instrumentation: confirmed disconnect
+                    // via the ReliableOrdered data channel closing -- one of
+                    // the three sites that populate `disconnect_observed_at`
+                    // (see `WebRtcTransport::disconnect_observed_at`'s doc
+                    // comment). Also clear `connect_started_at` defensively:
+                    // this path bypasses `cleanup_session_impl`.
+                    connect_started_at.write().unwrap().remove(&remote_id);
+                    super::conn_timing::insert_disconnect_observed(
+                        &mut disconnect_observed_at.write().unwrap(),
+                        remote_id.clone(),
+                        Instant::now(),
+                    );
                 }
                 {
                     let mut lock = disconnected_since.write().unwrap();
@@ -1486,14 +1969,19 @@ mod tests {
 
         // A fresh reconnect has already replaced the map entry with the new,
         // healthy peer -- mirroring `replace_peer_and_close_old`/
-        // `handle_offer`'s `peers.insert`.
+        // `handle_offer`'s `peers.insert` (and its matching `send_queues`
+        // insert -- see `WebRtcTransport::send_queues`'s doc comment).
         t.peers.write().await.insert(node.clone(), new_peer.clone());
+        t.send_queues
+            .write()
+            .unwrap()
+            .insert(node.clone(), new_peer.send_tx.clone());
 
         // The *old* peer's Failed/Closed (or dc-close) callback finally runs,
         // asking to remove/close `node`'s entry. It must be a no-op: the map
         // no longer belongs to it.
         let old_weak = Arc::downgrade(&old_peer);
-        let removed = remove_peer_if_current(&t.peers, &node, &old_weak).await;
+        let removed = remove_peer_if_current(&t.peers, &t.send_queues, &node, &old_weak).await;
         assert!(
             removed.is_none(),
             "a stale peer's cleanup must not remove a newer peer registered under the same NodeId"
@@ -1503,15 +1991,23 @@ mod tests {
             matches!(current, Some(p) if Arc::ptr_eq(&p, &new_peer)),
             "the new peer's registration must survive the stale peer's cleanup attempt"
         );
+        assert!(
+            t.send_queues.read().unwrap().contains_key(&node),
+            "a stale peer's cleanup must not remove the new peer's send_queues entry either"
+        );
 
         // The *current* peer's own teardown must still work normally.
         let new_weak = Arc::downgrade(&new_peer);
-        let removed = remove_peer_if_current(&t.peers, &node, &new_weak).await;
+        let removed = remove_peer_if_current(&t.peers, &t.send_queues, &node, &new_weak).await;
         assert!(
             matches!(removed, Some(p) if Arc::ptr_eq(&p, &new_peer)),
             "the current peer must be removable by its own cleanup"
         );
         assert!(t.peers.read().await.get(&node).is_none());
+        assert!(
+            !t.send_queues.read().unwrap().contains_key(&node),
+            "removing the current peer must also remove its send_queues entry"
+        );
     }
 
     #[tokio::test]
@@ -1678,7 +2174,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_millis(ICE_RESTART_RETRY_BACKOFF_MS),
+            elapsed < std::time::Duration::from_millis(ICE_RESTART_RETRY_INITIAL_BACKOFF_MS),
             "a missing peer must short-circuit immediately, not burn through the retry backoff \
              (elapsed={:?})",
             elapsed
@@ -1723,16 +2219,218 @@ mod tests {
         let elapsed = start.elapsed();
 
         // With ICE_RESTART_RETRY_ATTEMPTS attempts there are
-        // (ICE_RESTART_RETRY_ATTEMPTS - 1) backoff sleeps of
-        // ICE_RESTART_RETRY_BACKOFF_MS each before giving up.
-        let expected_min = std::time::Duration::from_millis(
-            (ICE_RESTART_RETRY_ATTEMPTS as u64 - 1) * ICE_RESTART_RETRY_BACKOFF_MS,
-        );
+        // (ICE_RESTART_RETRY_ATTEMPTS - 1) backoff sleeps, growing
+        // exponentially rather than a fixed interval -- sum the real
+        // schedule instead of assuming `count * constant`.
+        let expected_min =
+            std::time::Duration::from_millis(crate::transports::webrtc::backoff::total_backoff_ms(
+                ICE_RESTART_RETRY_ATTEMPTS - 1,
+                ICE_RESTART_RETRY_INITIAL_BACKOFF_MS,
+                ICE_RESTART_RETRY_BACKOFF_MULTIPLIER,
+                ICE_RESTART_RETRY_MAX_BACKOFF_MS,
+            ));
         assert!(
             elapsed >= expected_min,
             "expected try_ice_restart to retry across every attempt's backoff (elapsed={:?}, expected_min={:?})",
             elapsed,
             expected_min
+        );
+    }
+
+    /// Records every message handed to `send_signaling`, tagged with its
+    /// `SignalingType` -- used by the `spawn_offer_resend` tests below to
+    /// count how many `Offer`s were (re)sent.
+    struct RecordingSignaler(std::sync::Mutex<Vec<MessageContent>>);
+
+    #[async_trait::async_trait]
+    impl Signaler for RecordingSignaler {
+        async fn send_signaling(
+            &self,
+            _to: &NodeId,
+            msg: MessageContent,
+        ) -> mistlib_core::error::Result<()> {
+            self.0.lock().unwrap().push(msg);
+            Ok(())
+        }
+
+        async fn close(&self) -> mistlib_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn count_offers(recorder: &RecordingSignaler) -> usize {
+        recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|msg| {
+                matches!(msg, MessageContent::Data(d) if d.signaling_type == SignalingType::Offer)
+            })
+            .count()
+    }
+
+    /// Sets `node` up as a fresh, unanswered outbound offer: a real `Peer`
+    /// registered in `t.peers`, `connection_states` reserved as `Connecting`
+    /// (`send_offer`'s precondition), and the initial offer already sent via
+    /// `t.signaler`. Returns `(peer, attempt_id)` -- everything
+    /// `spawn_offer_resend` needs.
+    async fn setup_unanswered_offer(
+        t: &crate::transports::webrtc::WebRtcTransport,
+        node: &NodeId,
+    ) -> (Arc<Peer>, u32) {
+        let peer = t
+            .create_pc(node.clone())
+            .await
+            .expect("peer should be created");
+        // A real m= section (an application/data-channel one here) so a
+        // throwaway remote could answer this offer meaningfully -- some of
+        // these tests do exactly that.
+        peer.pc
+            .create_data_channel("reliable", None)
+            .await
+            .expect("data channel should be created");
+        t.peers.write().await.insert(node.clone(), peer.clone());
+        t.connection_states
+            .write()
+            .unwrap()
+            .insert(node.clone(), ConnectionState::Connecting);
+
+        t.send_offer(node, &peer)
+            .await
+            .expect("initial offer send should succeed");
+        let attempt_id = t.reserve_connection_attempt(node);
+        (peer, attempt_id)
+    }
+
+    /// Offer resend, initiator side (see
+    /// `WebRtcTransport::spawn_offer_resend`'s doc comment): while the peer
+    /// stays in `HaveLocalOffer` (no answer ever arrives) and neither the
+    /// peer nor the attempt is superseded, every scheduled resend in
+    /// `super::OFFER_RESEND_SCHEDULE_MS` must actually fire -- this is the
+    /// bounded-retransmission mechanism the whole fix exists to add.
+    #[tokio::test]
+    async fn spawn_offer_resend_retransmits_the_current_offer_while_unanswered() {
+        let recorder = Arc::new(RecordingSignaler(std::sync::Mutex::new(Vec::new())));
+        let t = crate::transports::webrtc::WebRtcTransport::new(
+            recorder.clone() as Arc<dyn Signaler>,
+            NodeId("local".to_string()),
+        );
+        let node = NodeId("remote".to_string());
+        let (peer, attempt_id) = setup_unanswered_offer(&t, &node).await;
+
+        t.spawn_offer_resend(node.clone(), attempt_id, peer.clone());
+
+        // Both schedule entries (test values 30ms/60ms) plus their jitter
+        // (test bound: 5ms) must have had a chance to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            count_offers(&recorder),
+            1 + crate::transports::webrtc::OFFER_RESEND_MAX as usize,
+            "the initial send plus every scheduled resend must have fired while the offer \
+             stayed unanswered"
+        );
+        assert_eq!(
+            peer.pc.signaling_state(),
+            RTCSignalingState::HaveLocalOffer,
+            "sanity: nothing in this test ever answers the offer"
+        );
+    }
+
+    /// Counterpart: once the offer IS answered (signaling_state leaves
+    /// `HaveLocalOffer` for `Stable`), no further resend may fire -- a
+    /// resend past that point would be a stale, pointless retransmission
+    /// (the negotiation this offer started has already completed).
+    #[tokio::test]
+    async fn spawn_offer_resend_stops_once_the_offer_is_answered() {
+        use webrtc::peer_connection::configuration::RTCConfiguration;
+
+        let recorder = Arc::new(RecordingSignaler(std::sync::Mutex::new(Vec::new())));
+        let t = crate::transports::webrtc::WebRtcTransport::new(
+            recorder.clone() as Arc<dyn Signaler>,
+            NodeId("local".to_string()),
+        );
+        let node = NodeId("remote".to_string());
+        let (peer, attempt_id) = setup_unanswered_offer(&t, &node).await;
+
+        // Answer the offer on a throwaway peer connection and apply that
+        // answer to our real peer directly -- moves `peer.pc` to `Stable`
+        // exactly the way a real `handle_answer` would, without needing a
+        // second full transport/real network (mirrors
+        // `tests/takeover.rs`'s `build_offer` helper's use of a throwaway
+        // `RTCPeerConnection` for offer-side SDP; here it's the answer
+        // side).
+        let offer_sdp = peer
+            .pc
+            .local_description()
+            .await
+            .expect("offer should be set as local description")
+            .sdp;
+        let fake_remote = t
+            .api
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .expect("throwaway peer connection should build");
+        fake_remote
+            .set_remote_description(
+                crate::transports::webrtc::signaling::parse_offer_payload(&offer_sdp)
+                    .expect("offer SDP should parse"),
+            )
+            .await
+            .expect("throwaway pc should accept our offer");
+        let answer = fake_remote
+            .create_answer(None)
+            .await
+            .expect("throwaway pc should answer");
+        fake_remote
+            .set_local_description(answer.clone())
+            .await
+            .expect("throwaway pc should set its own answer");
+        peer.pc
+            .set_remote_description(answer)
+            .await
+            .expect("our peer should accept the answer");
+        assert_eq!(peer.pc.signaling_state(), RTCSignalingState::Stable);
+
+        t.spawn_offer_resend(node.clone(), attempt_id, peer.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            count_offers(&recorder),
+            1,
+            "once the offer is answered (signaling_state left HaveLocalOffer) no resend must \
+             fire -- only the original send may be recorded"
+        );
+    }
+
+    /// Counterpart: once `attempt_id` is superseded (a fresh `connect_inner`/
+    /// takeover reserved a brand-new attempt id for the same node) before the
+    /// first scheduled resend fires, the resend task for the old attempt must
+    /// stop silently rather than resending on behalf of an attempt that no
+    /// longer owns this node.
+    #[tokio::test]
+    async fn spawn_offer_resend_stops_once_the_attempt_is_superseded() {
+        let recorder = Arc::new(RecordingSignaler(std::sync::Mutex::new(Vec::new())));
+        let t = crate::transports::webrtc::WebRtcTransport::new(
+            recorder.clone() as Arc<dyn Signaler>,
+            NodeId("local".to_string()),
+        );
+        let node = NodeId("remote".to_string());
+        let (peer, attempt_id) = setup_unanswered_offer(&t, &node).await;
+
+        t.spawn_offer_resend(node.clone(), attempt_id, peer.clone());
+        // Supersede immediately, before the first scheduled resend (test
+        // value: 30ms + <=5ms jitter) has any chance to fire.
+        let _new_attempt_id = t.reserve_connection_attempt(&node);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert_eq!(
+            count_offers(&recorder),
+            1,
+            "a resend task for a superseded attempt must never resend, leaving only the \
+             original send"
         );
     }
 }
